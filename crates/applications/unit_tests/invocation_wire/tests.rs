@@ -783,8 +783,21 @@ fn http_boundary_retains_bytes_and_rejects_guest_authority() {
     let mut injected = serde_json::to_value(control).unwrap();
     injected["response"]["proof"] = serde_json::json!(true);
     assert!(GuestControl::decode(&serde_json::to_vec(&injected).unwrap()).is_err());
-    injected["event"] = serde_json::json!("http_reply");
+    // Drop the unknown field before testing the `event` tag: `HttpReply` carries
+    // the same `HttpResult`, so `http_reply` is accepted, and re-asserting on the
+    // poisoned value would pass for the wrong reason. An unrecognized tag fails,
+    // and the recorded tag still decodes to the variant it names.
+    injected["response"]
+        .as_object_mut()
+        .unwrap()
+        .remove("proof");
+    injected["event"] = serde_json::json!("bogus");
     assert!(GuestControl::decode(&serde_json::to_vec(&injected).unwrap()).is_err());
+    injected["event"] = serde_json::json!("http_result");
+    assert_eq!(
+        GuestControl::decode(&serde_json::to_vec(&injected).unwrap()).unwrap(),
+        control
+    );
     assert!(GuestControl::decode(br#"{"event":"drained","version":1,"invocation":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","write_position":1}"#).is_err());
     let mut malicious = serde_json::to_value(output).unwrap();
     malicious["response"]["write_position"] = serde_json::json!(123);
