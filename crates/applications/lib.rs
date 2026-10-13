@@ -467,14 +467,8 @@ impl RouteTable {
     /// `hostname` is a request Host (optional port). Only `<route id>.<domain>`
     /// can resolve.
     pub fn resolve(&self, hostname: &str, domain: &str) -> Option<&RouteTarget> {
-        let hostname = match hostname.split_once(':') {
-            Some((name, port)) if port.parse::<u16>().is_ok_and(|port| port > 0) => name,
-            Some(_) => return None,
-            None => hostname,
-        }
-        .to_ascii_lowercase();
-        let label = hostname.strip_suffix(domain)?.strip_suffix('.')?;
-        self.0.get(&RouteId::try_from(label.to_owned()).ok()?)
+        let label = route_label(hostname, domain)?;
+        self.0.get(&RouteId::try_from(label).ok()?)
     }
 
     /// Whether `hostname` is inside the platform domain, whatever its label.
@@ -484,4 +478,24 @@ impl RouteTable {
             .strip_suffix(domain)
             .is_some_and(|label| label.ends_with('.'))
     }
+}
+
+/// The route label of a request Host, from the one place that parses a Host for
+/// routing. `Some("<route id>")` only for a `<route id>.<domain>` host whose port
+/// is a non-zero number; the label is case-folded, the domain must be lowercase
+/// as configured.
+///
+/// Both routing paths derive their label here: `RouteTable::resolve` for the
+/// in-memory table and `application_vm::resolve` for the store lookup a node
+/// actually serves from. Keeping one owner is what makes the port and case rules
+/// the rules that run, rather than rules only a test exercised.
+pub fn route_label(hostname: &str, domain: &str) -> Option<String> {
+    let hostname = match hostname.split_once(':') {
+        Some((name, port)) if port.parse::<u16>().is_ok_and(|port| port > 0) => name,
+        Some(_) => return None,
+        None => hostname,
+    }
+    .to_ascii_lowercase();
+    let label = hostname.strip_suffix(domain)?.strip_suffix('.')?;
+    Some(label.to_owned())
 }

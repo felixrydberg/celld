@@ -2657,13 +2657,12 @@ impl RouteDispatcher {
     async fn resolve(&self, url: &str) -> Result<Option<RouteTarget>> {
         let url = url::Url::parse(url)?;
         let host = url.host_str().unwrap_or_default();
-        if !RouteTable::is_platform_host(host, &self.routes.domain) {
-            return Ok(None);
-        }
-        let Some(label) = host.strip_suffix(&format!(".{}", self.routes.domain)) else {
+        // The same Host parsing the in-memory table uses: one owner for the
+        // port and case rules, so production runs the rules the tests assert.
+        let Some(label) = celld_applications::route_label(host, &self.routes.domain) else {
             return Ok(None);
         };
-        let Ok(id) = celld_applications::RouteId::try_from(label.to_owned()) else {
+        let Ok(id) = celld_applications::RouteId::try_from(label) else {
             return Ok(None);
         };
         self.routes.store.resolve_route(&id).await

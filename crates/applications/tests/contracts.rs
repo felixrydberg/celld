@@ -1,6 +1,6 @@
 use celld_applications::{
-    ApplicationId, BindingTarget, Deployment, Name, ResourceAddress, ResourceKind, ResourceRef,
-    RouteId, RouteTable,
+    route_label, ApplicationId, BindingTarget, Deployment, Name, ResourceAddress, ResourceKind,
+    ResourceRef, RouteId, RouteTable,
 };
 
 fn name(value: &str) -> Name {
@@ -286,6 +286,30 @@ fn routes_never_reach_another_applications_handler() {
     let routes = RouteTable::from_deployments([(&replacement, &ids(&one), None), (&second, &ids(&two), None)]).unwrap();
     assert!(routes.resolve(&host(&one), "apps.test").is_none());
     assert_eq!(routes.resolve(&host(&two), "apps.test").unwrap().application, second.application);
+}
+
+/// A request Host becomes a route label in exactly one place. This is the rules
+/// that run, because `application_vm::resolve` calls it too; the table test above
+/// only checks that the table consults it.
+#[test]
+fn one_host_parser_owns_the_port_and_case_rules() {
+    let id = RouteId::generate().unwrap();
+    let host = format!("{}.apps.test", id.as_str());
+    assert_eq!(route_label(&host, "apps.test").as_deref(), Some(id.as_str()));
+    assert_eq!(route_label(&host.to_ascii_uppercase(), "apps.test").as_deref(), Some(id.as_str()));
+    assert_eq!(route_label(&format!("{host}:8443"), "apps.test").as_deref(), Some(id.as_str()));
+    for refused in [
+        format!("{host}:0"),
+        format!("{host}:garbage"),
+        format!("{host}:65536"),
+        format!("x.{host}"),
+        "apps.test".into(),
+        ".apps.test".into(),
+        format!("{}.example.test", id.as_str()),
+        format!("{}.evil.apps.test", id.as_str()),
+    ] {
+        assert!(route_label(&refused, "apps.test").is_none(), "{refused}");
+    }
 }
 
 /// Names may hold `-` and `_`, so these pairs flatten to one spelling; none may
