@@ -616,6 +616,23 @@ async fn t29_containers() {
             let output = Command::new("docker").args(["image","inspect",image]).kill_on_drop(true).output().await.unwrap();
             assert!(output.status.success(), "missing fixture {image}: {}", String::from_utf8_lossy(&output.stderr));
         }
+        // A tag cannot prove the image is the fixture: `docker image inspect`
+        // succeeds for any image holding the name, so a mis-tagged leftover kept
+        // this scenario green. Each fixture labels itself, and that label is read
+        // back from the daemon. The fixture Dockerfiles pin their base image by
+        // digest, so the content behind this label is fixed too.
+        for (image, expected) in [
+            (&fence, celld::application_container::docker::FENCE_LABEL),
+            (&image, celld::application_container::docker::WORKLOAD_LABEL),
+        ] {
+            let labels = celld::application_container::docker::image_labels(image);
+            let (key, value) = expected.split_once('=').expect("fixture label is key=value");
+            assert_eq!(
+                labels.get(key).map(String::as_str),
+                Some(value),
+                "fixture {image} is not the expected image"
+            );
+        }
         let h = Harness::new("containers", true).await;
         let mut hosts = Vec::new();
         for (app, label) in [("e2e-one","one"),("e2e-two","two")] {

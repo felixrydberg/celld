@@ -31,21 +31,82 @@ pub(crate) fn cli(args: &[&str], stdin: Option<&str>) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-/// The fence and workload images, built from inline Dockerfiles and tagged
+/// The two container fixtures, single-sourced from the files the qualification
+/// runner reads: `tests/fixtures/t29-services`. Each pins its base image by
+/// digest and labels itself, so `images()` cannot drift from the fixture that
+/// the e2e container scenario asserts against.
+pub(crate) const FENCE_DOCKERFILE: &str =
+    include_str!("../../tests/fixtures/t29-services/fence.Dockerfile");
+pub(crate) const WORKLOAD_DOCKERFILE: &str =
+    include_str!("../../tests/fixtures/t29-services/workload.Dockerfile");
+
+/// What each fixture image says it is. A tag cannot prove this: the scenario
+/// asserted only that `docker image inspect <name>` succeeded, so any image
+/// holding the expected name kept it green.
+pub(crate) const FENCE_LABEL: &str = "celld.fixture=fence";
+pub(crate) const WORKLOAD_LABEL: &str = "celld.fixture=workload";
+
+/// The fence and workload images, built from the fixture Dockerfiles and tagged
 /// as a node would hold them. The workload serves HTTP on 8080 (`/`,
 /// `/dir` redirects to `/dir/`) and echoes TCP on 9000.
 pub(crate) fn images() -> (String, String) {
     let fence = format!("celld-image:{}", "1".repeat(64));
     let workload = format!("celld-image:{}", "2".repeat(64));
-    let dockerfile = "FROM alpine:3.20\nRUN apk add --no-cache nftables\n";
-    cli(&["build", "-q", "-t", &fence, "-"], Some(dockerfile));
-    let dockerfile = "FROM busybox:1.36\n\
-            RUN mkdir -p /www/dir /www/cgi-bin && echo -n ok > /www/index.html && echo -n nested > /www/dir/index.html \
-                && printf '#!/bin/sh\\necho \"Content-type: text/plain\"\\necho\\nprintf \"%%s\" \"$HTTP_HOST\"\\n' > /www/cgi-bin/host \
-                && chmod +x /www/cgi-bin/host\n\
-            CMD [\"sh\", \"-c\", \"httpd -f -p 8080 -h /www & exec tcpsvd 0.0.0.0 9000 cat\"]\n";
-    cli(&["build", "-q", "-t", &workload, "-"], Some(dockerfile));
+    cli(&["build", "-q", "-t", &fence, "-"], Some(FENCE_DOCKERFILE));
+    cli(
+        &["build", "-q", "-t", &workload, "-"],
+        Some(WORKLOAD_DOCKERFILE),
+    );
     (fence, workload)
+}
+
+/// The labels of one built image, read back from the daemon. Used by the e2e
+/// container scenario to prove the image under the expected name is the fixture
+/// and not a mis-tagged leftover.
+pub(crate) fn image_labels(image: &str) -> std::collections::HashMap<String, String> {
+    let json = cli(&["image", "inspect", image, "--format", "{{json .Config.Labels}}"], None);
+    serde_json::from_str(&json).unwrap_or_default()
+}
+
+/// The fixtures are read here through `include_str!`, so they cannot drift from
+/// what this test builds. `deploy.rs` keeps its own inline const for the fence,
+/// so a change there must update the fixture too. Assert both copies agree and
+/// that each fixture still pins its base by digest, so the content this test
+/// builds is fixed rather than whatever the tag resolves to on the day.
+#[test]
+fn container_fixtures_are_pinned_and_match_their_sources() {
+    let fixtures = [
+        (
+            FENCE_DOCKERFILE,
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/t29-services/fence.Dockerfile"
+            ),
+            "alpine:3.20",
+            FENCE_LABEL,
+            "nftables",
+        ),
+        (
+            WORKLOAD_DOCKERFILE,
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/t29-services/workload.Dockerfile"
+            ),
+            "busybox:1.36",
+            WORKLOAD_LABEL,
+            "httpd",
+        ),
+    ];
+    for (inlined, path, tag, label, required) in fixtures {
+        assert_eq!(inlined, std::fs::read_to_string(path).unwrap(), "{path}");
+        let from = inlined.lines().next().unwrap_or_default();
+        assert!(
+            from.starts_with(&format!("FROM {tag}@sha256:")),
+            "unpinned base in {path}: {from}"
+        );
+        assert!(inlined.contains(label), "{path} must label itself {label}");
+        assert!(inlined.contains(required), "{path} must run {required}");
+    }
 }
 
 /// The scopes that have a container for `node` on this engine.
