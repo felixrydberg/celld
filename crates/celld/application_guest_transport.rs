@@ -2340,6 +2340,16 @@ impl Client {
                 .pending
                 .get_mut(invocation)
                 .context("guest event retired")?;
+            // `FetchCancel` removes the fetch and its dial in one lock. The
+            // guest can cancel while this dial is still in flight, so register
+            // only while its fetch is still pending: otherwise the dial outlives
+            // the fetch that owns it, leaking a MAX_FETCHES slot and a peer
+            // connection that no cancel can reach. The guard unwinds when the
+            // early return drops it.
+            ensure!(
+                pending.fetches.contains_key(fetch),
+                "dialed fetch was cancelled"
+            );
             ensure!(
                 pending.dials.len() < MAX_FETCHES,
                 "too many outbound WebSockets in one event"
@@ -3335,10 +3345,26 @@ async fn run(
                             }
                             (None, false) => (None, None),
                         };
+                        // Registered before its task starts: a dialing fetch
+                        // proves it is still pending under the registry lock, and
+                        // `FetchCancel` removes the fetch and its dial together in
+                        // one lock. Spawning first would let the task observe its
+                        // own registration as missing.
+                        pending.fetches.insert(
+                            fetch.clone(),
+                            BrokeredFetch {
+                                flow: ResponseFlow::default(),
+                                pulls,
+                                _stop: stop.drop_guard(),
+                                request: request_upload,
+                                signals,
+                                relay,
+                            },
+                        );
                         crate::asyncrt::spawn(broker_fetch(
                             Client(read.clone()),
                             id.clone(),
-                            fetch.clone(),
+                            fetch,
                             request,
                             redirect,
                             target.map(|call| *call),
@@ -3353,17 +3379,6 @@ async fn run(
                             dial,
                             pending.execution.clone(),
                         ));
-                        pending.fetches.insert(
-                            fetch,
-                            BrokeredFetch {
-                                flow: ResponseFlow::default(),
-                                pulls,
-                                _stop: stop.drop_guard(),
-                                request: request_upload,
-                                signals,
-                                relay,
-                            },
-                        );
                     }
                     GuestControl::FetchPull {
                         fetch, sequence, ..
