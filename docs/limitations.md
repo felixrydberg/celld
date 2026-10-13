@@ -6,8 +6,12 @@ APIs, and Wrangler configuration.
 
 ## Fleets
 
-- A fleet runs one application. celld has no account service, multi-tenant
-  scheduler, or managed ingress.
+- A fleet runs one Worker application by default. celld has no account service,
+  multi-tenant scheduler, or managed ingress. A platform node started with
+  `--application-vms` or `--application-domain` serves many applications, each
+  with its own metadata record and authorization boundary; accounts,
+  organizations, and billing still belong to the integrating platform. See
+  [Application management](application-management.md).
 - A fleet stores its durable state in an S3-compatible bucket, a Google Cloud
   Storage bucket, or an Azure Blob Storage container. Only `celld dev` can use
   the local SQLite object store.
@@ -23,7 +27,9 @@ APIs, and Wrangler configuration.
   establishment and control requests but does not encrypt data, so the network
   must provide confidentiality.
 - The fleet bucket controls the fleet. Give its credentials access to one fleet
-  only. See [Security](security.md).
+  only, and additionally to every provider bucket an application's R2 binding
+  names, because celld opens those named buckets with the fleet's endpoint and
+  credentials. See [Security](security.md).
 
 ## Object storage credentials
 

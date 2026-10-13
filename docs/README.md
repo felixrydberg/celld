@@ -114,6 +114,8 @@ the waker role, and it wakes only the cells whose owner node has stopped.
 - [Environment variables](#environment-variables)
 - [Services](#services)
 - [Cloudflare compatibility](cloudflare-compat.md)
+- [Application management](application-management.md)
+- [Application setup](application-setup.md)
 - [What celld guarantees](guarantees.md)
 - [Limitations](limitations.md)
 - [Security](security.md)
