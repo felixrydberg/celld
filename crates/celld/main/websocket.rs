@@ -800,6 +800,19 @@ struct PumpClose {
     initiator: CloseInitiator,
 }
 
+/// What the application-route check decided for an upgrade.
+///
+/// `Withdrawn` is a separate case from `Unclaimed` on purpose. A platform host
+/// that names no live route answers 404 and must never reach the legacy Worker,
+/// while `Unclaimed` is the only state that falls through to it.
+#[derive(Default)]
+enum ApplicationUpgrade {
+    #[default]
+    Unclaimed,
+    Withdrawn,
+    Dispatched(anyhow::Result<HttpResponse>),
+}
+
 async fn write_ws_out<S>(ws: &SocketWriter<S>, out: celld::js::WsOut) -> bool
 where
     S: tokio::io::AsyncWrite + Unpin,
@@ -1140,12 +1153,31 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
     let body_read_us = body_started.elapsed().as_micros() as u64;
     let worker_started = Instant::now();
     let fetched = match application_upgrade(&app, &url, &method, &headers, &body).await {
-        Some(fetched) => fetched,
-        None => {
+        ApplicationUpgrade::Unclaimed => {
             runtime
                 .fetch_worker_pool(url, method, body.into(), headers, cancellation)
                 .await
         }
+        ApplicationUpgrade::Withdrawn => {
+            // A platform host whose route is gone or inactive answers 404, the
+            // same as the plain HTTP path (main.rs). Falling through to the
+            // legacy Worker here would break the stronger promise.
+            emit_websocket_connection_timing(
+                runtime,
+                request_id,
+                started,
+                body_read_us,
+                worker_started.elapsed().as_micros() as u64,
+                WebSocketConnectionOutcome {
+                    outcome: "rejected",
+                    route: "",
+                    scope: "",
+                    status: StatusCode::NOT_FOUND.as_u16(),
+                },
+            );
+            return response(StatusCode::NOT_FOUND, "application route not found");
+        }
+        ApplicationUpgrade::Dispatched(fetched) => fetched,
     };
     let mut worker_response = match fetched {
         Ok(response) => response,
@@ -1284,7 +1316,8 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
 
 /// A committed application route claims the upgrade before any Worker does:
 /// its handler runs in a VM, and the 101 it returns carries a hibernatable
-/// socket the host registry already owns. `None` when no route claims the URL.
+/// socket the host registry already owns. `Unclaimed` when no route claims the
+/// URL; `Withdrawn` when a platform host names no live route.
 #[cfg(target_os = "linux")]
 async fn application_upgrade(
     app: &AppHandle,
@@ -1292,25 +1325,28 @@ async fn application_upgrade(
     method: &str,
     headers: &[(String, String)],
     body: &[u8],
-) -> Option<anyhow::Result<HttpResponse>> {
-    let applications =
-        celld::application_vm::hosted().filter(|applications| applications.claims(url))?;
+) -> ApplicationUpgrade {
+    let Some(applications) =
+        celld::application_vm::hosted().filter(|applications| applications.claims(url))
+    else {
+        return ApplicationUpgrade::Unclaimed;
+    };
     let request = celld_applications::invocation_wire::HttpRequest {
         method: method.to_string(),
         url: url.to_string(),
         headers: headers.to_vec(),
         body: body.to_vec(),
     };
-    Some(
-        match applications
-            .dispatch(app, celld::js::handler_budget(), request, None)
-            .await
-        {
-            Ok(Some(response)) => Ok(response),
-            Ok(None) => Err(anyhow::anyhow!("application route was withdrawn")),
-            Err(error) => Err(error),
-        },
-    )
+    match applications
+        .dispatch(app, celld::js::handler_budget(), request, None)
+        .await
+    {
+        Ok(Some(response)) => ApplicationUpgrade::Dispatched(Ok(response)),
+        // The Host is under the platform domain, so no route here is a 404
+        // route concern, not a Worker concern.
+        Ok(None) => ApplicationUpgrade::Withdrawn,
+        Err(error) => ApplicationUpgrade::Dispatched(Err(error)),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1320,8 +1356,8 @@ async fn application_upgrade(
     _method: &str,
     _headers: &[(String, String)],
     _body: &[u8],
-) -> Option<anyhow::Result<HttpResponse>> {
-    None
+) -> ApplicationUpgrade {
+    ApplicationUpgrade::Unclaimed
 }
 
 /// Finish the client upgrade through the same owned response value that
