@@ -2,7 +2,7 @@
 # decisions; `crates/celld` is only an effect executor and adapter host.
 [workspace]
 resolver = "2"
-members = ["crates/celld", "crates/logic", "crates/ltx", "crates/applications"]
+members = ["crates/*"]
 
 # Size-tuned: fat LTO prunes unused dependency code, panic=abort drops
 # unwind tables. opt-level "s" (not "z") — measure RPS before trading further.
