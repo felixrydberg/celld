@@ -108,31 +108,8 @@ pub(super) fn host_available() -> Result<u64> {
         .take(16_385)
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 16_384, "host memory sample exceeds bound");
-    available(std::str::from_utf8(&bytes)?)
-}
-
-fn available(text: &str) -> Result<u64> {
-    let mut value = None;
-    for line in text.lines() {
-        let mut fields = line.split_whitespace();
-        if fields.next() != Some("MemAvailable:") {
-            continue;
-        }
-        ensure!(value.is_none(), "duplicate host available memory");
-        let kib: u64 = fields
-            .next()
-            .context("missing host available memory")?
-            .parse()?;
-        ensure!(
-            fields.next() == Some("kB") && fields.next().is_none(),
-            "invalid host available memory units"
-        );
-        value = Some(
-            kib.checked_mul(1024)
-                .context("host available memory overflow")?,
-        );
-    }
-    value.context("host available memory absent")
+    crate::machine::meminfo_available_bytes(std::str::from_utf8(&bytes)?)
+        .context("host available memory absent or malformed")
 }
 
 #[cfg(test)]

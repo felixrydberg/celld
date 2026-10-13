@@ -4436,18 +4436,9 @@ fn guest_available_from_meminfo(meminfo: &str) -> Option<u64> {
     if meminfo.len() > 16 * 1024 {
         return None;
     }
-    let line = meminfo
-        .lines()
-        .find(|line| line.starts_with("MemAvailable:"))?;
-    let mut fields = line.split_whitespace();
-    if fields.next()? != "MemAvailable:" {
-        return None;
-    }
-    let kib = fields.next()?.parse::<u64>().ok()?;
-    if fields.next()? != "kB" || fields.next().is_some() {
-        return None;
-    }
-    kib.checked_mul(1024)
+    // One owner for this line: machine::meminfo_available_bytes. It refuses a
+    // duplicate `MemAvailable`, which this reader used to silently accept.
+    crate::machine::meminfo_available_bytes(meminfo)
 }
 
 #[cfg(target_os = "linux")]
@@ -4482,6 +4473,11 @@ fn guest_available_memory_is_bounded_and_checks_units() {
     }
     assert_eq!(
         guest_available_from_meminfo(&format!("MemAvailable: 7 kB\n{}", " ".repeat(16 * 1024))),
+        None
+    );
+    // The shared parser refuses a duplicate line instead of taking the first.
+    assert_eq!(
+        guest_available_from_meminfo("MemAvailable: 7 kB\nMemAvailable: 9 kB\n"),
         None
     );
 }

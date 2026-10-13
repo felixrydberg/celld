@@ -155,6 +155,33 @@ fn total_memory_bytes() -> Option<u64> {
     None
 }
 
+/// `MemAvailable` from a `/proc/meminfo` body, in bytes.
+///
+/// One parser for both readers of this line: the host admission guard
+/// (`application_vm::pressure`) and the isolate's memory diagnostics (`js`).
+/// They previously disagreed about a duplicate line -- one failed the sample,
+/// the other silently took the first match -- so the rule is stated once here.
+/// A duplicate is a malformed sample, and the caller decides what a missing
+/// sample means.
+pub(crate) fn meminfo_available_bytes(text: &str) -> Option<u64> {
+    let mut value = None;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("MemAvailable:") {
+            continue;
+        }
+        if value.is_some() {
+            return None;
+        }
+        let kib = fields.next()?.parse::<u64>().ok()?;
+        if fields.next() != Some("kB") || fields.next().is_some() {
+            return None;
+        }
+        value = Some(kib.checked_mul(1024)?);
+    }
+    value
+}
+
 pub fn pressure_config_from_environment() -> anyhow::Result<celld_logic::pressure::PressureConfig> {
     // Residency is a hard cap (`CELLD_MAX_RESIDENT_CELLS` -> `Config::max_resident`),
     // enforced at admission -- not a pressure watermark, so it is not built here.

@@ -83,9 +83,12 @@ fn every_signal_delta_reset_and_host_headroom_fail_closed() {
 
 #[test]
 fn host_available_requires_one_bounded_unit_checked_scalar() {
+    // The parser is shared with the isolate memory diagnostics (`js`), so it is
+    // asserted where it lives. The guard wraps its refusal as host_available's
+    // error above.
     assert_eq!(
-        available("MemTotal: 50 kB\nMemAvailable: 2 kB\n").unwrap(),
-        2048
+        crate::machine::meminfo_available_bytes("MemTotal: 50 kB\nMemAvailable: 2 kB\n"),
+        Some(2048)
     );
     for text in [
         "",
@@ -94,6 +97,6 @@ fn host_available_requires_one_bounded_unit_checked_scalar() {
         "MemAvailable: 2 kB\nMemAvailable: 2 kB",
         "MemAvailable: 18446744073709551615 kB",
     ] {
-        assert!(available(text).is_err());
+        assert_eq!(crate::machine::meminfo_available_bytes(text), None, "{text:?}");
     }
 }
