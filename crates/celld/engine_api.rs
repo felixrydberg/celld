@@ -113,6 +113,10 @@ pub struct WsTarget {
 pub enum HttpResponseWebSocket {
     Cell(WsTarget),
     Worker(WorkerWebSocket),
+    /// A hibernatable socket an application guest's object accepted, owned by
+    /// the host registry until an upgrade consumes it; dropped, it is released.
+    #[cfg(unix)]
+    Guest(Box<crate::application_guest_transport::GuestSocket>),
 }
 
 pub struct HttpResponse {
@@ -279,6 +283,10 @@ pub enum ModuleSource {
     /// `WebAssembly.Module` (Wrangler's `CompiledWasm` rule), registered
     /// under both `name` and `./name`.
     Wasm(bytes::Bytes),
+    /// Binary content served as a module whose default export is an
+    /// `ArrayBuffer` (Wrangler's `Data` rule), registered under both `name`
+    /// and `./name`.
+    Data(bytes::Bytes),
 }
 
 /// A Workflow binding keeps the three names distinct across deployment
@@ -465,8 +473,6 @@ pub(crate) fn durable_object_id_hmac(key: &[u8; 32], input: &[u8]) -> hmac::Hmac
 const DO_ID_CACHE_MAX: usize = 4096;
 
 pub(crate) fn durable_object_id_for_name(namespace_key: &str, name: &str) -> [u8; 32] {
-    use hmac::Mac;
-
     thread_local! {
         static IDS: RefCell<HashMap<(String, String), [u8; 32]>> =
             RefCell::new(HashMap::new());
@@ -481,15 +487,7 @@ pub(crate) fn durable_object_id_for_name(namespace_key: &str, name: &str) -> [u8
     }
 
     let key = durable_object_id_key(namespace_key);
-    let mut id = [0_u8; 32];
-    let digest = durable_object_id_hmac(&key, name.as_bytes())
-        .finalize()
-        .into_bytes();
-    id[..16].copy_from_slice(&digest[..16]);
-    let digest = durable_object_id_hmac(&key, &id[..16])
-        .finalize()
-        .into_bytes();
-    id[16..].copy_from_slice(&digest[..16]);
+    let id = celld_applications::object_id::for_name(&key, name);
 
     IDS.with(|ids| {
         let mut ids = ids.borrow_mut();

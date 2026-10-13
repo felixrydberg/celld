@@ -83,6 +83,10 @@ impl InputGate {
         self.holder.is_none()
     }
 
+    pub fn is_held_by(&self, event: EventId) -> bool {
+        self.holder == Some(event)
+    }
+
     /// `event` entered a `blockConcurrencyWhile`. Shuts the gate, and
     /// answers whether it got it.
     ///

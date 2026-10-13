@@ -56,7 +56,9 @@ use object_store::PutPayload;
 use object_store::RetryConfig;
 use object_store::UpdateVersion;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 #[cfg(all(test, celld_internal_tests))]
@@ -197,6 +199,22 @@ pub struct Bucket {
     /// to. Call sites keep forming unprefixed keys; this type is the one
     /// place that knows where in the bucket a fleet lives.
     pub prefix: String,
+    r2: Arc<Mutex<HashMap<String, Arc<Bucket>>>>,
+    r2_source: Option<Arc<R2Source>>,
+}
+
+/// Fleet builders with their resolved credential providers retained, so
+/// application buckets inherit the same configuration and providers.
+/// Upstream GCS still reads its configured credential files during build;
+/// Azure's emulator still reads AZURITE_BLOB_STORAGE_URL during build.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one configured builder pair is retained behind an Arc per fleet"
+)]
+enum R2Source {
+    S3(AmazonS3Builder, AmazonS3Builder),
+    Gcs(GoogleCloudStorageBuilder, GoogleCloudStorageBuilder),
+    Azure(MicrosoftAzureBuilder, MicrosoftAzureBuilder),
 }
 
 /// One page of [`Bucket::common_prefixes_page`].
@@ -564,7 +582,7 @@ impl PaginatedListStore for UnpaginatedStore {
 
 impl Bucket {
     /// Builds a bucket from separate ordinary and paginated stores.
-    #[cfg(celld_internal_tests)]
+    #[cfg(any(test, celld_internal_tests))]
     #[doc(hidden)]
     pub fn with_paginated_store_for_test(
         store: Arc<dyn ObjectStore>,
@@ -578,6 +596,8 @@ impl Bucket {
             backend: StorageBackend::S3,
             name: "telemetry-test".to_string(),
             prefix,
+            r2: Arc::new(Mutex::new(HashMap::new())),
+            r2_source: None,
         }
     }
 
@@ -598,6 +618,8 @@ impl Bucket {
             backend,
             name,
             prefix,
+            r2: Arc::new(Mutex::new(HashMap::new())),
+            r2_source: None,
         }
     }
 
@@ -651,6 +673,8 @@ impl Bucket {
             backend: StorageBackend::Local,
             name: database.display().to_string(),
             prefix: String::new(),
+            r2: Arc::new(Mutex::new(HashMap::new())),
+            r2_source: None,
         })
     }
 
@@ -715,10 +739,15 @@ impl Bucket {
             retry_timeout: Duration::from_secs(30),
             ..RetryConfig::default()
         };
-        let (store, paginated, cas_store): (
+        #[allow(
+            clippy::type_complexity,
+            reason = "retain configured builders alongside the existing erased store traits"
+        )]
+        let (store, paginated, cas_store, r2_source): (
             Arc<dyn ObjectStore>,
             Arc<dyn PaginatedListStore>,
             Arc<dyn ObjectStore>,
+            R2Source,
         ) = match backend {
             StorageBackend::S3 => {
                 // An endpoint can also arrive through the environment:
@@ -756,11 +785,18 @@ impl Bucket {
                     }
                 }
                 let cas_builder = builder.clone().with_retry(cas_retry);
-                let client = Arc::new(builder.build().context("build s3 client")?);
+                let client = Arc::new(builder.clone().build().context("build s3 client")?);
+                let cas_client =
+                    Arc::new(cas_builder.clone().build().context("build s3 cas client")?);
+                // These are the base providers, not bucket-specific Express
+                // session credentials. A named builder creates its own session.
+                let builder = builder.with_credentials(client.credentials().clone());
+                let cas_builder = cas_builder.with_credentials(cas_client.credentials().clone());
                 (
                     client.clone(),
-                    client,
-                    Arc::new(cas_builder.build().context("build s3 cas client")?),
+                    client.clone(),
+                    cas_client.clone(),
+                    R2Source::S3(builder, cas_builder),
                 )
             }
             StorageBackend::Gcs => {
@@ -786,11 +822,20 @@ impl Bucket {
                     .with_retry(retry)
                     .with_client_options(options);
                 let cas_builder = builder.clone().with_retry(cas_retry);
-                let client = Arc::new(builder.build().context("build gcs client")?);
+                let client = Arc::new(builder.clone().build().context("build gcs client")?);
+                let cas_client = Arc::new(
+                    cas_builder
+                        .clone()
+                        .build()
+                        .context("build gcs cas client")?,
+                );
+                let builder = builder.with_credentials(client.credentials().clone());
+                let cas_builder = cas_builder.with_credentials(cas_client.credentials().clone());
                 (
                     client.clone(),
-                    client,
-                    Arc::new(cas_builder.build().context("build gcs cas client")?),
+                    client.clone(),
+                    cas_client.clone(),
+                    R2Source::Gcs(builder, cas_builder),
                 )
             }
             StorageBackend::Azure => {
@@ -815,11 +860,20 @@ impl Bucket {
                     .with_retry(retry)
                     .with_client_options(options);
                 let cas_builder = builder.clone().with_retry(cas_retry);
-                let client = Arc::new(builder.build().context("build azure client")?);
+                let client = Arc::new(builder.clone().build().context("build azure client")?);
+                let cas_client = Arc::new(
+                    cas_builder
+                        .clone()
+                        .build()
+                        .context("build azure cas client")?,
+                );
+                let builder = builder.with_credentials(client.credentials().clone());
+                let cas_builder = cas_builder.with_credentials(cas_client.credentials().clone());
                 (
                     client.clone(),
-                    client,
-                    Arc::new(cas_builder.build().context("build azure cas client")?),
+                    client.clone(),
+                    cas_client.clone(),
+                    R2Source::Azure(builder, cas_builder),
                 )
             }
             StorageBackend::Local => {
@@ -833,7 +887,115 @@ impl Bucket {
             backend,
             name: bucket.to_string(),
             prefix,
+            r2: Arc::new(Mutex::new(HashMap::new())),
+            r2_source: Some(Arc::new(r2_source)),
         })
+    }
+
+    /// Remote R2 bindings name a separate provider bucket/container. A fleet
+    /// prefix does not make the fleet's own bucket safe for application data.
+    pub fn validate_r2_bucket_name(&self, name: &str) -> anyhow::Result<()> {
+        if self.backend == StorageBackend::Local {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            (1..=128).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+            "R2 bucket name must be 1–128 ASCII letters, digits, hyphens or underscores"
+        );
+        anyhow::ensure!(
+            name != self.name,
+            "R2 bindings cannot use the fleet bucket {name:?}"
+        );
+        Ok(())
+    }
+
+    /// Reuse one client per real bucket, with the fleet's configured endpoint,
+    /// options, and credential providers. This selects a bucket, never creates one.
+    pub(crate) fn r2_bucket(&self, name: &str) -> anyhow::Result<Arc<Bucket>> {
+        self.validate_r2_bucket_name(name)?;
+        if self.backend == StorageBackend::Local {
+            return Ok(Arc::new(self.clone()));
+        }
+        let mut cache = self
+            .r2
+            .lock()
+            .map_err(|_| anyhow!("R2 bucket cache poisoned"))?;
+        if let Some(bucket) = cache.get(name) {
+            return Ok(bucket.clone());
+        }
+        let (store, paginated, cas_store): (
+            Arc<dyn ObjectStore>,
+            Arc<dyn PaginatedListStore>,
+            Arc<dyn ObjectStore>,
+        ) = match self.r2_source.as_deref() {
+            Some(R2Source::S3(builder, cas_builder)) => {
+                let client = Arc::new(
+                    builder
+                        .clone()
+                        .with_bucket_name(name)
+                        .build()
+                        .context("build named R2 s3 client")?,
+                );
+                let cas_client = Arc::new(
+                    cas_builder
+                        .clone()
+                        .with_bucket_name(name)
+                        .build()
+                        .context("build named R2 s3 cas client")?,
+                );
+                (client.clone(), client, cas_client)
+            }
+            Some(R2Source::Gcs(builder, cas_builder)) => {
+                let client = Arc::new(
+                    builder
+                        .clone()
+                        .with_bucket_name(name)
+                        .build()
+                        .context("build named R2 gcs client")?,
+                );
+                let cas_client = Arc::new(
+                    cas_builder
+                        .clone()
+                        .with_bucket_name(name)
+                        .build()
+                        .context("build named R2 gcs cas client")?,
+                );
+                (client.clone(), client, cas_client)
+            }
+            Some(R2Source::Azure(builder, cas_builder)) => {
+                let client = Arc::new(
+                    builder
+                        .clone()
+                        .with_container_name(name)
+                        .build()
+                        .context("build named R2 azure client")?,
+                );
+                let cas_client = Arc::new(
+                    cas_builder
+                        .clone()
+                        .with_container_name(name)
+                        .build()
+                        .context("build named R2 azure cas client")?,
+                );
+                (client.clone(), client, cas_client)
+            }
+            None => anyhow::bail!("this injected store cannot open an external R2 bucket"),
+        };
+        let bucket = Arc::new(Bucket {
+            store,
+            paginated,
+            cas_store,
+            backend: self.backend,
+            name: name.to_string(),
+            prefix: String::new(),
+            r2: Arc::new(Mutex::new(HashMap::new())),
+            r2_source: None,
+        });
+        cache.insert(name.to_string(), bucket.clone());
+        Ok(bucket)
     }
 
     /// The bucket's URL scheme, `s3`, `gs` or `az`, for operator-facing
@@ -1283,10 +1445,8 @@ impl Bucket {
 
     // ---- R2 binding primitives ------------------------------------------
     //
-    // An `r2_buckets` binding is served out of the fleet bucket under the
-    // reserved `r2/<bucket_name>/` prefix, so a Worker's blobs share the
-    // durability and the credentials of everything else celld stores and
-    // need no second bucket. These are the only operations that reach past
+    // Remote R2 bindings select the actual provider bucket; local development
+    // keeps its reserved `r2/<bucket_name>/` scope. These operations reach past
     // the in-memory `Bytes` contract the rest of this module keeps: a blob
     // is a Worker's payload and can be far larger than a fleet object, so
     // it is read as a stream and a large write goes through multipart.
@@ -1346,14 +1506,14 @@ impl Bucket {
                 return Ok(match self.head_blob(key).await? {
                     Some(meta) => BlobRead::Unmet(meta),
                     None => BlobRead::Missing,
-                })
+                });
             }
             Err(error) => {
                 return Err(anyhow!(error).context(format!(
                     "read {}://{}/{scoped}",
                     self.scheme(),
                     self.name
-                )))
+                )));
             }
         };
         let meta = self.blob_meta(&result.meta, &result.attributes);
@@ -2147,4 +2307,56 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
             || text.contains("status code: 403 Forbidden")
             || text.contains("status code: 401 Unauthorized")
     })
+}
+
+#[cfg(test)]
+mod r2_tests {
+    use super::*;
+
+    fn fleet() -> Bucket {
+        Bucket::open(
+            "fleet/private-prefix",
+            Some("http://127.0.0.1:1"),
+            "us-east-1",
+            Some(StaticCredentials {
+                access_key_id: "fixturekey".into(),
+                secret_access_key: "fixturesecret".into(),
+                session_token: None,
+            }),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn named_r2_refuses_fleet_even_with_a_prefix() {
+        let fleet = fleet();
+        assert!(fleet.validate_r2_bucket_name("fleet").is_err());
+        assert!(fleet.validate_r2_bucket_name("fleet/other").is_err());
+        assert!(fleet.validate_r2_bucket_name("").is_err());
+        assert!(fleet
+            .validate_r2_bucket_name("b9bdc93e-67b0-4a31-9da3-738ec6bf7745")
+            .is_ok());
+    }
+
+    #[test]
+    fn named_r2_clients_are_cached_and_keep_existing_key_mapping() {
+        let fleet = fleet();
+        let first = fleet.r2_bucket("application-bucket").unwrap();
+        let again = fleet.r2_bucket("application-bucket").unwrap();
+        let other = fleet.r2_bucket("other-bucket").unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert!(first.prefix.is_empty());
+        for key in ["/a//b/", "a/../b", "%2E/%/你好", "a\n\0b"] {
+            let path = first.blob_path(key);
+            assert_ne!(path.as_ref(), key);
+            assert_eq!(first.listed_key(&path).unwrap(), key);
+            assert_eq!(
+                fleet.blob_path(key).as_ref(),
+                format!("private-prefix/{path}")
+            );
+        }
+        assert_eq!(first.blob_path("/a//b/").as_ref(), "%/a/%/b/%");
+    }
 }

@@ -2,7 +2,7 @@
 
 //! The object-store side of an `r2_buckets` binding: the R2 object record,
 //! the request shapes, and the reads and writes that `celld r2` and the cell
-//! runtime share. Every engine reaches the fleet bucket through this module,
+//! runtime share. Every engine selects its bound bucket through this module,
 //! so an operator and a Worker cannot disagree about the key an object lives
 //! under or the record it carries. The V8 ops live in `js/r2_ops.rs`.
 
@@ -35,25 +35,30 @@ const LIST_HEADS: usize = 16;
 
 /// The part size a streaming `put` cuts at once it is too big to write in
 /// one request. Above S3's 5 MiB floor, and a round number of pages.
-const STREAM_PART: usize = 8 << 20;
+pub(crate) const STREAM_PART: usize = 8 << 20;
 
 /// The user-metadata name the R2 object record lives under. See
 /// [`Envelope`]. The bucket stores it as `celld_r2` on Azure, which
 /// refuses a hyphen in a metadata name.
 const ENVELOPE: &str = "celld-r2";
 
-/// The key space one binding owns inside the fleet bucket. `bucket_name`
-/// comes from the deployment manifest, which validates it, so the prefix
-/// cannot escape into the fleet's own keys.
-pub(crate) fn blob_key(bucket_name: &str, key: &str) -> String {
-    format!("r2/{bucket_name}/{key}")
+/// Remote keys have no binding prefix; Bucket applies its existing escaping.
+/// Local development keeps the binding prefix in its shared database.
+pub(crate) fn blob_key(store: &Bucket, bucket_name: &str, key: &str) -> String {
+    match store.backend {
+        crate::bucket::StorageBackend::Local => format!("r2/{bucket_name}/{key}"),
+        _ => key.to_string(),
+    }
 }
 
-/// The fleet bucket, or the error every op answers without one.
-pub(crate) fn store() -> Result<&'static Bucket, String> {
-    R2_STORE.get().ok_or_else(|| {
+/// Resolve the named bucket from the fleet's captured storage configuration.
+pub(crate) fn store(bucket_name: &str) -> Result<Arc<Bucket>, String> {
+    let fleet = R2_STORE.get().ok_or_else(|| {
         "R2 bindings need a fleet bucket: start celld with --bucket (or CELLD_BUCKET)".to_string()
-    })
+    })?;
+    fleet
+        .r2_bucket(bucket_name)
+        .map_err(|error| error.to_string())
 }
 
 // ---- the object record ---------------------------------------------------
@@ -376,7 +381,7 @@ fn verify(
                 return Err(format!(
                     "R2 put: the {name} checksum of the body is {actual}, not the {claimed} the \
                      caller asserted"
-                ))
+                ));
             }
             None => return Err(format!("R2 put: celld cannot check a {name} checksum")),
         }
@@ -390,8 +395,9 @@ fn verify(
 /// to disagree about which key an object lives under, and the answer is
 /// only right because both sides scope the key the same way.
 pub(crate) async fn head(bucket_name: &str, key: &str) -> Result<Option<BlobMeta>, String> {
-    store()?
-        .head_blob(&blob_key(bucket_name, key))
+    let store = store(bucket_name)?;
+    store
+        .head_blob(&blob_key(&store, bucket_name, key))
         .await
         .map_err(|error| error.to_string())
 }
@@ -406,18 +412,19 @@ pub(crate) async fn read(
     range: BlobRange,
     conditions: &BlobConditions,
 ) -> Result<BlobRead, String> {
-    store()?
-        .get_blob(&blob_key(bucket_name, key), range, conditions)
+    let store = store(bucket_name)?;
+    store
+        .get_blob(&blob_key(&store, bucket_name, key), range, conditions)
         .await
         .map_err(|error| error.to_string())
 }
 
 /// Remove every named key. Shared with `celld r2 delete`.
 pub(crate) async fn delete(bucket_name: &str, keys: &[String]) -> Result<(), String> {
-    let store = store()?;
+    let store = store(bucket_name)?;
     let keys = keys
         .iter()
-        .map(|key| blob_key(bucket_name, key))
+        .map(|key| blob_key(&store, bucket_name, key))
         .collect::<Vec<_>>();
     // `delete_blobs` reports what went; anything left is a failure the
     // caller must see, because R2's delete either applies or throws.
@@ -444,12 +451,12 @@ pub(crate) async fn list(
 ) -> Result<serde_json::Value, String> {
     let request = serde_json::from_str::<ListRequest>(request_json)
         .map_err(|error| format!("invalid R2 list options: {error}"))?;
-    let store = store()?;
+    let store = store(bucket_name)?;
     let limit = match request.limit.unwrap_or(0) {
         limit if limit > 0 => (limit as usize).min(LIST_LIMIT),
         _ => LIST_LIMIT,
     };
-    let scoped = blob_key(bucket_name, &request.prefix);
+    let scoped = blob_key(&store, bucket_name, &request.prefix);
     // R2 resumes from the cursor when it has one and ignores
     // `startAfter`, which is the same knob for a first page.
     let after = request
@@ -457,7 +464,7 @@ pub(crate) async fn list(
         .filter(|cursor| !cursor.is_empty())
         .or(request.start_after)
         .filter(|after| !after.is_empty())
-        .map(|after| blob_key(bucket_name, &after));
+        .map(|after| blob_key(&store, bucket_name, &after));
     let page = store
         .list_page(
             &scoped,
@@ -469,7 +476,7 @@ pub(crate) async fn list(
         .map_err(|error| error.to_string())?;
     // The binding's key space is the caller's: strip the reserved
     // prefix back off, so a listed key is one the caller can `get`.
-    let strip = blob_key(bucket_name, "");
+    let strip = blob_key(&store, bucket_name, "");
     let unscope = |key: &str| key.strip_prefix(&strip).unwrap_or(key).to_string();
     // A listing carries no metadata on any object store; `include` is
     // R2 saying it is worth one head per object to have it, and those
@@ -491,6 +498,7 @@ pub(crate) async fn list(
             })
             .collect::<Vec<_>>(),
         true => {
+            let store = &store;
             let keys = page
                 .objects
                 .iter()
@@ -545,9 +553,10 @@ pub(crate) async fn put_once(
         storage_class: request.storage_class,
     };
     let conditions = BlobConditions::from(request.only_if.unwrap_or_default());
-    let meta = store()?
+    let store = store(&bucket_name)?;
+    let meta = store
         .put_blob(
-            &blob_key(&bucket_name, &key),
+            &blob_key(&store, &bucket_name, &key),
             body.into(),
             &envelope.write(),
             &conditions,
@@ -569,7 +578,8 @@ pub(crate) async fn put_once(
 /// chunk at a time and the host decides, at the first part boundary,
 /// whether this is one request or a multipart upload.
 pub(crate) struct PutStream {
-    bucket_name: String,
+    pub(crate) bucket_name: String,
+    pub(crate) broker_owner: Option<String>,
     key: String,
     request: PutRequest,
     digests: Digests,
@@ -604,10 +614,11 @@ pub(crate) fn open_put(
     let request = serde_json::from_str::<PutRequest>(request_json)
         .map_err(|error| format!("invalid R2 put options: {error}"))?;
     // Fail before a byte moves if there is no bucket at all.
-    store()?;
+    store(&bucket_name)?;
     let digests = Digests::wanted(&request.verify, true);
     Ok(PutStream {
         bucket_name,
+        broker_owner: None,
         key,
         request,
         digests,
@@ -655,10 +666,11 @@ impl PutStream {
             if !self.request.verify.contains_key("md5") {
                 self.digests.md5 = None;
             }
+            let store = store(&self.bucket_name)?;
             self.upload = Some(
-                store()?
+                store
                     .begin_multipart(
-                        &blob_key(&self.bucket_name, &self.key),
+                        &blob_key(&store, &self.bucket_name, &self.key),
                         &self.envelope().write(),
                     )
                     .await

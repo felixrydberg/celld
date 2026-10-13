@@ -8,7 +8,7 @@
 //! A release pipeline publishes a build artifact with
 //! `wrangler r2 object put` and the Worker serves it from its `r2_buckets`
 //! binding. celld served the binding but had no command, so the only way to
-//! seed a bucket was `aws s3 cp` straight into the fleet bucket. That works
+//! seed a bucket was `aws s3 cp` straight into object storage. That works
 //! for the bytes and loses the record: an R2 object carries
 //! `customMetadata`, a `cacheExpiry`, and its checksums in a celld-private
 //! envelope that a plain copy does not write. The result reads back with no
@@ -21,8 +21,8 @@
 //! and an object written here is an object the binding could have written.
 //!
 //! Unlike `celld d1`, `celld kv` and `celld queue`, this command needs no
-//! node. A binding reads the fleet bucket directly, so an operator with the
-//! bucket credentials can publish into an empty fleet — which is what a
+//! node. The named bucket uses the fleet backend and credentials, so an operator
+//! can publish into an empty fleet — which is what a
 //! release pipeline that runs before a deployment needs.
 
 use crate::cli_options::FLEET_HELP;
@@ -125,10 +125,11 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     };
     let storage = command.fleet.clone().resolve("celld r2")?;
-    // The binding's store, installed exactly as a node installs it, so
-    // every call below reaches the same keys the Worker reads.
-    crate::js::set_r2_store(storage.open().await?);
     let bucket = command.bucket.as_str();
+    let fleet = storage.open().await?;
+    fleet.validate_r2_bucket_name(bucket)?;
+    // Installed exactly as a node installs it; the R2 layer opens the binding's bucket.
+    crate::js::set_r2_store(fleet);
 
     match command.action {
         Action::Get { key } => {
@@ -354,15 +355,12 @@ impl Command {
             other => bail!("unknown `celld r2` subcommand: {other}"),
         };
         // The bucket is the `bucket_name` from `r2_buckets`, not the
-        // binding name: the name is what places the keys in the fleet
-        // bucket, and it is the one an `env.BUCKET` call resolves to.
+        // binding name: it is the bucket an `env.BUCKET` call resolves to.
         let bucket = arguments
             .next()
             .filter(|value| !value.starts_with('-'))
             .ok_or_else(|| anyhow!("celld r2 needs an r2 bucket name"))?;
-        // The same rule the deployment applies to `bucket_name`. Without
-        // it a name with a `/` in it would write under another binding's
-        // prefix, or outside the reserved `r2/` space entirely.
+        // Keep CLI and deployment bucket names on the same contract.
         if !crate::deploy::valid_resource_name(&bucket) {
             bail!(
                 "invalid r2 bucket name {bucket:?}: use letters, digits, `-` and `_` \
@@ -403,8 +401,8 @@ impl Command {
                 flag @ ("--local" | "--remote" | "--jurisdiction") => bail!(
                     "celld r2 does not take {flag}: celld runs neither a local \
                      miniflare store nor a Cloudflare account, and it has no \
-                     jurisdiction. An r2 bucket name addresses one key space in \
-                     one fleet."
+                     jurisdiction. An r2 bucket name addresses a bucket on \
+                     the fleet's backend."
                 ),
                 "--help" | "-h" => return Ok(None),
                 other => {
@@ -570,7 +568,7 @@ The bucket name is the `bucket_name` from the project's `r2_buckets` entry,
 not the binding name. `get` writes the object to stdout as bytes, so an
 artifact comes back byte for byte.
 
-This command reads the fleet bucket directly and needs no running node, so
+This command opens the named bucket with fleet credentials and needs no node, so
 a release pipeline can publish an object before it deploys the Worker.
 
 PUT OPTIONS

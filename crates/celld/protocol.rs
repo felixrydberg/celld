@@ -263,8 +263,13 @@ pub fn validate_queue_manifest(manifest: &Manifest) -> anyhow::Result<()> {
         manifest.queue_consumers.is_empty() || manifest.main_module.is_some(),
         "Queue consumer deployment has no Worker module"
     );
+    validate_queue_consumers(&manifest.queue_consumers)
+}
+
+/// The consumer rules shared by deployment manifests and application handlers.
+pub(crate) fn validate_queue_consumers(consumers: &[QueueConsumerConfig]) -> anyhow::Result<()> {
     let mut consumed = std::collections::BTreeSet::new();
-    for consumer in &manifest.queue_consumers {
+    for consumer in consumers {
         anyhow::ensure!(
             celld_logic::cell::valid_cell_scope(&consumer.queue),
             "Queue consumer has an invalid queue name {:?}",
@@ -376,14 +381,7 @@ pub enum ModuleKind {
     Wasm,
 }
 
-/// Reference from a deploy manifest to its immutable, canonical asset index.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AssetManifestRef {
-    pub index: String,
-    pub sha256: String,
-    pub file_count: u32,
-    pub total_bytes: u64,
-}
+pub use celld_applications::AssetManifestRef;
 
 /// `deploy/<script>/<version>/assets.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

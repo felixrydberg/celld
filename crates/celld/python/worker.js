@@ -21,6 +21,7 @@ import "./pyodide.asm.js";
 import { loadPyodide } from "./pyodide.mjs";
 import workerSource from "./worker.py";
 import files from "./files.bin";
+import snapshot from "./pyodide-snapshot.bin";
 import { COMPATIBILITY_FLAGS, LOCK, MAIN_MODULE, PROCESS_PTH_FILES } from "./config.js";
 import { RUNTIME_URL } from "./shims.js";
 import { fatalGate } from "./fatal.js";
@@ -113,6 +114,15 @@ const entrypointHelper = {
   },
 };
 
+// Seeds from fresh entropy what the snapshot's boot seeded. The kernel and
+// V8 were reseeded per VM before the guest started.
+const RESEED = `
+import random, sys
+random.seed()
+if "tempfile" in sys.modules:
+    sys.modules["tempfile"]._name_sequence = None
+`;
+
 let started;
 function describe(error) {
   try {
@@ -123,6 +133,11 @@ function describe(error) {
 }
 
 async function start() {
+  // celld: on the application platform the interpreter is restored from a
+  // shared base snapshot (a booted interpreter, before any handler import)
+  // instead of booted per VM. An empty snapshot is a bundle that starts its
+  // own interpreter, as above.
+  const restore = snapshot.byteLength > 0;
   const pyodide = await loadPyodide({
     indexURL: RUNTIME_URL,
     lockFileContents: LOCK,
@@ -130,7 +145,14 @@ async function start() {
     // workerd's interpreter environment. The fixed hash seed makes string
     // hashing, and so set iteration order, match Cloudflare.
     env: { HOME: "/session", PYTHONHASHSEED: "111" },
+    ...(restore && { _loadSnapshot: snapshot }),
   });
+  if (restore) {
+    // Every VM restores the same bytes: Python's random state must not repeat.
+    pyodide.runPython(RESEED);
+    // The interpreter owns its copy now.
+    snapshot.transfer();
+  }
   pyodide._api.on_fatal = (error) => {
     const reason = `Python Worker fatal error: ${describe(error)}`;
     fatal.fail(new Error(reason));

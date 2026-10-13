@@ -344,7 +344,7 @@ pub(crate) fn gc_options_from_arguments(
     if !dry_run {
         bail!(
             "celld cell gc deletes nothing itself; pass --dry-run to report what the owners \
-             would delete, and give CELLD_LTX_RETENTION_SECS a positive value on the fleet to \
+             would delete, and give CELLD_LTX_RETENTION_SECS a positive value on the nodes to \
              let them"
         );
     }
@@ -366,12 +366,13 @@ and prints the candidates: the epochs below the chain's base, except the
 newest epoch, the epoch before it, and each epoch whose newest object is
 younger than the grace. This command reads the bucket and writes nothing.
 
-The owners delete fewer, later, or none: only a fleet node with a
-positive CELLD_LTX_RETENTION_SECS deletes, with that grace instead of
---grace-secs; a paged cell waits until its local file is complete; an
-inactive cell waits until it is active again; a cell that is not paged
-waits until its activation has a write, so a cell that is only read
-deletes nothing; and one pass deletes at most 64 epochs of a cell.
+The owners delete fewer, later, or none: only a node with a positive
+CELLD_LTX_RETENTION_SECS deletes, in either CELLD_DURABILITY mode, with
+that grace instead of --grace-secs; a paged cell waits until its local
+file is complete; an inactive cell waits until it is active again; a cell
+that is not paged waits until its activation has a write, so a cell that
+is only read deletes nothing; and one pass deletes at most 64 epochs of a
+cell.
 
 OPTIONS:
   --dry-run           Required; report without deleting

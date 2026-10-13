@@ -36,6 +36,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod python;
+pub(crate) use python::{runtime_files, sentinel_bytes, PYODIDE_VERSION};
 
 /// Config keys we understand. Anything else is an error: refusing is
 /// compat-safe, guessing produces confusing activation failures later.
@@ -202,13 +203,34 @@ pub struct Options {
     pub dry_run: bool,
     pub json: bool,
     /// Worker variables that override the `vars` of the config. `celld dev`
-    /// reads them from `.dev.vars`; `celld deploy` supplies none, so a local
-    /// credential cannot reach a fleet.
-    pub vars: BTreeMap<String, String>,
+    /// reads them from `.dev.vars` or the dotenv files; `celld deploy`
+    /// supplies none, so a local credential cannot reach a fleet.
+    pub vars: VarOverrides,
     /// Keep container images in the local engine instead of saving them to
     /// the bucket. `celld dev` runs its node on the same engine that built
     /// them; a fleet needs the tar.
     pub local_images: bool,
+    /// Build a Python Worker without its interpreter files, which the
+    /// application platform serves from a shared drive (see `python::build`).
+    pub shared_python_runtime: bool,
+}
+
+/// Local Worker variables, tagged with the kind of file that supplied them.
+/// The kind decides what an entry that cannot become a var binding does, so
+/// it travels with the entries instead of beside them.
+#[derive(Default)]
+pub enum VarOverrides {
+    #[default]
+    None,
+    /// `.dev.vars` exists only for the Worker, so an entry that cannot become
+    /// a binding is a mistake, and it fails the build.
+    DevVars(BTreeMap<String, String>),
+    /// `.env` and `.env.local` also serve other tools, such as a bundler or an
+    /// ORM. An entry with a name that is not a valid binding, or a name that
+    /// another binding of the config uses, is skipped with a warning. Failing
+    /// instead stops a `celld dev` that `wrangler dev` runs, and the only
+    /// workaround is an empty `.dev.vars`.
+    DotEnv(BTreeMap<String, String>),
 }
 
 pub fn print_help() {
@@ -243,8 +265,9 @@ pub fn options_from_arguments(
         region: None,
         dry_run: false,
         local_images: false,
+        shared_python_runtime: false,
         json: false,
-        vars: BTreeMap::new(),
+        vars: VarOverrides::None,
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -385,7 +408,7 @@ struct ContainerDecl {
     runtime: Option<String>,
 }
 
-struct ProjectAssets {
+pub(crate) struct ProjectAssets {
     directory: PathBuf,
     config: AssetConfig,
     raw_metadata: Value,
@@ -606,7 +629,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .as_deref()
         .map(|entry| {
             if let Some(compat) = &project.python {
-                let (output, descriptor) = python::build(&root, entry, compat)?;
+                let (output, descriptor) = python::build(&root, entry, compat, options.shared_python_runtime)?;
                 project.metadata["python_runtime"] = descriptor;
                 Ok(output)
             } else if project.no_bundle {
@@ -860,7 +883,28 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
     bucket.put(&key, output.stdout).await
 }
 
+/// Refuse fleet-storage bindings before publication or format initialization.
+pub fn validate_r2_bindings(bucket: &Bucket, manifest: &Manifest) -> anyhow::Result<()> {
+    if let Some(bindings) = manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(Value::as_array)
+    {
+        for binding in bindings {
+            if binding.get("type").and_then(Value::as_str) == Some("r2_bucket") {
+                let name = binding
+                    .get("bucket_name")
+                    .and_then(Value::as_str)
+                    .context("R2 binding has no bucket_name")?;
+                bucket.validate_r2_bucket_name(name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    validate_r2_bindings(bucket, &built.manifest)?;
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
@@ -1266,11 +1310,7 @@ pub(crate) fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> 
     )
 }
 
-fn read_project(
-    path: &Path,
-    root: &Path,
-    overrides: &BTreeMap<String, String>,
-) -> anyhow::Result<Project> {
+fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::Result<Project> {
     let source =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let config: Value = serde_json::from_str(&strip_jsonc(&source))
@@ -1796,7 +1836,7 @@ fn read_project(
             .get("bucket_name")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                anyhow!("r2 binding {binding} has no `bucket_name`; celld uses the name to place the bucket's keys in the fleet bucket")
+                anyhow!("r2 binding {binding} has no `bucket_name`; celld opens the named bucket using the fleet's backend and credentials")
             })?;
         if !valid_resource_name(bucket_name) {
             bail!(
@@ -1875,15 +1915,40 @@ fn read_project(
         Some(_) => bail!("config `vars` must be an object"),
     }
     // An asset-only project has no Worker to hand a variable to, so a
-    // `.dev.vars` beside it is residue, not a binding the guard below
+    // `.dev.vars` or `.env` beside it is residue, not a binding the guard below
     // should refuse in the config's name.
     let declared_vars = !vars.is_empty();
     if main.is_some() {
-        vars.extend(
-            overrides
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
-        );
+        match overrides {
+            VarOverrides::None => {}
+            VarOverrides::DevVars(entries) => vars.extend(
+                entries
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            ),
+            VarOverrides::DotEnv(entries) => {
+                // A config var of the same name is the override the entry
+                // exists for; every other binding owns its name.
+                let taken = bindings
+                    .iter()
+                    .filter_map(|binding| binding.get("name").and_then(Value::as_str))
+                    .chain(
+                        assets
+                            .as_ref()
+                            .and_then(|assets| assets.config.binding.as_deref()),
+                    )
+                    .collect::<BTreeSet<_>>();
+                for (name, value) in entries {
+                    if !valid_binding(name) {
+                        note!("warning: skipped the dotenv entry {name:?}, which is not a valid binding name");
+                    } else if taken.contains(name.as_str()) {
+                        note!("warning: skipped the dotenv entry {name:?}, whose name another binding uses");
+                    } else {
+                        vars.insert(name, value);
+                    }
+                }
+            }
+        }
     }
     for (name, value) in &vars {
         if !valid_binding(name) {
@@ -2253,10 +2318,8 @@ fn optional_queue_u32(value: &Value, field: &str) -> anyhow::Result<Option<u32>>
 
 /// The upstream workflow-name rule (`^[a-zA-Z0-9_][a-zA-Z0-9-_]*$`, at most 64
 /// characters). Instance ids follow the same rule; the harness validates those
-/// because they arrive at run time, not at deploy. An R2 `bucket_name` takes
-/// the same rule for a second reason: the name becomes a key prefix inside the
-/// fleet bucket, and this rule is what keeps it a single path segment, so a
-/// binding cannot address the fleet's own deployment, cell, or lease keys.
+/// because they arrive at run time, not at deploy. R2 `bucket_name` retains
+/// this existing deployment contract, which also accepts bucket UUIDs.
 pub(crate) fn valid_resource_name(name: &str) -> bool {
     name.len() <= 64
         && name
@@ -2371,7 +2434,7 @@ fn read_sqlite_classes(project: &Map<String, Value>) -> anyhow::Result<Vec<Strin
     Ok(result)
 }
 
-fn read_asset_project(
+pub(crate) fn read_asset_project(
     value: &Value,
     root: &Path,
     project: &Map<String, Value>,
@@ -2604,7 +2667,7 @@ fn read_asset_directive(directory: &Path, name: &str) -> anyhow::Result<Option<S
     Ok(Some(contents))
 }
 
-fn build_assets(project: &ProjectAssets) -> anyhow::Result<BuiltAssets> {
+pub(crate) fn build_assets(project: &ProjectAssets) -> anyhow::Result<BuiltAssets> {
     let max_file_bytes = crate::env_vars::max_asset_file_bytes()?;
     let mut files = Vec::new();
     collect_asset_files(&project.directory, "", &mut files)?;

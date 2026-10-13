@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub(crate) mod wake_record;
@@ -80,8 +80,12 @@ pub struct Cells {
 /// prevents asynchronous object-store work from recovering an epoch through a
 /// later ownership lookup after a takeover.
 struct OpenCell {
+    scope: String,
     connection: Connection,
     epoch: u64,
+    // A generation swap can reopen this cell at the same fenced epoch. Guest
+    // capabilities must also match this particular connection incarnation.
+    residency: Arc<AtomicBool>,
     replicated_wake: bool,
     backing: StorageBacking,
     /// The committed-write position the first event of this activation
@@ -89,6 +93,13 @@ struct OpenCell {
     /// read-only answer reports what it observed only above it, and a reader
     /// on a cell no handler has written asks for no proof.
     published_position: Option<u64>,
+}
+
+impl Drop for OpenCell {
+    fn drop(&mut self) {
+        self.residency.store(false, Ordering::Release);
+        crate::js::retire_guest_input_gate(&self.scope, &self.residency);
+    }
 }
 
 enum StorageBacking {
@@ -104,6 +115,10 @@ enum StorageBacking {
         root_path: String,
         root_scope: String,
         facet_path: Vec<String>,
+        /// Unique to this opening of the facet within the process. A facet
+        /// that its root reopens, even at the same scope and epoch after a
+        /// generation swap, is a new actor and takes a new value.
+        opening: u64,
         /// The root cell's gate sample, see [`StorageIdentity::root_position`].
         root_position: u64,
         root_observed: Option<u64>,
@@ -869,8 +884,10 @@ fn finish_open(
         d.borrow_mut().insert(
             scope.to_string(),
             OpenCell {
+                scope: scope.to_owned(),
                 connection: c,
                 epoch,
+                residency: Arc::new(AtomicBool::new(true)),
                 replicated_wake,
                 backing,
                 published_position: None,
@@ -928,6 +945,10 @@ fn with_mut<T>(scope: &str, f: impl FnOnce(&mut Connection) -> T) -> Option<T> {
 /// Return the epoch installed with the active cell database.
 pub(crate) fn activation_epoch(scope: &str) -> Option<u64> {
     dbs(|d| d.borrow().get(scope).map(|cell| cell.epoch))
+}
+
+pub(crate) fn activation_residency(scope: &str) -> Option<Arc<AtomicBool>> {
+    dbs(|d| d.borrow().get(scope).map(|cell| cell.residency.clone()))
 }
 
 /// The identity a facet of `scope` inherits, including the root cell's gate
@@ -1006,6 +1027,49 @@ pub(crate) fn embedded_root_gate(scope: &str) -> Option<RootGate> {
     })
 }
 
+/// The opening of the facet `scope` in this isolate, while it is open.
+pub(crate) fn facet_opening(scope: &str) -> Option<u64> {
+    dbs(|databases| match &databases.borrow().get(scope)?.backing {
+        StorageBacking::Embedded { opening, .. } => Some(*opening),
+        StorageBacking::File { .. } => None,
+    })
+}
+
+/// The facets open in this isolate below the facet at `facet_path` of `root`,
+/// deepest first, so each closes before its parent.
+pub(crate) fn embedded_facets_below(root: &str, facet_path: &[String]) -> Vec<String> {
+    open_facets(root, facet_path, false)
+}
+
+/// The same, with the facets at `facet_path` itself.
+pub(crate) fn embedded_facets_from(root: &str, facet_path: &[String]) -> Vec<String> {
+    open_facets(root, facet_path, true)
+}
+
+fn open_facets(root: &str, facet_path: &[String], include_self: bool) -> Vec<String> {
+    dbs(|databases| {
+        let databases = databases.borrow();
+        let mut below: Vec<(usize, String)> = databases
+            .iter()
+            .filter_map(|(scope, cell)| match &cell.backing {
+                StorageBacking::Embedded {
+                    root_scope,
+                    facet_path: path,
+                    ..
+                } if root_scope == root
+                    && (include_self || path.len() > facet_path.len())
+                    && path.starts_with(facet_path) =>
+                {
+                    Some((path.len(), scope.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        below.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        below.into_iter().map(|(_, scope)| scope).collect()
+    })
+}
+
 /// Take the root cell's gate sample of a facet that is already open, so the
 /// egress of this call is held against what the root cell had committed when
 /// the call left it, not against what it had committed when the facet first
@@ -1058,7 +1122,10 @@ pub(crate) fn open_embedded(
     restored: bool,
     sqlite_vec: bool,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(parent.facet_path.len() < 3, "Facet nesting depth limit exceeded. The maximum depth including the root Durable Object is 4.");
+    anyhow::ensure!(
+        parent.facet_path.len() < 3,
+        "Facet nesting depth limit exceeded. The maximum depth including the root Durable Object is 4."
+    );
     let mut facet_path = parent.facet_path.clone();
     facet_path.push(name.to_string());
     let stream = crate::engine_api::facet_cell(&parent.root_scope, &facet_path);
@@ -1104,6 +1171,7 @@ pub(crate) fn open_embedded(
         sqlite_vec,
         StorageBacking::Embedded {
             stream,
+            opening: NEXT_FACET_OPENING.fetch_add(1, Ordering::Relaxed),
             root_path: parent.root_path.clone(),
             root_scope: parent.root_scope.clone(),
             facet_path,
@@ -1139,6 +1207,7 @@ pub(crate) fn delete_legacy_facet(parent: &StorageIdentity, name: &str) -> anyho
 }
 
 static NEXT_BATCH_SAVEPOINT: AtomicU64 = AtomicU64::new(1);
+static NEXT_FACET_OPENING: AtomicU64 = AtomicU64::new(1);
 static NEXT_SYNC_LIST_CURSOR: AtomicU64 = AtomicU64::new(1);
 static NEXT_SQL_CURSOR: AtomicU64 = AtomicU64::new(1);
 
@@ -1309,6 +1378,52 @@ pub fn observed_position(scope: &str, sample: Option<u64>) -> Option<u64> {
         Some(published) if position <= published => None,
         _ => Some(position),
     }
+}
+
+/// Trusted output sample taken by the guest broker, in the owning turn and
+/// never from a guest reply. A facet names its root rather than inventing a
+/// routable cell, and its own writes are proved on its own stream.
+pub(crate) struct OutputGateSample {
+    pub cell: String,
+    pub epoch: Option<u64>,
+    pub position: Option<u64>,
+    pub observed: Option<u64>,
+    /// The facet's replication stream, which the output waits for before it
+    /// passes the root's gate: every effect can reveal a facet write, this
+    /// event's or an earlier one's.
+    pub facet_stream: Option<String>,
+}
+
+pub(crate) fn output_gate_sample(
+    scope: &str,
+    before: u64,
+    root: Option<RootGate>,
+) -> anyhow::Result<OutputGateSample> {
+    if let Some(root) = root {
+        if let Some(error) = sql_critical_error(scope) {
+            return Err(anyhow::anyhow!(error));
+        }
+        return Ok(OutputGateSample {
+            cell: root.cell,
+            epoch: Some(root.epoch),
+            position: None,
+            observed: root.observed,
+            facet_stream: Some(root.stream),
+        });
+    }
+    let sample = write_position(scope)?;
+    let wrote = sample.is_some_and(|position| position > before);
+    Ok(OutputGateSample {
+        cell: scope.to_owned(),
+        epoch: activation_epoch(scope),
+        position: if wrote { sample } else { None },
+        observed: if wrote {
+            None
+        } else {
+            observed_position(scope, sample)
+        },
+        facet_stream: None,
+    })
 }
 
 fn data_version(connection: &Connection) -> u64 {
@@ -2118,6 +2233,28 @@ pub fn sql_cursor_close(cursor_id: u64) {
     });
 }
 
+/// Host-only classification while the original native storage turn is held.
+/// A guest cannot declare a write statement safe to retain across responses.
+pub(crate) fn sql_cursor_readonly(cursor_id: u64) -> Option<bool> {
+    sql_cursors(|cursors| {
+        cursors.borrow().get(&cursor_id).map(|cursor| {
+            // SAFETY: the live cursor exclusively owns this prepared statement.
+            unsafe { rusqlite::ffi::sqlite3_stmt_readonly(cursor.statement) != 0 }
+        })
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn sql_cursor_count(scope: &str) -> usize {
+    sql_cursors(|cursors| {
+        cursors
+            .borrow()
+            .values()
+            .filter(|cursor| cursor.scope == scope)
+            .count()
+    })
+}
+
 /// `(last_insert_rowid, changes)` for the cell's connection. D1 reports both in
 /// a statement's `meta`; the DO `SqlStorage` surface exposes neither, so this
 /// is a separate read rather than a new field on the cursor result.
@@ -2330,7 +2467,7 @@ fn d1_bind_value(value: &serde_json::Value) -> Result<rusqlite::types::Value, D1
                                 "Type 'object' not supported for value '{item}': an array bind \
                                  must hold bytes 0-255"
                             ),
-                        })
+                        });
                     }
                 }
             }
@@ -2530,7 +2667,7 @@ unsafe fn d1_step_to_done(
                     database,
                     started_in_transaction,
                     code,
-                ))
+                ));
             }
         }
     }
@@ -3529,6 +3666,19 @@ pub fn put_many(scope: &str, entries: &[(String, String)]) -> anyhow::Result<()>
 }
 
 pub fn put_many_serialized(scope: &str, entries: &[(String, Vec<u8>)]) -> anyhow::Result<()> {
+    put_many_values(scope, entries)
+}
+
+/// Portable values use the existing TEXT/JSON row representation. They share
+/// the same batch transaction and critical-error handling as V8 clone BLOBs.
+pub fn put_many_json(scope: &str, entries: &[(String, String)]) -> anyhow::Result<()> {
+    for (_, value) in entries {
+        serde_json::from_str::<serde_json::Value>(value)?;
+    }
+    put_many_values(scope, entries)
+}
+
+fn put_many_values<T: rusqlite::ToSql>(scope: &str, entries: &[(String, T)]) -> anyhow::Result<()> {
     if entries.is_empty() {
         return with(scope, |_| ()).ok_or_else(|| anyhow::anyhow!("no db for {scope}"));
     }
@@ -3705,6 +3855,12 @@ pub fn sql_critical_error(scope: &str) -> Option<String> {
     sql_critical_errors(|errors| errors.borrow().get(scope).cloned())
 }
 
+/// Fail `scope` as a fatal SQL error would.
+#[cfg(test)]
+pub(crate) fn poison_sql_for_test(scope: &str, error: &str) {
+    d1_poison_transaction(scope, error.to_string());
+}
+
 fn require_sql_healthy(scope: &str) -> Result<(), String> {
     match sql_critical_error(scope) {
         Some(error) => Err(error),
@@ -3800,6 +3956,10 @@ fn close_sync_list_cursors(scope: &str) {
             .borrow_mut()
             .retain(|_, cursor| cursor.scope != scope);
     });
+}
+
+pub fn sync_list_close(cursor_id: u64) {
+    sync_list_cursors(|cursors| cursors.borrow_mut().remove(&cursor_id));
 }
 
 fn close_sql_cursors(scope: &str) {

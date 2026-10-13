@@ -84,6 +84,9 @@ struct AssetResolverInner {
     index: AssetIndex,
     asset_only: bool,
     fallback: Option<FallbackSource>,
+    /// Application assets keep their bodies under the application's own
+    /// artifact prefix instead of the fleet-wide content-addressed prefix.
+    blob_prefix: Option<String>,
     fallback_state: std::sync::Mutex<FallbackState>,
     cache_root: PathBuf,
     cache_max_bytes: u64,
@@ -146,7 +149,22 @@ impl AssetResolver {
             return Err(anyhow!("unsupported asset index name: {}", reference.index));
         }
         let key = format!("{prefix}/{}", reference.index);
-        let (bytes, _) = bucket.get(&key).await?.with_context(|| {
+        Self::load_scoped(bucket, &key, None, None, reference, asset_only, fallback).await
+    }
+
+    /// `load` for an index stored at `key`. `blob_prefix` names where the
+    /// bodies live (`None`: the fleet-wide prefix) and `cache_scope` keeps
+    /// the local body cache private to one application.
+    pub async fn load_scoped(
+        bucket: &Bucket,
+        key: &str,
+        blob_prefix: Option<String>,
+        cache_scope: Option<&str>,
+        reference: &AssetManifestRef,
+        asset_only: bool,
+        fallback: Option<FallbackSource>,
+    ) -> anyhow::Result<Self> {
+        let (bytes, _) = bucket.get(key).await?.with_context(|| {
             format!(
                 "read {}://{}/{key}: no such key",
                 bucket.scheme(),
@@ -161,9 +179,12 @@ impl AssetResolver {
         validate_index(&index, reference)?;
         let header_rules = parse_header_rules(index.config.headers.as_deref().unwrap_or(""))?;
         let redirect_rules = parse_redirect_rules(index.config.redirects.as_deref().unwrap_or(""))?;
-        let cache_root = std::env::var_os("CELLD_ASSET_CACHE_DIR")
+        let mut cache_root = std::env::var_os("CELLD_ASSET_CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("celld").join("asset-cache"));
+        if let Some(scope) = cache_scope {
+            cache_root = cache_root.join("apps").join(scope);
+        }
         std::fs::create_dir_all(&cache_root)
             .with_context(|| format!("create asset cache directory {}", cache_root.display()))?;
         let cache_max_bytes =
@@ -174,6 +195,7 @@ impl AssetResolver {
                 index,
                 asset_only,
                 fallback,
+                blob_prefix,
                 fallback_state: std::sync::Mutex::new(FallbackState::default()),
                 cache_root,
                 cache_max_bytes,
@@ -185,8 +207,19 @@ impl AssetResolver {
         })
     }
 
+    pub fn entries(&self) -> impl Iterator<Item = &AssetEntry> {
+        self.inner.index.entries.values()
+    }
+
     pub fn binding_name(&self) -> Option<&str> {
         self.inner.index.config.binding.as_deref()
+    }
+
+    pub fn worker_first_disabled(&self) -> bool {
+        match &self.inner.index.config.run_worker_first {
+            RunWorkerFirst::Bool(value) => !value,
+            RunWorkerFirst::Routes(routes) => routes.is_empty(),
+        }
     }
 
     pub fn asset_only(&self) -> bool {
@@ -678,6 +711,10 @@ impl AssetResolver {
         let mut random = rand::rngs::OsRng;
         let temporary = parent.join(format!(".{}.{}.tmp", std::process::id(), random.next_u64()));
         let key = asset_blob_key(&entry.sha256)
+            .map(|fleet| match &self.inner.blob_prefix {
+                Some(prefix) => format!("{prefix}{}", entry.sha256),
+                None => fleet,
+            })
             .ok_or_else(|| anyhow!("invalid asset digest for {resolved_path}"))?;
         let (body, _) = self
             .inner
@@ -755,7 +792,7 @@ impl AssetResolver {
         let _guard = self.inner.cleanup_lock.lock().await;
         let root = self.inner.cache_root.clone();
         let limit = self.inner.cache_max_bytes;
-        tokio::task::spawn_blocking(move || cleanup_cache_files(&root, limit))
+        tokio::task::spawn_blocking(move || cleanup_cache_files(&root, limit, None))
             .await
             .context("join asset cache cleanup")?
     }
@@ -1251,7 +1288,7 @@ async fn valid_cached_file(
     }
 }
 
-fn touch_cache_file(path: PathBuf) {
+pub(crate) fn touch_cache_file(path: PathBuf) {
     tokio::task::spawn_blocking(move || {
         let times = std::fs::FileTimes::new().set_modified(std::time::SystemTime::now());
         let _ = std::fs::File::options()
@@ -1261,7 +1298,13 @@ fn touch_cache_file(path: PathBuf) {
     });
 }
 
-fn cleanup_cache_files(root: &Path, limit: u64) -> anyhow::Result<()> {
+/// Evicts oldest-modified files past `limit` bytes and, when `max_age` is set,
+/// any file unused for that long (also stranded temp files).
+pub(crate) fn cleanup_cache_files(
+    root: &Path,
+    limit: u64,
+    max_age: Option<std::time::Duration>,
+) -> anyhow::Result<()> {
     let mut files = Vec::new();
     let mut total = 0_u64;
     for shard in
@@ -1275,6 +1318,12 @@ fn cleanup_cache_files(root: &Path, limit: u64) -> anyhow::Result<()> {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
+            if let (Some(age), Ok(modified)) = (max_age, entry.metadata().and_then(|m| m.modified())) {
+                if modified.elapsed().is_ok_and(|elapsed| elapsed > age) {
+                    let _ = std::fs::remove_file(entry.path());
+                    continue;
+                }
+            }
             if name.len() != 64
                 || !name
                     .bytes()

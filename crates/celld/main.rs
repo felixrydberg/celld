@@ -3,6 +3,7 @@
 // The binary contains connection, startup, shutdown, and V8 shell code. The
 // library Actor owns the execution domain and its routed adapters.
 #![allow(clippy::disallowed_methods)]
+#![recursion_limit = "256"]
 
 //! Runnable celld vertical slice.
 //!
@@ -16,7 +17,8 @@ use celld::actor::*;
 use celld::bucket::Bucket;
 use celld::cell_dispatch::{
     dispatch_call_attempt, dispatch_gate, local_dispatch_request_id, local_request_error,
-    local_response_stream, split_do_call, CallAttempt, CallPayload, RoutedRequestError,
+    local_response_stream, requests_websocket_upgrade, serve_guest_object, split_do_call,
+    CallAttempt, CallPayload, RoutedRequestError, WEBSOCKET_WITHOUT_UPGRADE,
 };
 use celld::fleet;
 use celld::generation::{
@@ -150,6 +152,16 @@ fn exit_flushed(code: i32) -> ! {
     std::process::exit(code);
 }
 
+/// Application VMs keep accepted work (`waitUntil`) past its reply, outside
+/// public admission; the pre-drain waits for it within the same bound.
+fn application_vms_settled() -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(applications) = celld::application_vm::hosted() {
+        return applications.settled();
+    }
+    true
+}
+
 /// Await shutdown work only while the orchestrator-compatible process budget
 /// remains. A zero budget does not poll the future, so best-effort store and
 /// diagnostic work cannot begin after the absolute deadline.
@@ -247,6 +259,24 @@ type HttpReply = Response<UnsyncBoxBody<Bytes, std::io::Error>>;
 
 const STALE_ROUTE_HEADER: &str = "x-cells-route-error";
 const STALE_ROUTE_VALUE: &str = "stale-owner";
+/// Marks a forwarded fetch whose handler failed on the owner, so the caller's
+/// `stub.fetch()` rejects as it does for a local owner. Without the marker a
+/// remote handler failure looks like an application 500 response.
+const HANDLER_FAILURE_HEADER: &str = "x-cells-handler-failure";
+const HANDLER_FAILURE_PREFIX: &str = "cell Worker failed: ";
+
+/// A handler failure that the owner reported for a forwarded fetch. The owner
+/// ran the handler, so a retry would run it a second time.
+#[derive(Debug)]
+struct RemoteHandlerFailure(String);
+
+impl std::fmt::Display for RemoteHandlerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RemoteHandlerFailure {}
 const DURABLE_OBJECT_ROUTING_ERROR_MARKER: &str = "__CELLD_DO_ROUTING_ERROR__:";
 
 fn owner_unreachable(scope: &str, owner: &str, source: anyhow::Error) -> anyhow::Error {
@@ -748,6 +778,7 @@ async fn arm_cron_schedule(app: AppHandle, cell: String) -> anyhow::Result<()> {
             reply,
             order: None,
             parent: None,
+            guest: None,
         },
     )
     .await;
@@ -794,6 +825,63 @@ fn spawn_cron_arm(app: AppHandle) {
                     tokio::time::sleep(std::time::Duration::from_millis(500 << attempt.min(5)))
                         .await;
                 }
+            }
+        }
+    });
+}
+
+/// Arm each application cron cell whose schedule this node has not armed, as
+/// `spawn_cron_arm` does for the Worker's: through the ordinary Durable Object
+/// path, on every node, with ownership deciding which cell answers. Boot and any
+/// catalog change (activation, replacement) arrive here; a failed arm is retried.
+#[cfg(target_os = "linux")]
+fn spawn_application_cron_arm(app: AppHandle) {
+    tokio::spawn(async move {
+        let mut cursor = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let Some(applications) = celld::application_vm::hosted() else {
+                return;
+            };
+            if !app.healthy().await {
+                continue;
+            }
+            let page = match applications.cron_candidates(cursor.clone()).await {
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(%error, "application cron candidate page failed; retrying");
+                    // Invalid provider cursors recover by a conservative complete cycle.
+                    if error.to_string().contains("cursor") || error.to_string().contains("token") {
+                        cursor = None;
+                    }
+                    continue;
+                }
+            };
+            let mut retry = false;
+            for candidate in page.candidates {
+                let cell = candidate.scope;
+                match applications.cron_candidate_ready(&cell).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) if error.is::<celld::applications::UncommittedCellIndex>() => {
+                        continue
+                    }
+                    Err(error) => {
+                        tracing::warn!(cell, %error, "application cron metadata failed; retrying page");
+                        retry = true;
+                        continue;
+                    }
+                }
+                match arm_cron_schedule(app.clone(), cell.clone()).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::warn!(cell, %error, "application cron arm failed; retrying page");
+                        retry = true;
+                    }
+                }
+            }
+            if !retry {
+                cursor = page.next_cursor;
             }
         }
     });
@@ -1037,13 +1125,8 @@ async fn internal_reload(app: AppHandle) -> HttpReply {
 
 async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
     let (mut call, mut payload, reply) = split_do_call(call);
-    let mut websocket_timing = payload
-        .headers
-        .iter()
-        .any(|(name, value)| {
-            name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket")
-        })
-        .then(|| WebSocketRouteTiming {
+    let mut websocket_timing =
+        requests_websocket_upgrade(&payload.headers).then(|| WebSocketRouteTiming {
             started: Instant::now(),
             route_resolution_us: 0,
             dispatch_us: 0,
@@ -1096,6 +1179,24 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         );
                     }
                     break result;
+                }
+                CallAttempt::RefusedWebSocket { error, websocket } => {
+                    websocket::reject_accepted_websocket(&app, &websocket, &error.to_string())
+                        .await;
+                    if let Some(timing) = websocket_timing.as_mut() {
+                        timing.dispatch_us = timing
+                            .dispatch_us
+                            .saturating_add(dispatch_started.elapsed().as_micros() as u64);
+                        timing.emit(
+                            &app,
+                            &call.scope,
+                            call.request_id,
+                            "error",
+                            "local",
+                            app.runtime.as_ref().map_or("", |runtime| runtime.node()),
+                        );
+                    }
+                    break Err(error);
                 }
                 CallAttempt::Remote {
                     node,
@@ -1172,20 +1273,37 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         scope.clone(),
                         request_id,
                     );
-                    let response = peer_tunnel::fetch(
-                        &peer_tunnel::Peer {
-                            http: &app.peer_http,
-                            auth: &app.peer_auth,
-                            addr: &addr,
-                            node: &node,
-                        },
-                        &control,
-                        url.clone(),
-                        method.clone(),
-                        headers.clone(),
-                        attempt_body,
-                    )
-                    .await
+                    let peer = peer_tunnel::Peer {
+                        http: &app.peer_http,
+                        auth: &app.peer_auth,
+                        addr: &addr,
+                        node: &node,
+                    };
+                    let response = match &call.guest {
+                        Some(guest) => {
+                            peer_tunnel::guest_fetch(
+                                &peer,
+                                &control,
+                                guest,
+                                url.clone(),
+                                method.clone(),
+                                headers.clone(),
+                                attempt_body,
+                            )
+                            .await
+                        }
+                        None => {
+                            peer_tunnel::fetch(
+                                &peer,
+                                &control,
+                                url.clone(),
+                                method.clone(),
+                                headers.clone(),
+                                attempt_body,
+                            )
+                            .await
+                        }
+                    }
                     .map_err(|error| owner_unreachable(scope, &addr, error))?;
                     // Only after the tunnel has taken the stream: `disarm`
                     // releases the guard's registry claim, and a claim that
@@ -1249,6 +1367,22 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                             observed_position: None,
                         });
                     }
+                    if response.headers().contains_key(HANDLER_FAILURE_HEADER) {
+                        // The owner ran the handler, so the attempt is
+                        // complete: the owner needs no abort, and the error
+                        // must not reach the redispatch policy below.
+                        abort.disarm();
+                        let body = Limited::new(response.into_body(), MAX_PEER_CONTROL_BODY_BYTES)
+                            .collect()
+                            .await
+                            .map(|body| body.to_bytes())
+                            .unwrap_or_default();
+                        let body = String::from_utf8_lossy(&body);
+                        let message = body.strip_prefix(HANDLER_FAILURE_PREFIX).unwrap_or(&body);
+                        return Err(anyhow::Error::new(RemoteHandlerFailure(
+                            message.to_string(),
+                        )));
+                    }
                     let response_headers = response
                         .headers()
                         .iter()
@@ -1295,6 +1429,12 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         timing.emit(&app, scope, request_id, "ok", "remote", &node);
                     }
                     break Ok(response);
+                }
+                Err(error) if error.downcast_ref::<RemoteHandlerFailure>().is_some() => {
+                    if let Some(timing) = websocket_timing.as_ref() {
+                        timing.emit(&app, scope, request_id, "error", "remote", &node);
+                    }
+                    break Err(error);
                 }
                 Err(error) => {
                     // A streamed upload is not replayable after the HTTP
@@ -1617,10 +1757,15 @@ fn internal_do_worker_error(error: anyhow::Error) -> HttpReply {
     if cell_overload_error(&error) {
         return cell_overload_response();
     }
-    response(
+    let mut failed = response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("cell Worker failed: {error:#}"),
-    )
+        format!("{HANDLER_FAILURE_PREFIX}{error:#}"),
+    );
+    failed.headers_mut().insert(
+        hyper::header::HeaderName::from_static(HANDLER_FAILURE_HEADER),
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    failed
 }
 
 /// Divide an ingress request into its metadata and a body that the Worker
@@ -1859,6 +2004,7 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
 /// rather than only the node it connected to. `/do/` and `/runtime/` share this:
 /// they differ in what they authenticate, not in how they reach a cell.
 async fn dispatch_cell_fetch(
+    app: &AppHandle,
     cell: String,
     name: Option<String>,
     url: String,
@@ -1889,6 +2035,7 @@ async fn dispatch_cell_fetch(
         // Cross-node trace propagation is not available here, so a direct-DO
         // ingress starts without a remote parent.
         parent: None,
+        guest: None,
     });
     if !accepted {
         return response(
@@ -1899,7 +2046,7 @@ async fn dispatch_cell_fetch(
     let _hangup = HangUp(Some(cancel_tx));
     match receive.await {
         Ok(Ok(worker_response)) => {
-            runtime_response(worker_response, preserve_representation_length)
+            reply_without_upgrade(app, worker_response, preserve_representation_length).await
         }
         Ok(Err(error)) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
@@ -1990,6 +2137,8 @@ pub(crate) async fn dispatch_forwarded_fetch(
                 drain_pins: app.drain_pins.clone(),
                 handler_active: true,
             };
+            let upgrade = requests_websocket_upgrade(&headers);
+            let mut accepted = None;
             let completed = local
                 .run(async {
                     let result = runtime
@@ -2014,10 +2163,28 @@ pub(crate) async fn dispatch_forwarded_fetch(
                     // gate wait below cancels the request's remaining work, not a
                     // handler that is still running.
                     abort.handler_answered();
-                    result
+                    let response = result?;
+                    if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
+                        accepted = Some(target.clone());
+                        // The same object-level check as a local call, so a
+                        // caller sees one answer whichever node owns the cell.
+                        anyhow::ensure!(upgrade, "TypeError: {WEBSOCKET_WITHOUT_UPGRADE}");
+                    }
+                    Ok(response)
                 })
                 .await;
             let activity = completed.activity;
+            // A failure after the cell returned a socket discards the response,
+            // which is the socket's only owner.
+            if let (Err(failure), Some(target)) = (&completed.result, accepted.as_ref()) {
+                let reason = match failure {
+                    LocalRequestFailure::Handler(error) => error.to_string(),
+                    LocalRequestFailure::OutputGate { verdict, .. } => {
+                        RoutedRequestError(*verdict).to_string()
+                    }
+                };
+                websocket::reject_accepted_websocket(&app, target, &reason).await;
+            }
             let result = match completed.result {
                 Ok(answer) => Ok(answer),
                 Err(LocalRequestFailure::Handler(error)) => Err(error),
@@ -2031,18 +2198,18 @@ pub(crate) async fn dispatch_forwarded_fetch(
             match result {
                 Ok(mut worker_response) => {
                     if let Some(HttpResponseWebSocket::Cell(target)) = &worker_response.websocket {
-                        let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
+                        let (cell, hibernatable) = celld::js::ws_core_registration(target);
+                        let kind = if hibernatable {
                             WebSocketKind::Hibernatable
                         } else {
                             WebSocketKind::Regular
                         };
-                        if let Err(error) = app
-                            .websocket_opened(target.scope.clone(), target.id, kind)
-                            .await
-                        {
+                        if let Err(error) = app.websocket_opened(cell, target.id, kind).await {
+                            let reason = format!("WebSocket core registration failed: {error:#}");
+                            websocket::reject_accepted_websocket(&app, target, &reason).await;
                             return ForwardedFetchOutcome::Reply(peer_response(response(
                                 StatusCode::SERVICE_UNAVAILABLE,
-                                format!("WebSocket core registration failed: {error:#}"),
+                                reason,
                             )));
                         }
                     }
@@ -2067,7 +2234,8 @@ pub(crate) async fn dispatch_forwarded_fetch(
                         abort.disarm();
                         drop(activity);
                     }
-                    runtime_response(worker_response, preserve_representation_length)
+                    reply_without_upgrade(&app, worker_response, preserve_representation_length)
+                        .await
                 }
                 Err(error) => internal_do_worker_error(error),
             }
@@ -2238,43 +2406,63 @@ pub(crate) async fn dispatch_forwarded_rpc(
     }
 }
 
+/// The owner half of a peer's guest object call.
+pub(crate) async fn dispatch_forwarded_guest(
+    app: AppHandle,
+    scope: String,
+    name: Option<String>,
+    guest: celld::js::GuestCall,
+    request: celld_applications::invocation_wire::HttpRequest,
+) -> HttpReply {
+    let preserve_representation_length = request.method.eq_ignore_ascii_case("HEAD");
+    peer_response(
+        match serve_guest_object(&app, &scope, name, guest, request).await {
+            Ok(Some(reply)) => runtime_response(reply, preserve_representation_length),
+            Ok(None) => {
+                let mut stale = response(StatusCode::CONFLICT, "stale route");
+                stale.headers_mut().insert(
+                    hyper::header::HeaderName::from_static(STALE_ROUTE_HEADER),
+                    hyper::header::HeaderValue::from_static(STALE_ROUTE_VALUE),
+                );
+                stale
+            }
+            Err(error) => response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("guest object call failed: {error:#}"),
+            ),
+        },
+    )
+}
+
 #[path = "main/peer_tunnel.rs"]
 mod peer_tunnel;
 #[path = "main/websocket.rs"]
 mod websocket;
-use websocket::{handle_websocket, outbound_websocket_task};
+use websocket::{handle_websocket, outbound_websocket_task, reply_without_upgrade};
 
 async fn handle_ingress(
     request: Request<Incoming>,
     app: AppHandle,
     connection: ConnectionWorkerRequests,
 ) -> HttpReply {
+    // A node with application VMs lets a committed route claim the URL first;
+    // an unclaimed request continues to the Worker below, unchanged.
+    #[cfg(target_os = "linux")]
+    let request = match celld::application_vm::hosted() {
+        Some(applications) => match application_ingress(applications, request, &app).await {
+            Ok(reply) => return reply,
+            Err(request) => *request,
+        },
+        None => request,
+    };
     if matches!(*request.method(), hyper::Method::GET | hyper::Method::HEAD) {
         // One snapshot for the asset decision and the Worker it may fall
         // into, so a deployment adopted mid-request cannot serve the new
         // generation's index with the old generation's Worker.
         let generation = app.runtime.as_ref().map(|runtime| runtime.generation());
         if let Some(resolver) = generation.as_deref().and_then(Generation::ingress_assets) {
-            let path = request.uri().path();
-            if !resolver.should_run_worker_first(path) {
-                let head = request.method() == hyper::Method::HEAD;
-                match resolver
-                    .ingress_response(path, request.uri().query(), head, request.headers())
-                    .await
-                {
-                    Ok(Some(response)) => return asset_response(response),
-                    Ok(None) if resolver.asset_only() => {
-                        return response(StatusCode::NOT_FOUND, "Not found");
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!("celld asset response failed for {path}: {error:#}");
-                        return response(
-                            StatusCode::BAD_GATEWAY,
-                            "Active deployment asset is unavailable",
-                        );
-                    }
-                }
+            if let Some(reply) = serve_assets(resolver, &request).await {
+                return reply;
             }
         }
     }
@@ -2294,7 +2482,9 @@ async fn handle_ingress(
         .fetch_worker(url, method, body, headers, connection)
         .await
     {
-        Ok(worker_response) => runtime_response(worker_response, preserve_representation_length),
+        Ok(worker_response) => {
+            reply_without_upgrade(&app, worker_response, preserve_representation_length).await
+        }
         Err(error) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
         }
@@ -2314,6 +2504,120 @@ async fn handle_ingress(
             ),
         },
     }
+}
+
+/// The static-asset step of ingress: the response for a GET/HEAD the assets
+/// serve, or `None` when the request continues to the Worker.
+async fn serve_assets(
+    resolver: &celld::assets::AssetResolver,
+    request: &Request<Incoming>,
+) -> Option<HttpReply> {
+    let path = request.uri().path();
+    if resolver.should_run_worker_first(path) {
+        return None;
+    }
+    let head = request.method() == hyper::Method::HEAD;
+    match resolver
+        .ingress_response(path, request.uri().query(), head, request.headers())
+        .await
+    {
+        Ok(Some(response)) => Some(asset_response(response)),
+        Ok(None) if resolver.asset_only() => {
+            let mut reply = response(StatusCode::NOT_FOUND, if head { "" } else { "Not found" });
+            reply.headers_mut().insert(hyper::header::CONTENT_LENGTH, hyper::header::HeaderValue::from_static("9"));
+            Some(reply)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!("celld asset response failed for {path}: {error:#}");
+            Some(response(
+                StatusCode::BAD_GATEWAY,
+                "Active deployment asset is unavailable",
+            ))
+        }
+    }
+}
+
+/// Serve a request a committed application route claims, or hand it back.
+#[cfg(target_os = "linux")]
+async fn application_ingress(
+    applications: &celld::application_vm::RouteDispatcher,
+    request: Request<Incoming>,
+    app: &AppHandle,
+) -> Result<HttpReply, Box<Request<Incoming>>> {
+    let (parts, body) = request.into_parts();
+    let url = request_url(&parts, app.trust_forwarded_headers);
+    if !applications.claims(&url) {
+        return Err(Box::new(Request::from_parts(parts, body)));
+    }
+    let request = Request::from_parts(parts, body);
+    // Like the original ingress, a GET/HEAD the handler's assets serve never
+    // reaches the handler (and so never launches its VM).
+    {
+        match applications.asset_resolver_for(&url).await {
+            Ok(Some(resolver)) => {
+                if matches!(*request.method(), hyper::Method::GET | hyper::Method::HEAD) {
+                    if let Some(reply) = serve_assets(&resolver, &request).await { return Ok(reply); }
+                } else if resolver.asset_only() {
+                    let mut reply = response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed");
+                    reply.headers_mut().insert(hyper::header::ALLOW, hyper::header::HeaderValue::from_static("GET, HEAD"));
+                    return Ok(reply);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "application assets failed");
+                return Ok(response(
+                    StatusCode::BAD_GATEWAY,
+                    "Active deployment asset is unavailable",
+                ));
+            }
+        }
+    }
+    let (url, method, body, headers) = match ingress_payload(
+        request,
+        app.trust_forwarded_headers,
+        app.max_request_body_bytes,
+    )
+    .await
+    {
+        Ok(payload) => payload,
+        Err(reply) => return Ok(*reply),
+    };
+    let (bytes, stream) = match body {
+        celld::js::RequestBody::Bytes(bytes) => (bytes.to_vec(), None),
+        celld::js::RequestBody::Stream(id) => match celld::js::take_body_stream(id) {
+            Ok(stream) => (Vec::new(), Some(stream)),
+            Err(error) => {
+                return Ok(response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("request body stream: {error}"),
+                ));
+            }
+        },
+    };
+    let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
+    let request = celld_applications::invocation_wire::HttpRequest {
+        method,
+        url,
+        headers,
+        body: bytes,
+    };
+    let dispatched = applications
+        .dispatch(app, celld::js::handler_budget(), request, stream)
+        .await;
+    Ok(match dispatched {
+        Ok(Some(reply)) => runtime_response(reply, preserve_representation_length),
+        // The route was withdrawn between the claim and the dispatch.
+        Ok(None) => response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"),
+        Err(error) if error.is::<celld::application_vm::CapacityExhausted>() => {
+            response(StatusCode::SERVICE_UNAVAILABLE, format!("{error}"))
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "application request failed");
+            response(StatusCode::INTERNAL_SERVER_ERROR, "application failed")
+        }
+    })
 }
 
 async fn dispatch_asset_call(app: AppHandle, call: AssetCallReq) {
@@ -2393,7 +2697,26 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
         batch,
     } = call;
     let queue = batch.queue.clone();
+    #[cfg(target_os = "linux")]
+    let application = match celld::application_vm::hosted() {
+        Some(applications) => match applications.owns_queue(&scope).await {
+            Ok(owned) => owned,
+            Err(error) => {
+                tracing::warn!(%scope, %error, "application queue ownership refused; lease will expire");
+                return;
+            }
+        },
+        None => false,
+    };
     let result = match &app.runtime {
+        // An application's queue never runs in the legacy stateless script: its
+        // consumer handler's VM does. A failed dispatch lets the lease expire
+        // and the batch is redelivered as in the original.
+        #[cfg(target_os = "linux")]
+        _ if application => match celld::application_vm::hosted() {
+            Some(applications) => applications.dispatch_queue(&app, &scope, &batch).await,
+            None => Err(anyhow::anyhow!("no application VM host")),
+        },
         Some(runtime) => runtime.queue_service(generation, &script, batch).await,
         None => Err(anyhow::anyhow!("no Worker runtime")),
     };
@@ -2442,6 +2765,7 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
             reply,
             order: None,
             parent: None,
+            guest: None,
         },
     )
     .await;
@@ -2783,6 +3107,20 @@ async fn handle_public(
     Ok(result)
 }
 
+/// The actor's snapshot, plus the application VM pool on a node that hosts one.
+fn node_state(snapshot: String) -> String {
+    let Some(applications) = celld::application_vm::hosted() else {
+        return snapshot;
+    };
+    match serde_json::from_str::<serde_json::Value>(&snapshot) {
+        Ok(mut state) => {
+            state["applicationVms"] = applications.pool_status();
+            state.to_string()
+        }
+        Err(_) => snapshot,
+    }
+}
+
 async fn handle_internal(
     request: Request<Incoming>,
     app: AppHandle,
@@ -2797,7 +3135,7 @@ async fn handle_internal(
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
-        "/state" => response(StatusCode::OK, app.snapshot().await),
+        "/state" => response(StatusCode::OK, node_state(app.snapshot().await)),
         "/reload" if request.method() != hyper::Method::POST => {
             response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
@@ -2909,6 +3247,7 @@ async fn handle_internal(
             // consumer. The runtime also proves that this name hashes to the
             // requested scope before it exposes the identity to JavaScript.
             dispatch_cell_fetch(
+                &app,
                 scope,
                 name,
                 "http://cell/".to_string(),
@@ -2958,7 +3297,7 @@ async fn handle_internal(
                 Ok(payload) => payload,
                 Err(response) => return Ok(*response),
             };
-            dispatch_cell_fetch(cell, None, url, method, body, headers).await
+            dispatch_cell_fetch(&app, cell, None, url, method, body, headers).await
         }
         _ if cell_scope.is_some() => {
             let cell = cell_scope.expect("checked prefix");
@@ -2967,31 +3306,31 @@ async fn handle_internal(
             } else {
                 let cell = cell.to_string();
                 match app.request(cell.clone()).await {
-                Ok(Routed {
-                    request,
-                    route: Route::Local,
-                }) => {
-                    let _activity = app.activity(request, cell.clone());
-                    response(
-                        StatusCode::OK,
-                        format!("{{\"route\":\"local\",\"cell\":{cell:?}}}"),
-                    )
-                }
-                Ok(Routed {
-                    route:
-                        Route::Remote {
-                            node,
-                            addr,
-                            epoch,
-                            peer_protocol,
-                        },
-                    ..
-                }) => response(
-                    StatusCode::TEMPORARY_REDIRECT,
-                    format!(
-                        "{{\"route\":\"remote\",\"node\":{node:?},\"addr\":{addr:?},\"epoch\":{epoch},\"peer_protocol\":{peer_protocol}}}"
+                    Ok(Routed {
+                        request,
+                        route: Route::Local,
+                    }) => {
+                        let _activity = app.activity(request, cell.clone());
+                        response(
+                            StatusCode::OK,
+                            format!("{{\"route\":\"local\",\"cell\":{cell:?}}}"),
+                        )
+                    }
+                    Ok(Routed {
+                        route:
+                            Route::Remote {
+                                node,
+                                addr,
+                                epoch,
+                                peer_protocol,
+                            },
+                        ..
+                    }) => response(
+                        StatusCode::TEMPORARY_REDIRECT,
+                        format!(
+                            "{{\"route\":\"remote\",\"node\":{node:?},\"addr\":{addr:?},\"epoch\":{epoch},\"peer_protocol\":{peer_protocol}}}"
+                        ),
                     ),
-                ),
                     Err(error) => response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         format!("{{\"error\":\"{error:?}\"}}"),
@@ -3238,6 +3577,64 @@ fn serve_http_connection(
     })
 }
 
+/// Keep both bound surfaces unhealthy while caches are built, before the actor starts.
+#[cfg(any(target_os = "linux", test))]
+async fn prepare_with_unhealthy_listeners(
+    public: &tokio::net::TcpListener,
+    internal: &tokio::net::TcpListener,
+    preparation: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    // Owned futures drop their sockets on success, failure, or cancellation.
+    let mut connections: FuturesUnordered<ConnectionFuture> = FuturesUnordered::new();
+    tokio::pin!(preparation);
+    loop {
+        celld::asyncrt::select! {
+            result = &mut preparation => return result,
+            accepted = async {
+                celld::asyncrt::select! {
+                    accepted = public.accept() => accepted,
+                    accepted = internal.accept() => accepted,
+                }
+            } => {
+                let (stream, _) = accepted.context("accept during application cache preparation")?;
+                // Bound slow clients across both sockets; excess connections close immediately.
+                if connections.len() >= 64 {
+                    continue;
+                }
+                connections.push(Box::pin(async move {
+                    let _ = stream.set_nodelay(true);
+                    let service = service_fn(|request: Request<Incoming>| async move {
+                        let body = if request.uri().path() == "/.well-known/celld/health" {
+                            "{\"ok\":false}"
+                        } else {
+                            "{\"error\":\"starting\"}"
+                        };
+                        let mut refused = response(StatusCode::SERVICE_UNAVAILABLE, body);
+                        for (name, value) in [
+                            (hyper::header::CONNECTION, "close"),
+                            (hyper::header::RETRY_AFTER, "1"),
+                            (hyper::header::CACHE_CONTROL, "no-store"),
+                        ] {
+                            refused.headers_mut().insert(
+                                name,
+                                hyper::header::HeaderValue::from_static(value),
+                            );
+                        }
+                        Ok::<_, Infallible>(refused)
+                    });
+                    let connection = http1::Builder::new()
+                        .keep_alive(false)
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(std::time::Duration::from_secs(5))
+                        .serve_connection(TokioIo::new(stream), service);
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), connection).await;
+                }));
+            }
+            Some(()) = connections.next(), if !connections.is_empty() => {}
+        }
+    }
+}
+
 /// Serve the surviving follower disks before recovering this node's own
 /// predecessor. After a correlated restart, every predecessor can need a
 /// fragment on another restarting node. Waiting to accept until recovery
@@ -3298,6 +3695,8 @@ fn shutdown_accept_failure_test_action() -> Action {
         advertise: None,
         unsafe_public_advertise: false,
         trust_forwarded_headers: false,
+        application_vms: None,
+        application_domain: None,
         dev_store: None,
     })
 }
@@ -3436,6 +3835,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::memory::tune_allocator();
     let mut settings = match action {
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
+        Action::ApplicationApi(arguments) => return celld::application_api::run(arguments).await,
+        Action::Application(arguments) => return celld::application_cli::run(arguments).await,
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
@@ -3443,16 +3844,16 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::Queue(arguments) => return celld::queue_cli::run(arguments).await,
         Action::R2(arguments) => return celld::r2_cli::run(arguments).await,
         Action::Connect(arguments) => {
-            return celld::control_plane::handle_connect_command(arguments).await
+            return celld::control_plane::handle_connect_command(arguments).await;
         }
         Action::Credentials(arguments) => {
-            return celld::control_plane::handle_credentials_command(arguments).await
+            return celld::control_plane::handle_credentials_command(arguments).await;
         }
         Action::Token(arguments) => {
-            return celld::control_plane::handle_token_command(arguments).await
+            return celld::control_plane::handle_token_command(arguments).await;
         }
         Action::Disconnect(arguments) => {
-            return celld::control_plane::handle_disconnect_command(arguments).await
+            return celld::control_plane::handle_disconnect_command(arguments).await;
         }
         Action::Help => {
             print_help()?;
@@ -3713,10 +4114,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             // cell needs. Test both contracts here before the node serves.
             fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
             let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
+            let application_only = (settings.application_vms.is_some() || settings.application_domain.is_some())
+                && !settings.control_plane
+                && client.get(fleet::CURRENT_POINTER_KEY).await?.is_none();
             if settings.control_plane {
                 celld::control_plane::wait_for_initial_deployment(&client).await?;
                 deploy_agent = Some(client.clone());
-            } else {
+            } else if !application_only {
                 // A self-hosted node can start before its first `celld
                 // deploy`; wait for the pointer instead of exiting, or
                 // systemd restarts the node in a loop until a deployment
@@ -3724,6 +4128,13 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 fleet::wait_for_deployment_pointer(&client).await?;
             }
             let peer_key = peer_auth::load_or_create(&client).await?;
+            #[cfg(target_os = "linux")]
+            let graph = if application_only {
+                celld::runtime::application_host_graph(node.clone())
+            } else {
+                DeploymentGraph::load(&client, node.clone()).await?
+            };
+            #[cfg(not(target_os = "linux"))]
             let graph = DeploymentGraph::load(&client, node.clone()).await?;
             let wake = Arc::new(celld::wake::WakeFlusher::new());
             celld::js::set_arm_gate(ArmGate {
@@ -4143,6 +4554,32 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         operation_deadline_ms: celld::actor::operation_deadline_ms()?,
         follower: follower.clone(),
     };
+    #[cfg(target_os = "linux")]
+    if let Some(config) = &settings.application_vms {
+        let bucket = fleet_bucket
+            .clone()
+            .context("--application-vms needs a fleet bucket")?;
+        prepare_with_unhealthy_listeners(
+            &listener,
+            &internal_listener,
+            celld::application_vm::host(config, bucket, app.advertise.clone(), &app),
+        )
+        .await
+        .context("prepare application startup caches")?;
+        celld::application_vm::hosted()
+            .expect("installed application host")
+            .install_alarm_host(app.clone())?;
+        celld::application_vm::RouteDispatcher::install_parked_release(
+            peer_tunnel::release_upgrade,
+        );
+        spawn_application_cron_arm(app.clone());
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(domain) = &settings.application_domain {
+        let bucket = fleet_bucket.clone().context("--application-domain needs a fleet bucket")?;
+        celld::application_vm::host_static(domain.clone(), bucket).await?;
+    }
 
     // The in-fleet log tier, v0. The takeover interlock is installed in
     // every posture — a bucket-posture node can take over from a
@@ -4967,7 +5404,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         let mut pre_drain_tick = tokio::time::interval(std::time::Duration::from_millis(5));
         let mut admitted = None;
         let admitted_drained = loop {
-            if admitted.is_none() && app.public_in_flight() == 0 {
+            if admitted.is_none() && app.public_in_flight() == 0 && application_vms_settled() {
                 admitted = Some(true);
             }
             if let Some(admitted_drained) = admitted {
@@ -5320,10 +5757,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .unwrap_or_else(|| "{\"error\":\"process_deadline\"}".to_string());
         match before_process_deadline(
             process_deadline,
-            tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                app.drain_status(),
-            ),
+            tokio::time::timeout(std::time::Duration::from_millis(50), app.drain_status()),
         )
         .await
         .and_then(Result::ok)
@@ -5392,6 +5826,23 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         flush_connections,
     )
     .await;
+    // Public admission is closed and drained, so no VM can launch or take
+    // an event. Reap them before the durability seal below.
+    let mut application_vms_reaped = true;
+    #[cfg(target_os = "linux")]
+    if let Some(applications) = celld::application_vm::hosted() {
+        match before_process_deadline(process_deadline, applications.shutdown()).await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                application_vms_reaped = false;
+                tracing::error!(%error, "application VM shutdown failed");
+            }
+            None => {
+                application_vms_reaped = false;
+                tracing::error!("application VM shutdown exceeded the process deadline");
+            }
+        }
+    }
     // The graceful-shutdown drain point: seal our node-log record so the
     // next incarnation starts with no gather. Guarded inside — it seals
     // only when every shipped frame is bucket-covered.
@@ -5418,7 +5869,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // Preparation captures and uploads each stopped cell's exact database
     // position. A failed proof abandons the marker and leaves normal startup
     // to reconcile the preserved files against bucket coverage.
-    if clean_reload_is_eligible(durability_quiesced, drained, shutdown_mode) {
+    if clean_reload_is_eligible(
+        durability_quiesced && application_vms_reaped,
+        drained,
+        shutdown_mode,
+    ) {
         let presence = before_process_deadline(process_deadline, app.presence()).await;
         let prepared = match (&app.runtime, presence) {
             (Some(runtime), Some(Some(presence))) => {
@@ -5590,4 +6045,114 @@ fn forwarder_response_stream(
 #[cfg(all(test, celld_internal_tests))]
 mod durability_lifecycle_private {
     include!(env!("CELLD_CONFORMANCE_MAIN_DURABILITY_TESTS"));
+}
+
+#[cfg(test)]
+mod application_startup_listener_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn request(address: std::net::SocketAddr, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    async fn closed(stream: &mut tokio::net::TcpStream) {
+        let mut byte = [0];
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .expect("startup connection was retained");
+        assert!(
+            matches!(result, Ok(0) | Err(_)),
+            "startup connection still serves"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_requests_and_releases_sockets_on_every_exit() {
+        for outcome in 0..3 {
+            let public = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+            let internal = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+            let addresses = [public.local_addr().unwrap(), internal.local_addr().unwrap()];
+            let (finish, finished) = oneshot::channel();
+            let started = Arc::new(AtomicUsize::new(0));
+            let actor_started = started.clone();
+            let startup_public = public.clone();
+            let startup_internal = internal.clone();
+            let startup = tokio::spawn(async move {
+                let result =
+                    prepare_with_unhealthy_listeners(&startup_public, &startup_internal, async {
+                        let success = finished.await.unwrap();
+                        anyhow::ensure!(success, "injected cache preparation failure");
+                        Ok(())
+                    })
+                    .await;
+                if result.is_ok() {
+                    actor_started.fetch_add(1, Ordering::SeqCst);
+                }
+                result
+            });
+            let mut incomplete = Vec::new();
+            for address in addresses {
+                let mut slow = tokio::net::TcpStream::connect(address).await.unwrap();
+                slow.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+                incomplete.push(slow);
+                let health = request(address, "/.well-known/celld/health").await;
+                assert!(health.starts_with("HTTP/1.1 503"), "{health}");
+                assert!(health.contains("content-type: application/json\r\n"));
+                assert!(health.contains("connection: close\r\n"));
+                assert!(health.contains("retry-after: 1\r\n"));
+                assert!(health.contains("cache-control: no-store\r\n"));
+                assert!(health.ends_with("{\"ok\":false}"));
+                for path in ["/", "/state", "/peer/log/tail", "/do/test"] {
+                    let refused = request(address, path).await;
+                    assert!(refused.starts_with("HTTP/1.1 503"), "{refused}");
+                    assert!(refused.ends_with("{\"error\":\"starting\"}"));
+                }
+            }
+            assert_eq!(started.load(Ordering::SeqCst), 0);
+            match outcome {
+                0 => {
+                    finish.send(true).unwrap();
+                    startup.await.unwrap().unwrap();
+                    assert_eq!(started.load(Ordering::SeqCst), 1);
+                }
+                1 => {
+                    finish.send(false).unwrap();
+                    let error = startup.await.unwrap().unwrap_err();
+                    assert!(error.to_string().contains("cache preparation failure"));
+                    assert_eq!(started.load(Ordering::SeqCst), 0);
+                }
+                _ => {
+                    startup.abort();
+                    assert!(startup.await.unwrap_err().is_cancelled());
+                    assert_eq!(started.load(Ordering::SeqCst), 0);
+                }
+            }
+            for stream in &mut incomplete {
+                closed(stream).await;
+            }
+            // The same sockets remain available to the normal HTTP accept loop.
+            for (listener, address) in [(&public, addresses[0]), (&internal, addresses[1])] {
+                let _client = tokio::net::TcpStream::connect(address).await.unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+    }
 }

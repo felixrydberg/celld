@@ -104,7 +104,9 @@ impl TurnScheduler {
         if let Some(receive) = receive {
             // Cancellation leaves a closed sender in this lane. `release`
             // skips it, so a dropped waiter cannot strand the active token.
-            let _ = receive.await;
+            let mut waiting = Waiting(self, Some(receive));
+            let _ = waiting.1.as_mut().expect("waiting receiver").await;
+            waiting.1 = None;
         }
         TurnPermit(self)
     }
@@ -139,6 +141,23 @@ impl TurnScheduler {
             }
             if keep_lane {
                 schedule.ready.push_back(lane);
+            }
+        }
+    }
+}
+
+/// A queued turn. `release` can hand it the token after the grant is sent but
+/// before this future runs again; dropping it then would strand the token
+/// and block every later turn on the isolate, so a dropped waiter that was
+/// already granted passes the token on.
+struct Waiting<'a>(&'a TurnScheduler, Option<tokio::sync::oneshot::Receiver<()>>);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        if let Some(mut receive) = self.1.take() {
+            receive.close();
+            if receive.try_recv().is_ok() {
+                self.0.release();
             }
         }
     }
@@ -190,6 +209,9 @@ pub struct Slot {
     /// drained. `None` for a standalone slot: nothing frees or replaces it,
     /// so [`Slot::condemn`] cannot apply to it.
     reclaim: Option<Arc<tokio::sync::Notify>>,
+    /// The slot holds a Worker Loader's Worker, so the facets it runs belong
+    /// to the root that started them rather than to this isolate.
+    loaded_worker: bool,
     /// Cells whose realm lives in this isolate. Not a count of live work: a
     /// cell stays until it is evicted or handed to another node, which is
     /// why `retire` refuses an isolate holding any.
@@ -246,6 +268,7 @@ impl Slot {
                 self.0.turns.fetch_sub(1, Ordering::Relaxed);
             }
         }
+        let _activity = js::guest_activity::hold();
         self.turns.fetch_add(1, Ordering::Relaxed);
         let _turn = Counted(self);
         let _scheduled = self.turn_scheduler.acquire(lane.clone()).await;
@@ -306,11 +329,16 @@ impl Slot {
         Affiliation(self.clone())
     }
 
+    /// A slot holding a Worker Loader's Worker.
+    pub(crate) fn loaded_worker(worker: js::Worker) -> Arc<Self> {
+        Self::outside_pool(worker, true)
+    }
+
     /// A slot holding a Worker outside a placement pool.
     ///
     /// A dynamic Worker owns exactly one isolate, so it needs no
     /// admission, growth, or retirement policy.
-    pub(crate) fn standalone(worker: js::Worker) -> Arc<Self> {
+    fn outside_pool(worker: js::Worker, loaded_worker: bool) -> Arc<Self> {
         Arc::new_cyclic(|me| Slot {
             me: me.clone(),
             id: 0,
@@ -322,6 +350,7 @@ impl Slot {
             requests: AtomicUsize::new(0),
             freed: Arc::new(tokio::sync::Notify::new()),
             reclaim: None,
+            loaded_worker,
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
@@ -330,9 +359,14 @@ impl Slot {
         })
     }
 
+    /// Whether this slot holds a Worker Loader's Worker.
+    pub(crate) fn is_loaded_worker(&self) -> bool {
+        self.loaded_worker
+    }
+
     #[cfg(celld_internal_tests)]
     pub fn for_test(worker: js::Worker) -> Arc<Self> {
-        Self::standalone(worker)
+        Self::outside_pool(worker, false)
     }
 
     #[cfg(all(test, celld_internal_tests))]
@@ -348,6 +382,7 @@ impl Slot {
             requests: AtomicUsize::new(0),
             freed: Arc::new(tokio::sync::Notify::new()),
             reclaim: None,
+            loaded_worker: false,
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
@@ -429,6 +464,13 @@ impl Slot {
     /// The node-wide identity of this slot's currently installed V8 heap.
     pub fn heap_id(&self) -> HeapId {
         self.heap_id
+    }
+
+    /// Sample only when no turn holds the permit; never wait for an isolate.
+    /// A retired worker has no heap, while contention leaves its size unknown.
+    pub(crate) fn try_heap_bytes(&self) -> Result<Option<js::HeapBytes>, ()> {
+        let worker = self.worker.try_lock().map_err(|_| ())?;
+        Ok(worker.as_ref().and_then(js::Worker::heap_bytes))
     }
 
     fn is_reusable(&self) -> bool {
@@ -617,6 +659,7 @@ impl Pool {
             requests: AtomicUsize::new(0),
             freed: self.freed.clone(),
             reclaim: Some(self.reclaim.clone()),
+            loaded_worker: false,
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
@@ -911,3 +954,26 @@ const _: fn() = || {
     assert_send_sync::<Slot>();
     assert_send_sync::<Affiliation>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+
+    /// A waiter granted the token and then cancelled before it polled again
+    /// must not strand the token.
+    #[tokio::test]
+    async fn cancelled_granted_turn_passes_the_token_on() {
+        let scheduler = TurnScheduler::default();
+        let lane = || TurnLane::Cell("cell".into());
+        let first = scheduler.acquire(lane()).await;
+        let mut queued = Box::pin(scheduler.acquire(lane()));
+        let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(queued.as_mut().poll(&mut context).is_pending());
+        drop(first);
+        drop(queued);
+        tokio::time::timeout(std::time::Duration::from_secs(5), scheduler.acquire(lane()))
+            .await
+            .expect("a cancelled granted waiter stranded the turn token");
+    }
+}

@@ -42,5 +42,6 @@ ARG CELLD_VERSION=unknown
 LABEL org.opencontainers.image.title="celld" \
       org.opencontainers.image.revision="${CELLD_COMMIT}" \
       org.opencontainers.image.version="${CELLD_VERSION}"
+COPY LICENSE NOTICE /usr/share/doc/celld/
 COPY --from=test /out/celld /usr/local/bin/celld
 ENTRYPOINT ["/usr/local/bin/celld"]

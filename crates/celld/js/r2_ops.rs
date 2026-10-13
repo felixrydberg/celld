@@ -3,9 +3,9 @@
 //! The V8 surface over an `r2_buckets` binding.
 //!
 //! celld does not run a blob service; it runs *on* one. A binding is
-//! therefore served out of the fleet bucket the node already holds
-//! credentials for, under the reserved `r2/<bucket_name>/` prefix — the
-//! same durability, the same store, no second set of credentials. A node
+//! therefore served out of the named provider bucket using the node's
+//! resolved storage configuration. Local development keeps its shared
+//! database and reserved `r2/<bucket_name>/` prefix. A node
 //! with no bucket (a local run without `--bucket`) has nowhere to put a
 //! blob, and every op says so rather than pretending.
 //!
@@ -21,6 +21,7 @@ use crate::bucket::BlobConditions;
 use crate::bucket::BlobMeta;
 use crate::bucket::BlobRange;
 use crate::bucket::BlobRead;
+use futures_util::StreamExt as _;
 use object_store::MultipartUpload;
 use std::collections::BTreeMap;
 
@@ -39,6 +40,89 @@ pub(crate) use crate::r2_store::Envelope;
 pub(crate) use crate::r2_store::GetRequest;
 pub(crate) use crate::r2_store::Open;
 pub(crate) use crate::r2_store::PutRequest;
+// Original JS upload closures retain their binding alias. The broker still
+// authorizes every opaque upload id against its host-derived bucket; the guest
+// needs no permanent upload-id registry.
+fn guest_binding(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments,
+    index: i32,
+) -> Result<String, String> {
+    let binding = args.get(index);
+    if !binding.is_string() {
+        return Err("R2 upload has no binding alias".into());
+    }
+    Ok(binding.to_rust_string_lossy(scope))
+}
+
+fn guest_return(
+    scope: &mut v8::PinScope,
+    rv: &mut v8::ReturnValue<v8::Value>,
+    binding: Result<String, String>,
+    operation: celld_applications::resource_wire::R2Operation,
+    body: Vec<u8>,
+) {
+    use celld_applications::resource_wire::{R2Operation, ResourceOperation};
+    let read = matches!(operation, R2Operation::Get { .. });
+    let request = binding.as_ref().map_err(Clone::clone).and_then(|binding| {
+        guest_storage::resource_request(
+            scope,
+            binding.clone(),
+            ResourceOperation::R2 { operation },
+            body,
+        )
+    });
+    let stream_service = http_stream_service();
+    let id = asyncrt::enqueue(async move {
+        let response = request?
+            .await
+            .map_err(|_| "R2 guest operation was abandoned".to_string())??;
+        let mut stream: HttpChunkStream =
+            futures_util::stream::once(std::future::ready(Ok(response.body)))
+                .chain(
+                    response
+                        .stream
+                        .unwrap_or_else(|| Box::pin(futures_util::stream::empty())),
+                )
+                .boxed();
+        let result = if read {
+            let mut bytes = bytes::BytesMut::new();
+            let length = loop {
+                if bytes.len() >= 4 {
+                    break u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+                }
+                bytes.extend_from_slice(&stream.next().await.ok_or("R2 guest record truncated")??);
+            };
+            if length > 1024 * 1024 {
+                return Err("R2 guest record exceeds wire limit".into());
+            }
+            while bytes.len() < length + 4 {
+                bytes.extend_from_slice(&stream.next().await.ok_or("R2 guest record truncated")??);
+            }
+            let mut envelope: serde_json::Value =
+                serde_json::from_slice(&bytes[4..4 + length]).map_err(|error| error.to_string())?;
+            if envelope["state"] == "hit" {
+                let rest = bytes.split_off(length + 4).to_vec();
+                let body = futures_util::stream::iter((!rest.is_empty()).then_some(Ok(rest)))
+                    .chain(stream)
+                    .boxed();
+                let stream_id = stream_service
+                    .register_source(HttpStreamSource::Stream(body))
+                    .ok_or_else(|| format!("R2 get: {HTTP_STREAM_REGISTRATION_CLOSED}"))?;
+                envelope["streamId"] = stream_id.into();
+            }
+            envelope.to_string()
+        } else {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                bytes.extend(chunk?);
+            }
+            String::from_utf8(bytes).map_err(|error| error.to_string())?
+        };
+        Ok::<_, String>(result)
+    });
+    rv.set(promise_for(scope, id));
+}
 
 /// How long an untouched multipart upload or streaming write is kept
 /// before the host abandons it. A push that streams a multi-gigabyte pack
@@ -52,6 +136,146 @@ const IDLE: Duration = Duration::from_secs(3600);
 /// predecessor waits in memory; this bounds that wait.
 const PART_BACKLOG: usize = 256 << 20;
 
+/// Reuse the original object-store/R2 implementation after the trusted broker
+/// has authenticated an alias and proved the calling event's native output.
+/// Numeric upload handles belong to the authenticated application resource,
+/// independently of whether another application binds the same real bucket.
+pub(crate) async fn broker_operation(
+    bucket_name: String,
+    broker_owner: String,
+    operation: celld_applications::resource_wire::R2Operation,
+    body: Vec<u8>,
+) -> Result<HttpResponse, String> {
+    use celld_applications::resource_wire::R2Operation as R;
+    let put = match &operation {
+        R::PutChunk { id } | R::PutEnd { id, .. } => Some(*id),
+        _ => None,
+    };
+    if let Some(id) = put {
+        let entry = puts().lock().unwrap().get(&id).cloned();
+        if let Some(entry) = entry {
+            let entry = entry.lock().await;
+            if entry.bucket_name != bucket_name
+                || entry.broker_owner.as_deref() != Some(broker_owner.as_str())
+            {
+                return Err("R2 streaming write belongs to another binding".into());
+            }
+        }
+    }
+    let upload = match &operation {
+        R::MultipartPart { id, .. }
+        | R::MultipartComplete { id, .. }
+        | R::MultipartAbort { id } => Some(*id),
+        _ => None,
+    };
+    if let Some(id) = upload {
+        let entry = uploads().lock().unwrap().get(&id).cloned();
+        if let Some(entry) = entry {
+            let entry = entry.lock().await;
+            if entry.bucket_name != bucket_name
+                || entry.broker_owner.as_deref() != Some(broker_owner.as_str())
+            {
+                return Err("R2 multipart upload belongs to another binding".into());
+            }
+        }
+    }
+    let mut response = HttpResponse {
+        status: 200,
+        body: vec![],
+        stream: None,
+        headers: vec![],
+        websocket: None,
+        write_position: None,
+        observed_position: None,
+    };
+    let result = match operation {
+        R::Head { key } => match head(&bucket_name, &key).await? {
+            None => serde_json::json!({"state":"miss"}).to_string(),
+            Some(meta) => serde_json::json!({"state":"hit", "object":object_json(&key,&meta,None)})
+                .to_string(),
+        },
+        R::Get { key, options } => {
+            let request: GetRequest = serde_json::from_str(&options)
+                .map_err(|error| format!("invalid R2 get options: {error}"))?;
+            let range = request
+                .range
+                .map(BlobRange::from)
+                .unwrap_or(BlobRange::Whole);
+            let conditions = BlobConditions::from(request.only_if.unwrap_or_default());
+            let envelope = match read(&bucket_name, &key, range, &conditions).await? {
+                BlobRead::Missing => serde_json::json!({"state":"miss"}),
+                BlobRead::Unmet(meta) => {
+                    serde_json::json!({"state":"unmet","object":object_json(&key,&meta,None)})
+                }
+                BlobRead::Hit(blob) => {
+                    response.stream = Some(blob.body);
+                    serde_json::json!({"state":"hit","object":object_json(&key,&blob.meta,Some(blob.range))})
+                }
+            };
+            let bytes = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
+            response.body = (bytes.len() as u32).to_be_bytes().to_vec();
+            response.body.extend(bytes);
+            return Ok(response);
+        }
+        R::Put { key, options } => {
+            let request = serde_json::from_str::<PutRequest>(&options)
+                .map_err(|error| format!("invalid R2 put options: {error}"))?;
+            put_once(bucket_name, key, body, request).await?
+        }
+        R::Delete { keys } => {
+            delete(&bucket_name, &keys).await?;
+            String::new()
+        }
+        R::List { options } => list(&bucket_name, &options).await?.to_string(),
+        R::PutBegin { key, options } => {
+            native_put_begin(bucket_name, key, options, Some(&broker_owner)).await?
+        }
+        R::PutChunk { id } => {
+            native_put_chunk(id, Some(body), EgressGate::NoCell, Some(&broker_owner)).await?
+        }
+        R::PutEnd { id, abort } => {
+            native_put_end(id, abort, EgressGate::NoCell, Some(&broker_owner)).await?
+        }
+        R::MultipartBegin { key, options } => {
+            native_mp_begin(
+                bucket_name,
+                key,
+                serde_json::from_str(&options)
+                    .map_err(|error| format!("invalid R2 multipart options: {error}")),
+                EgressGate::NoCell,
+                Some(&broker_owner),
+            )
+            .await?
+        }
+        R::MultipartResume { key, id } => {
+            native_mp_resume(bucket_name, key, id, Some(&broker_owner)).await?
+        }
+        R::MultipartPart { id, part } => {
+            native_mp_part(
+                id,
+                part,
+                Some(body),
+                EgressGate::NoCell,
+                Some(&broker_owner),
+            )
+            .await?
+        }
+        R::MultipartComplete { id, parts } => {
+            native_mp_complete(id, Ok(parts), EgressGate::NoCell, Some(&broker_owner)).await?
+        }
+        R::MultipartAbort { id } => {
+            let gate = uploads()
+                .lock()
+                .unwrap()
+                .contains_key(&id)
+                .then_some(EgressGate::NoCell);
+            native_mp_abort(id, gate, Some(&broker_owner)).await?
+        }
+    };
+    response.body = result.into_bytes();
+    Ok(response)
+}
+
 // ---- reads ---------------------------------------------------------------
 
 /// `__r2_head(bucketName, key)`. Resolves to the object's record, or to
@@ -63,6 +287,12 @@ pub(super) fn op_r2_head(
 ) {
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let key = args.get(1).to_rust_string_lossy(scope);
+    if guest_storage::enabled(scope) {
+        let binding = Ok(bucket_name);
+        let operation = celld_applications::resource_wire::R2Operation::Head { key };
+        let body = Vec::new();
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
     let id = asyncrt::enqueue(async move {
         let meta = head(&bucket_name, &key).await?;
         Ok(match meta {
@@ -91,6 +321,15 @@ pub(super) fn op_r2_get(
     let key = args.get(1).to_rust_string_lossy(scope);
     let request = serde_json::from_str::<GetRequest>(&args.get(2).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 get options: {error}"));
+    if guest_storage::enabled(scope) {
+        let binding = Ok(bucket_name);
+        let operation = celld_applications::resource_wire::R2Operation::Get {
+            key,
+            options: args.get(2).to_rust_string_lossy(scope),
+        };
+        let body = Vec::new();
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
     let stream_service = http_stream_service();
     let id = asyncrt::enqueue(async move {
         let request = request?;
@@ -133,6 +372,17 @@ pub(super) fn op_r2_delete(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let keys = serde_json::from_str::<Vec<String>>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 delete key list: {error}"));
+    if guest_storage::enabled(scope) {
+        let binding = Ok(bucket_name);
+        let operation = celld_applications::resource_wire::R2Operation::Delete {
+            keys: match keys {
+                Ok(keys) => keys,
+                Err(error) => return loader_throw(scope, &error),
+            },
+        };
+        let body = Vec::new();
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let keys = keys?;
@@ -153,6 +403,14 @@ pub(super) fn op_r2_list(
 ) {
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let request_json = args.get(1).to_rust_string_lossy(scope);
+    if guest_storage::enabled(scope) {
+        let binding = Ok(bucket_name);
+        let operation = celld_applications::resource_wire::R2Operation::List {
+            options: request_json,
+        };
+        let body = Vec::new();
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
     let id =
         asyncrt::enqueue(async move { Ok(list(&bucket_name, &request_json).await?.to_string()) });
     rv.set(promise_for(scope, id));
@@ -181,6 +439,18 @@ pub(super) fn op_r2_put(
     let body = view_bytes(args.get(2));
     let request = serde_json::from_str::<PutRequest>(&args.get(3).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 put options: {error}"));
+    if guest_storage::enabled(scope) {
+        let binding = Ok(bucket_name);
+        let operation = celld_applications::resource_wire::R2Operation::Put {
+            key,
+            options: args.get(3).to_rust_string_lossy(scope),
+        };
+        let body = match body {
+            Some(body) => body,
+            None => return loader_throw(scope, "R2 put: the body must be an ArrayBuffer view"),
+        };
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let request = request?;
@@ -233,16 +503,19 @@ pub(super) fn op_r2_put_begin(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let key = args.get(1).to_rust_string_lossy(scope);
     let request_json = args.get(2).to_rust_string_lossy(scope);
-    let id = asyncrt::enqueue(async move {
-        let put = open_put(bucket_name, key, &request_json)?;
-        reap_puts();
-        let put_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        puts()
-            .lock()
-            .unwrap()
-            .insert(put_id, Arc::new(tokio::sync::Mutex::new(put)));
-        Ok(put_id.to_string())
-    });
+    if guest_storage::enabled(scope) {
+        let binding = Ok(bucket_name);
+        let operation = celld_applications::resource_wire::R2Operation::PutBegin {
+            key,
+            options: request_json,
+        };
+        let body = Vec::new();
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
+    let id =
+        asyncrt::enqueue(
+            async move { native_put_begin(bucket_name, key, request_json, None).await },
+        );
     rv.set(promise_for(scope, id));
 }
 
@@ -256,24 +529,17 @@ pub(super) fn op_r2_put_chunk(
 ) {
     let put_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let chunk = view_bytes(args.get(1));
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
-    let id = asyncrt::enqueue(async move {
-        let Some(chunk) = chunk else {
-            return Err("R2 put: a body chunk must be an ArrayBuffer view".to_string());
+    if guest_storage::enabled(scope) {
+        let binding = guest_binding(scope, &args, 2);
+        let operation = celld_applications::resource_wire::R2Operation::PutChunk { id: put_id };
+        let body = match chunk {
+            Some(chunk) => chunk,
+            None => return loader_throw(scope, "R2 put: a body chunk must be an ArrayBuffer view"),
         };
-        await_egress_gate(gate).await?;
-        let put = puts()
-            .lock()
-            .unwrap()
-            .get(&put_id)
-            .cloned()
-            .ok_or_else(|| format!("R2 streaming write {put_id} is not open"))?;
-        // A failed chunk leaves the write open, so `__r2_put_end` can
-        // abort the parts already on the store.
-        let mut put = put.lock().await;
-        put.touched = Instant::now();
-        put.push(chunk).await.map(|()| String::new())
-    });
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let id = asyncrt::enqueue(async move { native_put_chunk(put_id, chunk, gate, None).await });
     rv.set(promise_for(scope, id));
 }
 
@@ -286,25 +552,15 @@ pub(super) fn op_r2_put_end(
 ) {
     let put_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let abort = args.get(1).boolean_value(scope);
+    if guest_storage::enabled(scope) {
+        let binding = guest_binding(scope, &args, 2);
+        let operation =
+            celld_applications::resource_wire::R2Operation::PutEnd { id: put_id, abort };
+        let body = Vec::new();
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
-    let id = asyncrt::enqueue(async move {
-        // Keep the entry registered until the proof succeeds. If the gate
-        // refuses the effect, the normal cleanup path can abort a live multipart
-        // upload instead of dropping its handle and orphaning its parts.
-        await_egress_gate(gate).await?;
-        let put = puts().lock().unwrap().remove(&put_id);
-        let Some(put) = put else {
-            return Err(format!("R2 streaming write {put_id} is not open"));
-        };
-        let mut put = put.lock().await;
-        if abort {
-            if let Some(mut upload) = put.upload.take() {
-                let _ = upload.abort().await;
-            }
-            return Ok(serde_json::json!({ "stored": false }).to_string());
-        }
-        put.finish().await
-    });
+    let id = asyncrt::enqueue(async move { native_put_end(put_id, abort, gate, None).await });
     rv.set(promise_for(scope, id));
 }
 
@@ -312,6 +568,7 @@ pub(super) fn op_r2_put_end(
 
 struct UploadEntry {
     bucket_name: String,
+    broker_owner: Option<String>,
     key: String,
     upload: Box<dyn MultipartUpload>,
     /// Part numbers already handed to the store, in that order. The store
@@ -407,40 +664,20 @@ pub(super) fn op_r2_mp_begin(
     let key = args.get(1).to_rust_string_lossy(scope);
     let request = serde_json::from_str::<PutRequest>(&args.get(2).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 multipart options: {error}"));
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
-    let id = asyncrt::enqueue(async move {
-        let request = request?;
-        await_egress_gate(gate).await?;
-        reap_uploads();
-        // A multipart object carries no md5, on R2 or here, so nothing is
-        // computed over parts that were never seen whole.
-        let envelope = Envelope {
-            custom: request.custom,
-            http: request.http,
-            checksums: BTreeMap::new(),
-            storage_class: request.storage_class,
+    if guest_storage::enabled(scope) {
+        let binding = Ok(bucket_name);
+        let operation = celld_applications::resource_wire::R2Operation::MultipartBegin {
+            key,
+            options: args.get(2).to_rust_string_lossy(scope),
         };
-        let upload = store()?
-            .begin_multipart(&blob_key(&bucket_name, &key), &envelope.write())
-            .await
-            .map_err(|error| error.to_string())?;
-        let upload_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        uploads().lock().unwrap().insert(
-            upload_id,
-            Arc::new(tokio::sync::Mutex::new(UploadEntry {
-                bucket_name,
-                key,
-                upload,
-                flushed: Vec::new(),
-                pending: BTreeMap::new(),
-                held: 0,
-                envelope,
-                written: 0,
-                touched: Instant::now(),
-            })),
+        let body = Vec::new();
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let id =
+        asyncrt::enqueue(
+            async move { native_mp_begin(bucket_name, key, request, gate, None).await },
         );
-        Ok(upload_id.to_string())
-    });
     rv.set(promise_for(scope, id));
 }
 
@@ -454,29 +691,15 @@ pub(super) fn op_r2_mp_resume(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let key = args.get(1).to_rust_string_lossy(scope);
     let upload_id = args.get(2).to_rust_string_lossy(scope);
-    let id = asyncrt::enqueue(async move {
-        let parsed = upload_id.parse::<u64>().ok();
-        let entry = parsed.and_then(|id| uploads().lock().unwrap().get(&id).cloned());
-        let entry = match entry {
-            Some(entry) => Some(entry.lock_owned().await),
-            None => None,
-        };
-        match entry.as_deref() {
-            Some(entry) if entry.bucket_name == bucket_name && entry.key == key => {
-                Ok(upload_id.clone())
-            }
-            Some(_) => Err(format!(
-                "R2 multipart upload {upload_id} was opened for another key or binding"
-            )),
-            // The handle the object store hands out cannot be re-derived
-            // from an id, so an upload outlives only the node that opened
-            // it — and only until that node restarts.
-            None => Err(format!(
-                "R2 multipart upload {upload_id} is not open on this node: celld can resume an \
-                 upload within the node that created it, not across nodes or restarts"
-            )),
-        }
-    });
+    if guest_storage::enabled(scope) {
+        let binding = Ok(bucket_name);
+        let operation =
+            celld_applications::resource_wire::R2Operation::MultipartResume { key, id: upload_id };
+        let body = Vec::new();
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
+    let id =
+        asyncrt::enqueue(async move { native_mp_resume(bucket_name, key, upload_id, None).await });
     rv.set(promise_for(scope, id));
 }
 
@@ -495,56 +718,23 @@ pub(super) fn op_r2_mp_part(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let part_number = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u32;
     let bytes = view_bytes(args.get(2));
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
-    let id = asyncrt::enqueue(async move {
-        let Some(bytes) = bytes else {
-            return Err(format!(
-                "R2 multipart part {part_number} of upload {upload_id} must be an ArrayBuffer view"
-            ));
+    if guest_storage::enabled(scope) {
+        let binding = guest_binding(scope, &args, 3);
+        let operation = celld_applications::resource_wire::R2Operation::MultipartPart {
+            id: upload_id,
+            part: part_number,
         };
-        await_egress_gate(gate).await?;
-        let entry = uploads()
-            .lock()
-            .unwrap()
-            .get(&upload_id)
-            .cloned()
-            .ok_or_else(|| format!("R2 multipart upload {upload_id} is not open"))?;
-        let mut entry = entry.lock().await;
-        entry.touched = Instant::now();
-        let result = async {
-            if entry.flushed.contains(&part_number) {
-                return Err(format!(
-                    "R2 multipart part {part_number} of upload {upload_id} was already handed to \
-                     the object store, which appends parts and cannot rewrite one: celld \
-                     replaces a part that is still waiting its turn, not one already written. \
-                     Send the replacement before the part in front of it, or open the upload \
-                     again"
-                ));
-            }
-            // R2 replaces a part when its number is uploaded again. A part
-            // still waiting its turn is replaced in place, so the bytes it
-            // displaces leave the backlog with it: counting the replacement
-            // without discounting the replaced would grow `held` past what
-            // is actually held and refuse an upload well inside the limit.
-            let replaced = entry.pending.get(&part_number).map_or(0, Vec::len);
-            let held = entry.held - replaced + bytes.len();
-            if held > PART_BACKLOG {
-                return Err(format!(
-                    "R2 multipart upload {upload_id} is holding {} bytes of parts waiting for \
-                     part {}: celld hands parts to the object store in ascending order, so \
-                     upload the parts in front of the ones running ahead",
-                    entry.held,
-                    entry.next(),
-                ));
-            }
-            entry.held = held;
-            entry.pending.insert(part_number, bytes);
-            entry.drain().await
-        }
-        .await;
-        result?;
-        Ok(serde_json::json!({ "partNumber": part_number }).to_string())
-    });
+        let body = match bytes {
+            Some(bytes) => bytes,
+            None => return loader_throw(scope, "R2 multipart part must be an ArrayBuffer view"),
+        };
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let id =
+        asyncrt::enqueue(
+            async move { native_mp_part(upload_id, part_number, bytes, gate, None).await },
+        );
     rv.set(promise_for(scope, id));
 }
 
@@ -560,28 +750,21 @@ pub(super) fn op_r2_mp_complete(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let claimed = serde_json::from_str::<Vec<u32>>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 multipart part list: {error}"));
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
-    let id = asyncrt::enqueue(async move {
-        let claimed = claimed?;
-        // Keep the upload reachable until the proof succeeds, so a refused
-        // completion leaves a handle that `reap_uploads` can abort.
-        await_egress_gate(gate).await?;
-        let Some(entry) = uploads().lock().unwrap().remove(&upload_id) else {
-            return Err(format!("R2 multipart upload {upload_id} is not open"));
+    if guest_storage::enabled(scope) {
+        let binding = guest_binding(scope, &args, 2);
+        let operation = celld_applications::resource_wire::R2Operation::MultipartComplete {
+            id: upload_id,
+            parts: match claimed {
+                Ok(claimed) => claimed,
+                Err(error) => return loader_throw(scope, &error),
+            },
         };
-        let mut entry = entry.lock().await;
-        let result = complete(&mut entry, upload_id, claimed).await;
-        if result.is_err() {
-            if let Err(error) = entry.upload.abort().await {
-                tracing::warn!(
-                    %error,
-                    upload_id,
-                    "mismatched R2 multipart upload could not be aborted"
-                );
-            }
-        }
-        result
-    });
+        let body = Vec::new();
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let id =
+        asyncrt::enqueue(async move { native_mp_complete(upload_id, claimed, gate, None).await });
     rv.set(promise_for(scope, id));
 }
 
@@ -638,27 +821,837 @@ pub(super) fn op_r2_mp_abort(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    if guest_storage::enabled(scope) {
+        let binding = guest_binding(scope, &args, 1);
+        let operation =
+            celld_applications::resource_wire::R2Operation::MultipartAbort { id: upload_id };
+        let body = Vec::new();
+        return guest_return(scope, &mut rv, binding, operation, body);
+    }
     let gate = uploads()
         .lock()
         .unwrap()
         .contains_key(&upload_id)
         .then(|| egress_gate_request(&event_context(scope), celld_logic::Channel::R2));
-    let id =
-        asyncrt::enqueue(async move {
-            // An absent upload changes nothing. A live upload stays in the
-            // registry until the proof succeeds, so a refusal cannot orphan
-            // parts by dropping its only handle.
-            let Some(gate) = gate else {
-                return Ok(String::new());
-            };
-            await_egress_gate(gate).await?;
-            let entry = uploads().lock().unwrap().remove(&upload_id);
-            if let Some(entry) = entry {
-                entry.lock().await.upload.abort().await.map_err(|error| {
-                    format!("R2 multipart abort of upload {upload_id}: {error}")
-                })?;
-            }
-            Ok(String::new())
-        });
+    let id = asyncrt::enqueue(async move { native_mp_abort(upload_id, gate, None).await });
     rv.set(promise_for(scope, id));
+}
+
+// Shared original native operations; trusted application brokers prove output before calling.
+async fn native_put_begin(
+    bucket_name: String,
+    key: String,
+    request_json: String,
+    broker_owner: Option<&str>,
+) -> Result<String, String> {
+    let mut put = open_put(bucket_name, key, &request_json)?;
+    put.broker_owner = broker_owner.map(str::to_owned);
+    reap_puts();
+    let put_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    puts()
+        .lock()
+        .unwrap()
+        .insert(put_id, Arc::new(tokio::sync::Mutex::new(put)));
+    Ok(put_id.to_string())
+}
+
+async fn native_put_chunk(
+    put_id: u64,
+    chunk: Option<Vec<u8>>,
+    gate: EgressGate,
+    broker_owner: Option<&str>,
+) -> Result<String, String> {
+    let Some(chunk) = chunk else {
+        return Err("R2 put: a body chunk must be an ArrayBuffer view".to_string());
+    };
+    await_egress_gate(gate).await?;
+    let put = puts()
+        .lock()
+        .unwrap()
+        .get(&put_id)
+        .cloned()
+        .ok_or_else(|| format!("R2 streaming write {put_id} is not open"))?;
+    // A failed chunk leaves the write open, so `__r2_put_end` can
+    // abort the parts already on the store.
+    let mut put = put.lock().await;
+    if put.broker_owner.as_deref() != broker_owner {
+        return Err("R2 streaming write belongs to another binding".into());
+    }
+    put.touched = Instant::now();
+    put.push(chunk).await.map(|()| String::new())
+}
+
+async fn native_put_end(
+    put_id: u64,
+    abort: bool,
+    gate: EgressGate,
+    broker_owner: Option<&str>,
+) -> Result<String, String> {
+    // Keep the entry registered until the proof succeeds. If the gate
+    // refuses the effect, the normal cleanup path can abort a live multipart
+    // upload instead of dropping its handle and orphaning its parts.
+    await_egress_gate(gate).await?;
+    let put = puts().lock().unwrap().get(&put_id).cloned();
+    let Some(put) = put else {
+        return Err(format!("R2 streaming write {put_id} is not open"));
+    };
+    let mut put = put.lock().await;
+    if put.broker_owner.as_deref() != broker_owner {
+        return Err("R2 streaming write belongs to another binding".into());
+    }
+    if puts().lock().unwrap().remove(&put_id).is_none() {
+        return Err(format!("R2 streaming write {put_id} is not open"));
+    }
+    if abort {
+        if let Some(mut upload) = put.upload.take() {
+            let _ = upload.abort().await;
+        }
+        return Ok(serde_json::json!({ "stored": false }).to_string());
+    }
+    put.finish().await
+}
+
+async fn native_mp_begin(
+    bucket_name: String,
+    key: String,
+    request: Result<PutRequest, String>,
+    gate: EgressGate,
+    broker_owner: Option<&str>,
+) -> Result<String, String> {
+    let request = request?;
+    await_egress_gate(gate).await?;
+    reap_uploads();
+    // A multipart object carries no md5, on R2 or here, so nothing is
+    // computed over parts that were never seen whole.
+    let envelope = Envelope {
+        custom: request.custom,
+        http: request.http,
+        checksums: BTreeMap::new(),
+        storage_class: request.storage_class,
+    };
+    let store = store(&bucket_name)?;
+    let upload = store
+        .begin_multipart(&blob_key(&store, &bucket_name, &key), &envelope.write())
+        .await
+        .map_err(|error| error.to_string())?;
+    let upload_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    uploads().lock().unwrap().insert(
+        upload_id,
+        Arc::new(tokio::sync::Mutex::new(UploadEntry {
+            bucket_name,
+            broker_owner: broker_owner.map(str::to_owned),
+            key,
+            upload,
+            flushed: Vec::new(),
+            pending: BTreeMap::new(),
+            held: 0,
+            envelope,
+            written: 0,
+            touched: Instant::now(),
+        })),
+    );
+    Ok(upload_id.to_string())
+}
+
+async fn native_mp_resume(
+    bucket_name: String,
+    key: String,
+    upload_id: String,
+    broker_owner: Option<&str>,
+) -> Result<String, String> {
+    let parsed = upload_id.parse::<u64>().ok();
+    let entry = parsed.and_then(|id| uploads().lock().unwrap().get(&id).cloned());
+    let entry = match entry {
+        Some(entry) => Some(entry.lock_owned().await),
+        None => None,
+    };
+    match entry.as_deref() {
+        Some(entry)
+            if entry.bucket_name == bucket_name
+                && entry.key == key
+                && entry.broker_owner.as_deref() == broker_owner =>
+        {
+            Ok(upload_id.clone())
+        }
+        Some(_) => Err(format!(
+            "R2 multipart upload {upload_id} was opened for another key or binding"
+        )),
+        // The handle the object store hands out cannot be re-derived
+        // from an id, so an upload outlives only the node that opened
+        // it — and only until that node restarts.
+        None => Err(format!(
+            "R2 multipart upload {upload_id} is not open on this node: celld can resume an \
+                 upload within the node that created it, not across nodes or restarts"
+        )),
+    }
+}
+
+async fn native_mp_part(
+    upload_id: u64,
+    part_number: u32,
+    bytes: Option<Vec<u8>>,
+    gate: EgressGate,
+    broker_owner: Option<&str>,
+) -> Result<String, String> {
+    let Some(bytes) = bytes else {
+        return Err(format!(
+            "R2 multipart part {part_number} of upload {upload_id} must be an ArrayBuffer view"
+        ));
+    };
+    await_egress_gate(gate).await?;
+    let entry = uploads()
+        .lock()
+        .unwrap()
+        .get(&upload_id)
+        .cloned()
+        .ok_or_else(|| format!("R2 multipart upload {upload_id} is not open"))?;
+    let mut entry = entry.lock().await;
+    if entry.broker_owner.as_deref() != broker_owner {
+        return Err("R2 multipart upload belongs to another binding".into());
+    }
+    entry.touched = Instant::now();
+    let result = async {
+        if entry.flushed.contains(&part_number) {
+            return Err(format!(
+                "R2 multipart part {part_number} of upload {upload_id} was already handed to \
+                     the object store, which appends parts and cannot rewrite one: celld \
+                     replaces a part that is still waiting its turn, not one already written. \
+                     Send the replacement before the part in front of it, or open the upload \
+                     again"
+            ));
+        }
+        // R2 replaces a part when its number is uploaded again. A part
+        // still waiting its turn is replaced in place, so the bytes it
+        // displaces leave the backlog with it: counting the replacement
+        // without discounting the replaced would grow `held` past what
+        // is actually held and refuse an upload well inside the limit.
+        let replaced = entry.pending.get(&part_number).map_or(0, Vec::len);
+        let held = entry.held - replaced + bytes.len();
+        if held > PART_BACKLOG {
+            return Err(format!(
+                "R2 multipart upload {upload_id} is holding {} bytes of parts waiting for \
+                     part {}: celld hands parts to the object store in ascending order, so \
+                     upload the parts in front of the ones running ahead",
+                entry.held,
+                entry.next(),
+            ));
+        }
+        entry.held = held;
+        entry.pending.insert(part_number, bytes);
+        entry.drain().await
+    }
+    .await;
+    result?;
+    Ok(serde_json::json!({ "partNumber": part_number }).to_string())
+}
+
+async fn native_mp_complete(
+    upload_id: u64,
+    claimed: Result<Vec<u32>, String>,
+    gate: EgressGate,
+    broker_owner: Option<&str>,
+) -> Result<String, String> {
+    let claimed = claimed?;
+    // Keep the upload reachable until the proof succeeds, so a refused
+    // completion leaves a handle that `reap_uploads` can abort.
+    await_egress_gate(gate).await?;
+    let Some(entry) = uploads().lock().unwrap().get(&upload_id).cloned() else {
+        return Err(format!("R2 multipart upload {upload_id} is not open"));
+    };
+    let mut entry = entry.lock().await;
+    if entry.broker_owner.as_deref() != broker_owner {
+        return Err("R2 multipart upload belongs to another binding".into());
+    }
+    if uploads().lock().unwrap().remove(&upload_id).is_none() {
+        return Err(format!("R2 multipart upload {upload_id} is not open"));
+    }
+    let result = complete(&mut entry, upload_id, claimed).await;
+    if result.is_err() {
+        if let Err(error) = entry.upload.abort().await {
+            tracing::warn!(
+                %error,
+                upload_id,
+                "mismatched R2 multipart upload could not be aborted"
+            );
+        }
+    }
+    result
+}
+
+async fn native_mp_abort(
+    upload_id: u64,
+    gate: Option<EgressGate>,
+    broker_owner: Option<&str>,
+) -> Result<String, String> {
+    // An absent upload changes nothing. A live upload stays in the
+    // registry until the proof succeeds, so a refusal cannot orphan
+    // parts by dropping its only handle.
+    let Some(gate) = gate else {
+        return Ok(String::new());
+    };
+    await_egress_gate(gate).await?;
+    let entry = uploads().lock().unwrap().get(&upload_id).cloned();
+    if let Some(entry) = entry {
+        let mut entry = entry.lock().await;
+        if entry.broker_owner.as_deref() != broker_owner {
+            return Err("R2 multipart upload belongs to another binding".into());
+        }
+        if uploads().lock().unwrap().remove(&upload_id).is_none() {
+            return Ok(String::new());
+        }
+        entry
+            .upload
+            .abort()
+            .await
+            .map_err(|error| format!("R2 multipart abort of upload {upload_id}: {error}"))?;
+    }
+    Ok(String::new())
+}
+
+#[cfg(test)]
+pub(crate) async fn check_application_broker() {
+    use crate::bucket::Bucket;
+    use crate::r2_store::STREAM_PART;
+    use celld_applications::resource_wire::R2Operation as R;
+    use celld_applications::{ApplicationId, Name, ResourceAddress, ResourceKind, ResourceRef};
+    static DIRECTORY: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let directory = DIRECTORY.get_or_init(|| tempfile::tempdir().unwrap());
+    set_r2_store(Bucket::open_dev(&directory.path().join("r2.sqlite")).unwrap());
+    let name = |value: &str| Name::try_from(value.to_owned()).unwrap();
+    let scope = |app: &str| {
+        ResourceAddress {
+            application: ApplicationId { app: name(app) },
+            resource: ResourceRef {
+                kind: ResourceKind::R2,
+                id: name("bucket"),
+            },
+        }
+        .storage_root()
+        .trim_end_matches('/')
+        .to_owned()
+    };
+    let one = scope("one");
+    let two = scope("two");
+    let call = |scope: String, operation: R, body: Vec<u8>| {
+        broker_operation(scope.clone(), scope, operation, body)
+    };
+    let json = |response: HttpResponse| {
+        serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+    };
+    async fn read(mut response: HttpResponse) -> (serde_json::Value, Vec<u8>) {
+        let length = u32::from_be_bytes(response.body[..4].try_into().unwrap()) as usize;
+        let record = serde_json::from_slice(&response.body[4..4 + length]).unwrap();
+        let mut bytes = response.body.split_off(4 + length);
+        if let Some(mut stream) = response.stream {
+            while let Some(chunk) = stream.next().await {
+                bytes.extend(chunk.unwrap());
+            }
+        }
+        (record, bytes)
+    }
+    // Local development preserves its private key mapping. Dot segments and
+    // already encoded delimiters become
+    // literal key segments; leading delimiters never replace the scoped root.
+    call(
+        two.clone(),
+        R::Put {
+            key: "sentinel".into(),
+            options: "{}".into(),
+        },
+        b"foreign-kept".to_vec(),
+    )
+    .await
+    .unwrap();
+    let unusual = vec![
+        format!("{}r2/{two}/sentinel", "../".repeat(20)),
+        format!("/r2/{two}/sentinel"),
+        format!("%2e%2e/%2F/r2/{two}/sentinel"),
+        "./leading//nested/key".into(),
+    ];
+    let prefix = object_store::path::Path::from(format!("r2/{one}"));
+    for key in &unusual {
+        let encoded = object_store::path::Path::from(blob_key(&store(&one).unwrap(), &one, key));
+        assert!(
+            encoded.prefix_matches(&prefix),
+            "R2 key escaped application resource: {key}"
+        );
+        assert_ne!(
+            encoded,
+            object_store::path::Path::from(blob_key(&store(&two).unwrap(), &two, "sentinel"))
+        );
+        call(
+            one.clone(),
+            R::Put {
+                key: key.clone(),
+                options: "{}".into(),
+            },
+            b"local".to_vec(),
+        )
+        .await
+        .unwrap();
+        let (_, value) = read(
+            call(
+                one.clone(),
+                R::Get {
+                    key: key.clone(),
+                    options: "{}".into(),
+                },
+                vec![],
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(value, b"local");
+        let (_, foreign) = read(
+            call(
+                two.clone(),
+                R::Get {
+                    key: "sentinel".into(),
+                    options: "{}".into(),
+                },
+                vec![],
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(foreign, b"foreign-kept");
+    }
+    call(one.clone(), R::Delete { keys: unusual }, vec![])
+        .await
+        .unwrap();
+    call(
+        two.clone(),
+        R::Delete {
+            keys: vec!["sentinel".into()],
+        },
+        vec![],
+    )
+    .await
+    .unwrap();
+    let options = r#"{"http":{"contentType":"text/plain"},"custom":{"case":"Kept"}}"#.to_owned();
+    assert_eq!(
+        json(
+            call(
+                one.clone(),
+                R::Put {
+                    key: "record".into(),
+                    options: options.clone()
+                },
+                b"hello".to_vec()
+            )
+            .await
+            .unwrap()
+        )["stored"],
+        true
+    );
+    assert_eq!(
+        json(
+            call(
+                two.clone(),
+                R::Head {
+                    key: "record".into()
+                },
+                vec![]
+            )
+            .await
+            .unwrap()
+        )["state"],
+        "miss"
+    );
+    let head = json(
+        call(
+            one.clone(),
+            R::Head {
+                key: "record".into(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(
+        json(
+            broker_operation(
+                one.clone(),
+                two.clone(),
+                R::Head {
+                    key: "record".into()
+                },
+                vec![]
+            )
+            .await
+            .unwrap()
+        )["state"],
+        "hit",
+        "sharing a bucket shares objects, not upload handles",
+    );
+    assert_eq!(head["object"]["custom"]["case"], "Kept");
+    assert_eq!(head["object"]["http"]["contentType"], "text/plain");
+    let (record, bytes) = read(
+        call(
+            one.clone(),
+            R::Get {
+                key: "record".into(),
+                options: r#"{"range":{"suffix":2}}"#.into(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(bytes, b"lo");
+    assert_eq!(record["object"]["range"]["length"], 2);
+    let (record, bytes) = read(
+        call(
+            one.clone(),
+            R::Get {
+                key: "record".into(),
+                options: r#"{"onlyIf":{"etagMatches":"wrong"}}"#.into(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(record["state"], "unmet");
+    assert!(bytes.is_empty());
+    assert!(call(
+        one.clone(),
+        R::Put {
+            key: "record".into(),
+            options: r#"{"verify":{"sha256":"wrong"}}"#.into()
+        },
+        b"changed".to_vec()
+    )
+    .await
+    .is_err());
+    let (_, bytes) = read(
+        call(
+            one.clone(),
+            R::Get {
+                key: "record".into(),
+                options: "{}".into(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(bytes, b"hello");
+    let id = String::from_utf8(
+        call(
+            one.clone(),
+            R::PutBegin {
+                key: "stream".into(),
+                options: "{}".into(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap()
+        .body,
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    assert!(call(two.clone(), R::PutChunk { id }, vec![8])
+        .await
+        .is_err());
+    assert!(
+        broker_operation(one.clone(), two.clone(), R::PutChunk { id }, vec![8])
+            .await
+            .is_err()
+    );
+    assert!(broker_operation(
+        one.clone(),
+        two.clone(),
+        R::PutEnd { id, abort: true },
+        vec![]
+    )
+    .await
+    .is_err());
+    assert!(
+        native_put_chunk(id, Some(vec![8]), EgressGate::NoCell, None)
+            .await
+            .is_err()
+    );
+    assert!(native_put_end(id, true, EgressGate::NoCell, None)
+        .await
+        .is_err());
+    call(one.clone(), R::PutChunk { id }, vec![7; STREAM_PART + 1])
+        .await
+        .unwrap();
+    assert_eq!(
+        json(
+            call(one.clone(), R::PutEnd { id, abort: false }, vec![])
+                .await
+                .unwrap()
+        )["stored"],
+        true
+    );
+    let (_, bytes) = read(
+        call(
+            one.clone(),
+            R::Get {
+                key: "stream".into(),
+                options: "{}".into(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(bytes, vec![7; STREAM_PART + 1]);
+    let id = String::from_utf8(
+        call(
+            one.clone(),
+            R::MultipartBegin {
+                key: "multipart".into(),
+                options: options.clone(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap()
+        .body,
+    )
+    .unwrap();
+    assert!(call(
+        two.clone(),
+        R::MultipartResume {
+            key: "multipart".into(),
+            id: id.clone()
+        },
+        vec![]
+    )
+    .await
+    .is_err());
+    assert!(broker_operation(
+        one.clone(),
+        two.clone(),
+        R::MultipartResume {
+            key: "multipart".into(),
+            id: id.clone(),
+        },
+        vec![]
+    )
+    .await
+    .is_err());
+    assert!(
+        native_mp_resume(one.clone(), "multipart".into(), id.clone(), None)
+            .await
+            .is_err()
+    );
+    assert!(call(
+        one.clone(),
+        R::MultipartResume {
+            key: "other".into(),
+            id: id.clone()
+        },
+        vec![]
+    )
+    .await
+    .is_err());
+    call(
+        one.clone(),
+        R::MultipartResume {
+            key: "multipart".into(),
+            id: id.clone(),
+        },
+        vec![],
+    )
+    .await
+    .unwrap();
+    let id = id.parse().unwrap();
+    call(
+        one.clone(),
+        R::MultipartPart { id, part: 2 },
+        b"second".to_vec(),
+    )
+    .await
+    .unwrap();
+    assert!(call(
+        two.clone(),
+        R::MultipartPart { id, part: 1 },
+        b"foreign".to_vec()
+    )
+    .await
+    .is_err());
+    assert!(broker_operation(
+        one.clone(),
+        two.clone(),
+        R::MultipartPart { id, part: 1 },
+        b"foreign".to_vec()
+    )
+    .await
+    .is_err());
+    assert!(
+        native_mp_part(id, 1, Some(b"foreign".to_vec()), EgressGate::NoCell, None)
+            .await
+            .is_err()
+    );
+    call(
+        one.clone(),
+        R::MultipartPart { id, part: 1 },
+        b"first".to_vec(),
+    )
+    .await
+    .unwrap();
+    assert!(call(
+        one.clone(),
+        R::MultipartPart { id, part: 1 },
+        b"rewrite".to_vec()
+    )
+    .await
+    .is_err());
+    assert!(call(
+        two.clone(),
+        R::MultipartComplete {
+            id,
+            parts: vec![1, 2]
+        },
+        vec![]
+    )
+    .await
+    .is_err());
+    assert!(broker_operation(
+        one.clone(),
+        two.clone(),
+        R::MultipartComplete {
+            id,
+            parts: vec![1, 2],
+        },
+        vec![]
+    )
+    .await
+    .is_err());
+    assert!(
+        native_mp_complete(id, Ok(vec![1, 2]), EgressGate::NoCell, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        json(
+            call(
+                one.clone(),
+                R::MultipartComplete {
+                    id,
+                    parts: vec![1, 2]
+                },
+                vec![]
+            )
+            .await
+            .unwrap()
+        )["custom"]["case"],
+        "Kept"
+    );
+    let (_, bytes) = read(
+        call(
+            one.clone(),
+            R::Get {
+                key: "multipart".into(),
+                options: "{}".into(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(bytes, b"firstsecond");
+    let id = String::from_utf8(
+        call(
+            one.clone(),
+            R::MultipartBegin {
+                key: "aborted".into(),
+                options: "{}".into(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap()
+        .body,
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    assert!(call(two.clone(), R::MultipartAbort { id }, vec![])
+        .await
+        .is_err());
+    assert!(
+        broker_operation(one.clone(), two.clone(), R::MultipartAbort { id }, vec![])
+            .await
+            .is_err()
+    );
+    assert!(native_mp_abort(id, Some(EgressGate::NoCell), None)
+        .await
+        .is_err());
+    call(one.clone(), R::MultipartAbort { id }, vec![])
+        .await
+        .unwrap();
+    call(one.clone(), R::MultipartAbort { id }, vec![])
+        .await
+        .unwrap();
+    let listing = json(
+        call(
+            one.clone(),
+            R::List {
+                options: r#"{"limit":1,"include":true}"#.into(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(listing["objects"].as_array().unwrap().len(), 1);
+    assert_eq!(listing["truncated"], true);
+    let next = json(
+        call(
+            one.clone(),
+            R::List {
+                options: serde_json::json!({"cursor":listing["cursor"],"include":true}).to_string(),
+            },
+            vec![],
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(next["objects"].as_array().unwrap().len(), 2);
+    call(
+        one.clone(),
+        R::Delete {
+            keys: vec![
+                "record".into(),
+                "stream".into(),
+                "multipart".into(),
+                "absent".into(),
+            ],
+        },
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(json(
+        call(
+            one,
+            R::List {
+                options: "{}".into()
+            },
+            vec![]
+        )
+        .await
+        .unwrap()
+    )["objects"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    eprintln!(
+        "native application R2: original conditional/ranged streaming reads, metadata/checksums, streamed multipart write, out-of-order multipart/resume/complete/abort, cursored list and delete; same-name cross-application scopes, same-bucket cross-owner and legacy handle mutations refused"
+    );
 }

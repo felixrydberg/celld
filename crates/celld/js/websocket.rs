@@ -9,6 +9,7 @@
 //! until the gate opens, which is why emitting is not simply a send.
 use super::*;
 pub use crate::ws_registry::*;
+use futures_util::StreamExt as _;
 
 #[derive(Default)]
 pub(super) struct WsCapture {
@@ -22,7 +23,7 @@ pub(super) struct WsCapture {
 fn prepare_worker_websocket_handoff(id: u64) {
     let (inbound, receiver) = ws_pull_channel();
     ws_pull_register(id, receiver);
-    ws_register_outbound(id, "");
+    ws_register_outbound(id, "", None);
     ws_track_request_socket(id);
     let registry = ws_registry();
     let replaced = registry.lock().unwrap().worker_handoffs.insert(id, inbound);
@@ -50,6 +51,12 @@ pub(super) fn transfer_worker_websocket_handoff(id: u64) -> Option<WorkerWebSock
 /// send failing, and nothing else tells it to go.
 pub(super) fn ws_close_request_sockets(opened: Vec<u64>) {
     for id in opened {
+        // A socket this guest dialed is the host's: it closes it, and its echo
+        // of the close ends the pump still reading it.
+        if dials().lock().unwrap().contains_key(&id) {
+            guest_storage::close_dialed(&current_context(), id);
+            continue;
+        }
         let registry = ws_registry();
         let handoff = registry.lock().unwrap().worker_handoffs.remove(&id);
         drop(handoff);
@@ -241,6 +248,199 @@ fn ws_emit(context: &Arc<IoContext>, id: u64, out: WsOut) {
     });
 }
 
+/// The frame streams of the sockets this guest dialed, by the guest's local id.
+/// Each is the credited stream of its dial fetch, one inbound frame to a run
+/// of chunks (see `DIAL_*`); `__ws_next` takes one frame per call, so a pump
+/// that stops asking stops the host reading the connection.
+pub(crate) type DialStream = Arc<tokio::sync::Mutex<HttpChunkStream>>;
+
+fn dials() -> &'static std::sync::Mutex<HashMap<u64, DialStream>> {
+    static DIALS: OnceLock<std::sync::Mutex<HashMap<u64, DialStream>>> = OnceLock::new();
+    DIALS.get_or_init(Default::default)
+}
+
+/// The next inbound frame of a dialed socket as `__ws_next` resolves it. A
+/// stream that ends or fails without a close frame is an abnormal closure.
+pub(crate) async fn next_dial_frame(id: u64, stream: DialStream) -> Vec<u8> {
+    use celld_applications::invocation_wire::{DIAL_LAST, MAX_BODY_BYTES};
+    let mut stream = stream.lock().await;
+    let mut frame = Vec::new();
+    let encoded = loop {
+        match stream.next().await {
+            Some(Ok(chunk)) if !chunk.is_empty() => {
+                frame.extend_from_slice(&chunk[1..]);
+                if frame.len() > MAX_BODY_BYTES + 1 {
+                    break WsPull::Close(1009, "message too big".into(), false).encode();
+                }
+                if chunk[0] == DIAL_LAST {
+                    break frame;
+                }
+            }
+            _ => break WsPull::Close(1006, String::new(), false).encode(),
+        }
+    };
+    if encoded.first() == Some(&WS_PULL_TAG_CLOSE) {
+        dials().lock().unwrap().remove(&id);
+    }
+    encoded
+}
+
+/// `new WebSocket(url)` and `fetch(url, { Upgrade })` in guest mode: the host
+/// dials. `upgrade` is the `fetch()` form, which also answers a server that
+/// declines; both resolve as the original ops do.
+/// The handshake is an HTTP request; `ws(s)` is its twin, as in the connector.
+fn dial_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some(("ws", rest)) => format!("http://{rest}"),
+        Some(("wss", rest)) => format!("https://{rest}"),
+        _ => url.to_owned(),
+    }
+}
+
+/// The subprotocols a `fetch()` upgrade offers, read from its headers.
+fn upgrade_protocols(headers: &[(String, String)]) -> Vec<String> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
+        .map(|(_, value)| value.split(',').map(|p| p.trim().to_string()).collect())
+        .unwrap_or_default()
+}
+
+fn guest_dial(
+    scope: &mut v8::PinScope,
+    rv: &mut v8::ReturnValue<v8::Value>,
+    id: u64,
+    url: &str,
+    protocols: Vec<String>,
+    headers: Vec<(String, String)>,
+    upgrade: bool,
+) {
+    let brokered = match guest_storage::dial(scope, id, dial_url(url), protocols, headers, upgrade)
+    {
+        Ok(brokered) => brokered,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    // The socket belongs to the request that opened it, as a Worker's does, and
+    // its queue exists before the handshake ends: the pump asks for frames at
+    // once, as it does for the original's queue, and waits for the stream.
+    ws_track_request_socket(id);
+    let (deliver, delivered) = tokio::sync::oneshot::channel::<HttpChunkStream>();
+    let queued: HttpChunkStream = Box::pin(futures_util::stream::once(delivered).flat_map(
+        |stream| match stream {
+            Ok(stream) => stream,
+            Err(_) => Box::pin(futures_util::stream::empty()) as HttpChunkStream,
+        },
+    ));
+    dials()
+        .lock()
+        .unwrap()
+        .insert(id, Arc::new(tokio::sync::Mutex::new(queued)));
+    let failed = if upgrade {
+        "WebSocket upgrade failed"
+    } else {
+        "WebSocket connection failed"
+    };
+    let async_id = asyncrt::enqueue(async move {
+        let mut response = match brokered.await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                dials().lock().unwrap().remove(&id);
+                return Err(format!("{failed}: {error}"));
+            }
+            Err(_) => {
+                dials().lock().unwrap().remove(&id);
+                return Err(format!("{failed}: the connection was abandoned"));
+            }
+        };
+        let protocol = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        if response.status == 101 {
+            let stream = response
+                .stream
+                .take()
+                .ok_or_else(|| format!("{failed}: the host sent no frame stream"))?;
+            let _ = deliver.send(stream);
+            return Ok(if upgrade {
+                serde_json::json!({"upgraded": true, "protocol": protocol}).to_string()
+            } else {
+                protocol
+            });
+        }
+        dials().lock().unwrap().remove(&id);
+        if !upgrade {
+            return Err(format!("{failed}: the server answered {}", response.status));
+        }
+        let mut body = std::mem::take(&mut response.body);
+        if let Some(mut stream) = response.stream.take() {
+            while let Some(chunk) = stream.next().await {
+                body.extend(chunk?);
+            }
+        }
+        Ok(serde_json::json!({
+            "upgraded": false,
+            "status": response.status,
+            "headers": response.headers,
+            "body": body,
+        })
+        .to_string())
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+/// A guest object's registry operation, answered by the host. `None` outside
+/// guest mode, where the original in-process registry answers.
+fn guest_registry(
+    scope: &mut v8::PinScope,
+    cell: Option<&str>,
+    operation: celld_applications::storage_wire::Operation,
+) -> Option<Result<celld_applications::storage_wire::Value, String>> {
+    if !guest_storage::enabled(scope) {
+        return None;
+    }
+    let call = |scope: &mut v8::PinScope| {
+        let channel = match cell {
+            Some(cell) => guest_storage::channel(scope, cell)?
+                .ok_or_else(|| "guest storage is unavailable".to_string())?,
+            None => guest_storage::current_channel(scope)?,
+        };
+        guest_storage::call(scope, &channel, operation)
+    };
+    Some(call(scope))
+}
+
+/// Outbound frame of a guest object, or `false` outside guest mode.
+fn guest_frame(
+    scope: &mut v8::PinScope,
+    id: u64,
+    frame: celld_applications::invocation_wire::SocketFrame,
+) -> bool {
+    if !guest_storage::enabled(scope) {
+        return false;
+    }
+    let dial = dials().lock().unwrap().contains_key(&id);
+    if let Err(error) = guest_storage::socket_frame(scope, id, dial, frame) {
+        loader_throw(scope, &error);
+    }
+    true
+}
+
+/// Sockets that need the host to carry frames in a way no guest bridge exists
+/// for yet fail at their first call, not as a silent drop.
+fn guest_refuses(scope: &mut v8::PinScope, what: &str) -> bool {
+    if !guest_storage::enabled(scope) {
+        return false;
+    }
+    loader_throw(
+        scope,
+        &format!("{what} is not connected in application guests; use state.acceptWebSocket()"),
+    );
+    true
+}
+
 pub(super) fn op_ws_send(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -252,6 +452,13 @@ pub(super) fn op_ws_send(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let data = args.get(1).to_rust_string_lossy(scope);
+    if guest_frame(
+        scope,
+        id,
+        celld_applications::invocation_wire::SocketFrame::Text { data: data.clone() },
+    ) {
+        return;
+    }
     ws_emit(&event_context(scope), id, WsOut::Text(data));
 }
 pub(super) fn op_ws_send_binary(
@@ -265,6 +472,13 @@ pub(super) fn op_ws_send_binary(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let data = view_bytes(args.get(1)).unwrap_or_default();
+    if guest_frame(
+        scope,
+        id,
+        celld_applications::invocation_wire::SocketFrame::Binary { data: data.clone() },
+    ) {
+        return;
+    }
     ws_emit(&event_context(scope), id, WsOut::Binary(data));
 }
 pub(super) fn op_ws_close(
@@ -279,14 +493,45 @@ pub(super) fn op_ws_close(
         .unwrap_or(0);
     let code = args.get(1).uint32_value(scope).unwrap_or(1000) as u16;
     let reason = args.get(2).to_rust_string_lossy(scope);
+    if guest_frame(
+        scope,
+        id,
+        celld_applications::invocation_wire::SocketFrame::Close {
+            code,
+            reason: reason.clone(),
+        },
+    ) {
+        return;
+    }
     ws_emit(&event_context(scope), id, WsOut::Close(code, reason));
 }
+/// Whether sockets are the host's to dial (an application guest). JavaScript
+/// polls such a socket, whatever object it runs for, as a Worker polls its own.
+/// Where an application guest's own socket ids start; host registry ids stay below.
+const GUEST_LOCAL_IDS: u64 = 1 << 40;
+
+pub(super) fn op_ws_guest(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let guest = guest_storage::enabled(scope);
+    rv.set(v8::Boolean::new(scope, guest).into());
+}
+
 pub(super) fn op_ws_alloc(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    rv.set(v8::Number::new(scope, ws_next_id() as f64).into());
+    // A guest's local ids (pairs, dialed sockets) sit above every registry id the
+    // host hands it, so one id never names two sockets.
+    let base = if guest_storage::enabled(scope) {
+        GUEST_LOCAL_IDS
+    } else {
+        0
+    };
+    rv.set(v8::Number::new(scope, (base + ws_next_id()) as f64).into());
 }
 
 pub(super) fn op_ws_prepare_worker_handoff(
@@ -299,8 +544,48 @@ pub(super) fn op_ws_prepare_worker_handoff(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
+    if guest_refuses(scope, "A Worker WebSocket response") {
+        return;
+    }
     prepare_worker_websocket_handoff(id);
 }
+/// The facet record of an outbound socket that `cell` opens, when the running
+/// event belongs to a Durable Object facet.
+///
+/// A facet is not a cell. A socket that names the facet's scope as its cell
+/// starts an activation of a class that no Worker exports, so the upgrade
+/// fails with `RuntimeFailed`. The socket must route, register, and gate
+/// through the facet's root instead. The record comes from the frame that
+/// the host installed when the event started, not from `cell`, because the
+/// scope crosses application JavaScript.
+fn dialing_facet(scope: &mut v8::PinScope, cell: &str) -> Result<Option<FacetSocket>, String> {
+    if cell.is_empty() {
+        return Ok(None);
+    }
+    let Some(EgressFrame {
+        storage,
+        root: Some(root),
+        ..
+    }) = current_cell_event(&event_context(scope))
+    else {
+        return Ok(None);
+    };
+    if storage != cell {
+        return Err(format!(
+            "websocket: the socket names {cell}, but the running Durable Object facet is {storage}"
+        ));
+    }
+    let opening = storage::facet_opening(&storage).ok_or(
+        "websocket: the Durable Object facet that opened this socket is no longer running",
+    )?;
+    Ok(Some(FacetSocket {
+        root: root.cell,
+        stream: root.stream,
+        epoch: root.epoch,
+        opening,
+    }))
+}
+
 /// `fetch(url, { headers: { Upgrade: "websocket" } })`. Returns a JSON
 /// envelope: either an upgraded socket, or the ordinary response a server sent
 /// instead, which the caller returns unchanged.
@@ -309,6 +594,27 @@ pub(super) fn op_ws_upgrade(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    if guest_storage::enabled(scope) {
+        let id = args
+            .get(0)
+            .to_integer(scope)
+            .map_or(0, |n| n.value() as u64);
+        let url = args.get(2).to_rust_string_lossy(scope);
+        let headers: Vec<(String, String)> =
+            match serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)) {
+                Ok(headers) => headers,
+                Err(error) => {
+                    return loader_throw(
+                        scope,
+                        &format!(
+                            "websocket: the upgrade headers are not a name/value list: {error}"
+                        ),
+                    )
+                }
+            };
+        let protocols = upgrade_protocols(&headers);
+        return guest_dial(scope, &mut rv, id, &url, protocols, headers, true);
+    }
     match &actor_runtime_state(scope).egress {
         EgressPolicy::Allow => {}
         EgressPolicy::Deny => {
@@ -330,6 +636,10 @@ pub(super) fn op_ws_upgrade(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    let facet = match dialing_facet(scope, &cell) {
+        Ok(facet) => facet,
+        Err(error) => return loader_throw(scope, &error),
+    };
     let url = args.get(2).to_rust_string_lossy(scope);
     // The subprotocol list is read back out of these headers, so a silent
     // default opened the socket with no headers and no subprotocol at all.
@@ -366,6 +676,7 @@ pub(super) fn op_ws_upgrade(
                 headers,
                 want_response: true,
                 target: None,
+                facet,
                 reply: tx,
             })
             .is_ok()
@@ -410,6 +721,17 @@ pub(super) fn op_ws_next(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
+    if guest_storage::enabled(scope) {
+        let stream = dials().lock().unwrap().get(&id).cloned();
+        let async_id = asyncrt::enqueue_io_context(async move {
+            Ok(match stream {
+                Some(stream) => next_dial_frame(id, stream).await,
+                None => WsPull::Close(1006, "socket is not registered".into(), false).encode(),
+            })
+        });
+        rv.set(promise_for(scope, async_id));
+        return;
+    }
     let queue = ws_pull().lock().unwrap().get(&id).cloned();
     let async_id = asyncrt::enqueue_io_context(async move {
         let Some(queue) = queue else {
@@ -430,6 +752,24 @@ pub(super) fn op_ws_connect(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    if guest_storage::enabled(scope) {
+        let id = args
+            .get(0)
+            .to_integer(scope)
+            .map_or(0, |n| n.value() as u64);
+        let url = args.get(2).to_rust_string_lossy(scope);
+        let protocols: Vec<String> =
+            match serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)) {
+                Ok(protocols) => protocols,
+                Err(error) => {
+                    return loader_throw(
+                        scope,
+                        &format!("websocket: the subprotocol list is not a JSON array: {error}"),
+                    )
+                }
+            };
+        return guest_dial(scope, &mut rv, id, &url, protocols, Vec::new(), false);
+    }
     match &actor_runtime_state(scope).egress {
         EgressPolicy::Allow => {}
         EgressPolicy::Deny => {
@@ -451,6 +791,10 @@ pub(super) fn op_ws_connect(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    let facet = match dialing_facet(scope, &cell) {
+        Ok(facet) => facet,
+        Err(error) => return loader_throw(scope, &error),
+    };
     let url = args.get(2).to_rust_string_lossy(scope);
     let protocols: Vec<String> =
         match serde_json::from_str(&args.get(3).to_rust_string_lossy(scope)) {
@@ -482,6 +826,7 @@ pub(super) fn op_ws_connect(
                 headers: Vec::new(),
                 want_response: false,
                 target: None,
+                facet,
                 reply: tx,
             })
             .is_ok()
@@ -518,6 +863,12 @@ pub(super) fn op_ws_bind_target(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
+    if guest_refuses(
+        scope,
+        "Accepting a Durable Object WebSocket in another isolate",
+    ) {
+        return;
+    }
     let Ok(target) = serde_json::from_str::<WsTarget>(&args.get(1).to_rust_string_lossy(scope))
     else {
         return loader_throw(scope, "WebSocket target is not valid");
@@ -526,6 +877,14 @@ pub(super) fn op_ws_bind_target(
     // accounted against the isolate holding it, exactly as `op_ws_connect`
     // accounts an outbound one.
     let cell = args.get(2).to_rust_string_lossy(scope);
+    // The caller end's frames reach this isolate through its pull queue, so
+    // they never route by `cell`. The record still matters: a facet that
+    // stops closes its sockets by it, and this end would otherwise keep the
+    // other Durable Object's socket open after the facet is gone.
+    let facet = match dialing_facet(scope, &cell) {
+        Ok(facet) => facet,
+        Err(error) => return loader_throw(scope, &error),
+    };
     let (pull_tx, pull_rx) = ws_pull_channel();
     ws_pull_register(id, pull_rx);
     if cell.is_empty() {
@@ -535,7 +894,7 @@ pub(super) fn op_ws_bind_target(
     // the pipe task buffers as a pending frame instead of being dropped for
     // a socket the registry has never heard of. `accept()` opens the socket
     // synchronously, so that window is reachable by an ordinary `send()`.
-    ws_register_outbound(id, &cell);
+    ws_register_outbound(id, &cell, facet);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sent = outbound_ws_tx().is_some_and(|sender| {
         sender
@@ -548,6 +907,8 @@ pub(super) fn op_ws_bind_target(
                 headers: Vec::new(),
                 want_response: false,
                 target: Some(target),
+                // `scope` names the target, which keeps its own route.
+                facet: None,
                 reply: tx,
             })
             .is_ok()
@@ -570,7 +931,7 @@ pub(super) fn op_ws_bind_target(
 pub(super) fn op_ws_accept(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
+    mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args
         .get(0)
@@ -591,6 +952,27 @@ pub(super) fn op_ws_accept(
             )
         }
     };
+    // The host owns the socket: it answers with the registry id every later
+    // frame, list row and event names. `accepted` marks an id it already gave.
+    let accepted = args.get(3).boolean_value(scope);
+    if let Some(answer) = guest_registry(
+        scope,
+        Some(&cell),
+        celld_applications::storage_wire::Operation::SocketAccept {
+            ws: id,
+            accepted,
+            tags: tags.clone(),
+        },
+    ) {
+        match answer {
+            Ok(celld_applications::storage_wire::Value::Socket { ws }) => {
+                rv.set(v8::Number::new(scope, ws as f64).into())
+            }
+            Ok(_) => loader_throw(scope, "invalid WebSocket accept reply"),
+            Err(error) => loader_throw(scope, &error),
+        }
+        return;
+    }
     let replaced_regular_scope = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -613,6 +995,8 @@ pub(super) fn op_ws_accept(
                 attachment: None,
                 pending: Vec::new(),
                 auto_response_at: None,
+                facet: None,
+                claimed: true,
             });
         replaced_regular_scope
     };
@@ -632,6 +1016,12 @@ pub(super) fn op_ws_accept_regular(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    if guest_refuses(
+        scope,
+        "A regular (non-hibernatable) Durable Object WebSocket",
+    ) {
+        return;
+    }
     let inserted = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -644,6 +1034,8 @@ pub(super) fn op_ws_accept_regular(
                 attachment: None,
                 pending: Vec::new(),
                 auto_response_at: None,
+                facet: None,
+                claimed: true,
             });
             true
         } else {
@@ -667,6 +1059,31 @@ pub(super) fn op_ws_list(
     } else {
         Some(tag.to_rust_string_lossy(scope))
     };
+    if let Some(answer) = guest_registry(
+        scope,
+        Some(&cell),
+        celld_applications::storage_wire::Operation::SocketList { tag: tag.clone() },
+    ) {
+        match answer {
+            Ok(celld_applications::storage_wire::Value::Sockets { sockets }) => {
+                let rows = sockets
+                    .into_iter()
+                    .map(|row| {
+                        serde_json::json!({
+                            "id": row.ws,
+                            "tags": row.tags,
+                            "attachment": row.attachment,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let json = serde_json::to_string(&rows).unwrap();
+                rv.set(v8::String::new(scope, &json).unwrap().into());
+            }
+            Ok(_) => loader_throw(scope, "invalid WebSocket list reply"),
+            Err(error) => loader_throw(scope, &error),
+        }
+        return;
+    }
     let rows = ws_registry()
         .lock()
         .unwrap()
@@ -704,6 +1121,19 @@ pub(super) fn op_ws_attachment_set(
         scope.throw_exception(exception);
         return;
     };
+    if let Some(answer) = guest_registry(
+        scope,
+        None,
+        celld_applications::storage_wire::Operation::SocketAttachment {
+            ws: id,
+            attachment: attachment.to_vec(),
+        },
+    ) {
+        if let Err(error) = answer {
+            loader_throw(scope, &error);
+        }
+        return;
+    }
     if let Some(meta) = ws_registry().lock().unwrap().metadata.get_mut(&id) {
         meta.attachment = Some(attachment.to_vec());
     }
@@ -716,7 +1146,24 @@ pub(super) fn op_ws_auto_response_set(
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
     let request = args.get(1);
-    if request.is_null() || request.is_undefined() {
+    let unset = request.is_null() || request.is_undefined();
+    if guest_storage::enabled(scope) {
+        let pair = (!unset).then(|| {
+            (
+                request.to_rust_string_lossy(scope),
+                args.get(2).to_rust_string_lossy(scope),
+            )
+        });
+        if let Some(Err(error)) = guest_registry(
+            scope,
+            Some(&cell),
+            celld_applications::storage_wire::Operation::SocketAutoResponse { pair },
+        ) {
+            loader_throw(scope, &error);
+        }
+        return;
+    }
+    if unset {
         ws_auto_responses().lock().unwrap().remove(&cell);
         return;
     }
@@ -733,7 +1180,16 @@ pub(super) fn op_ws_auto_response_get(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
-    let pair = ws_auto_responses().lock().unwrap().get(&cell).cloned();
+    let pair = match guest_registry(
+        scope,
+        Some(&cell),
+        celld_applications::storage_wire::Operation::SocketAutoResponseGet {},
+    ) {
+        Some(Ok(celld_applications::storage_wire::Value::AutoResponse { pair })) => pair,
+        Some(Ok(_)) => return loader_throw(scope, "invalid WebSocket auto-response reply"),
+        Some(Err(error)) => return loader_throw(scope, &error),
+        None => ws_auto_responses().lock().unwrap().get(&cell).cloned(),
+    };
     let json = match pair {
         Some((request, response)) => serde_json::to_string(&[request, response]).unwrap(),
         None => "null".to_string(),
@@ -750,14 +1206,72 @@ pub(super) fn op_ws_auto_response_ts(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
-    let stamped = ws_registry()
-        .lock()
-        .unwrap()
-        .metadata
-        .get(&id)
-        .and_then(|meta| meta.auto_response_at);
+    let stamped = match guest_registry(
+        scope,
+        None,
+        celld_applications::storage_wire::Operation::SocketAutoResponseTimestamp { ws: id },
+    ) {
+        Some(Ok(celld_applications::storage_wire::Value::AutoResponseTimestamp { millis })) => {
+            millis
+        }
+        Some(Ok(_)) => return loader_throw(scope, "invalid WebSocket timestamp reply"),
+        Some(Err(error)) => return loader_throw(scope, &error),
+        None => ws_registry()
+            .lock()
+            .unwrap()
+            .metadata
+            .get(&id)
+            .and_then(|meta| meta.auto_response_at),
+    };
     match stamped {
         Some(ms) => rv.set(v8::Number::new(scope, ms).into()),
         None => rv.set(v8::null(scope).into()),
+    }
+}
+
+#[cfg(test)]
+mod dial_tests {
+    use super::*;
+
+    #[test]
+    fn dials_use_the_http_twin_and_read_offered_subprotocols() {
+        assert_eq!(
+            dial_url("wss://peer.invalid/a?b=1"),
+            "https://peer.invalid/a?b=1"
+        );
+        assert_eq!(dial_url("ws://peer.invalid/"), "http://peer.invalid/");
+        assert_eq!(dial_url("https://peer.invalid/"), "https://peer.invalid/");
+        let headers = vec![
+            ("x-key".to_owned(), "v".to_owned()),
+            ("Sec-WebSocket-Protocol".to_owned(), "a, b".to_owned()),
+        ];
+        assert_eq!(upgrade_protocols(&headers), ["a", "b"]);
+        assert!(upgrade_protocols(&[]).is_empty());
+    }
+
+    /// An inbound frame reaches `__ws_next` whole however many credits carried it.
+    #[tokio::test]
+    async fn dialed_frames_reassemble_from_flagged_chunks() {
+        use celld_applications::invocation_wire::{DIAL_LAST, DIAL_MORE};
+        let chunks: Vec<std::result::Result<Vec<u8>, String>> = vec![
+            Ok([&[DIAL_LAST][..], &[WS_PULL_TAG_TEXT], b"hi"].concat()),
+            Ok([&[DIAL_MORE][..], &[WS_PULL_TAG_BINARY], b"ab"].concat()),
+            Ok([&[DIAL_LAST][..], b"cd"].concat()),
+        ];
+        let stream: DialStream = Arc::new(tokio::sync::Mutex::new(Box::pin(
+            futures_util::stream::iter(chunks),
+        )));
+        let mut frame = next_dial_frame(u64::MAX, stream.clone()).await;
+        assert_eq!((frame.remove(0), frame), (WS_PULL_TAG_TEXT, b"hi".to_vec()));
+        let mut frame = next_dial_frame(u64::MAX, stream.clone()).await;
+        assert_eq!(
+            (frame.remove(0), frame),
+            (WS_PULL_TAG_BINARY, b"abcd".to_vec())
+        );
+        // The end of the stream without a close frame is an abnormal closure.
+        assert_eq!(
+            next_dial_frame(u64::MAX, stream).await[0],
+            WS_PULL_TAG_CLOSE
+        );
     }
 }

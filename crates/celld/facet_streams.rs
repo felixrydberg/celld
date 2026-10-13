@@ -182,7 +182,7 @@ impl FacetStreams {
         match replication {
             Some(replication) => {
                 for stream in &doomed {
-                    replication.ltx().discard(stream, epoch);
+                    replication.ltx().delete_local(stream, epoch);
                 }
                 replication.ltx().delete_streams(&facet).await
             }

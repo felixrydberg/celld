@@ -2,8 +2,8 @@
 
 //! Isolate bootstrap: what a fresh context needs before user code runs.
 //!
-//! The prelude and the harness compile once per process and are cached, so a
-//! new isolate pays for execution but not for compilation. On top of those go
+//! The prelude and harness cache compiled bytecode per process, so a
+//! new isolate reuses bytecode while still executing each script. On top go
 //! the bindings — `env`, the routing table, the compatibility flags — which
 //! differ per worker and are therefore built every time.
 use super::*;
@@ -12,8 +12,8 @@ use super::*;
 /// Every cell wake pays a fresh isolate, and without this each one re-parses
 /// and re-compiles the same ~23k lines of prelude + harness — the single
 /// largest slice of cold-wake latency. The first isolate compiles
-/// eagerly and publishes the cache; every later isolate consumes it and only
-/// executes.
+/// eagerly and publishes the cache. A guest root keeps unused harness bodies
+/// lazy; consumers of that cache may compile them on first use.
 ///
 /// Keyed by script name alone. Each script compiles as a function whose
 /// parameter list is `op_names()`, and V8's cache check does not cover that
@@ -130,6 +130,40 @@ fn bootstrap_code_cache() -> &'static std::sync::Mutex<BootstrapCache> {
     CACHE.get_or_init(Default::default)
 }
 
+fn bootstrap_compile_options(
+    cache: Option<&str>,
+    guest: bool,
+) -> v8::script_compiler::CompileOptions {
+    use v8::script_compiler::CompileOptions;
+    match cache {
+        Some("harness.js") if guest => CompileOptions::NoCompileOptions,
+        Some(_) => CompileOptions::EagerCompile,
+        None => CompileOptions::NoCompileOptions,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn bootstrap_compile_policy() {
+    use v8::script_compiler::CompileOptions;
+    assert_eq!(
+        bootstrap_compile_options(Some("harness.js"), true),
+        CompileOptions::NoCompileOptions,
+    );
+    assert_eq!(
+        bootstrap_compile_options(Some("harness.js"), false),
+        CompileOptions::EagerCompile,
+    );
+    assert_eq!(
+        bootstrap_compile_options(Some("streams.js"), true),
+        CompileOptions::EagerCompile,
+    );
+    assert_eq!(
+        bootstrap_compile_options(None, true),
+        CompileOptions::NoCompileOptions,
+    );
+}
+
 #[cfg(celld_internal_tests)]
 fn run_bootstrap_script<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -189,16 +223,15 @@ pub(super) fn run_internal_script<'s>(
             );
             function
         }
-        // Eager for a cached bootstrap script: a lazily-compiled cache would
-        // push function-body compile cost back into every consumer's first
-        // request. A lazy script keeps V8's lazy compile: most of a builtin
-        // module is never called.
+        // Guest-root harness bodies compile on first use; other cached sources
+        // stay eager so their consumers avoid that cost on the first request.
         None => {
             let mut source = v8::script_compiler::Source::new(code, None);
-            let options = match cache {
-                Some(_) => CompileOptions::EagerCompile,
-                None => CompileOptions::NoCompileOptions,
-            };
+            #[cfg(unix)]
+            let guest = guest_storage::enabled(scope);
+            #[cfg(not(unix))]
+            let guest = false;
+            let options = bootstrap_compile_options(cache, guest);
             let function = v8::script_compiler::compile_function(
                 scope,
                 &mut source,
@@ -449,6 +482,7 @@ pub(super) fn inject_workflows(
     scope: &mut v8::PinScope,
     script_name: &str,
     workflow_bindings: &[WorkflowBinding],
+    keyed_namespaces: &[(String, String, String)],
 ) -> Result<()> {
     let cell = cell_state(scope)?;
     let map = v8::Object::new(scope);
@@ -469,6 +503,15 @@ pub(super) fn inject_workflows(
     // declares" is worth keeping true rather than nearly true.
     if !workflow_bindings.is_empty() {
         alias_workflow_class(scope, cell, script_name)?;
+        for binding in workflow_bindings {
+            let expected = crate::deploy::workflow_class(&binding.workflow);
+            if keyed_namespaces
+                .iter()
+                .any(|(alias, class, _)| alias == &binding.environment && class == &expected)
+            {
+                alias_workflow_class(scope, cell, &binding.workflow)?;
+            }
+        }
     }
     Ok(())
 }
@@ -479,6 +522,7 @@ pub(super) fn inject_workflows(
 pub(super) fn inject_containers(
     scope: &mut v8::PinScope,
     containers: &[crate::container::ContainerSpec],
+    aliases: &[(String, String)],
 ) -> Result<()> {
     let cell = cell_state(scope)?;
     let map = v8::Object::new(scope);
@@ -486,6 +530,12 @@ pub(super) fn inject_containers(
         let key =
             v8::String::new(scope, &spec.class_name).ok_or_else(|| anyhow!("container class"))?;
         let value = v8::Boolean::new(scope, true);
+        map.set(scope, key.into(), value.into());
+    }
+    // An application guest names the host-pinned Container binding of a class.
+    for (class, alias) in aliases {
+        let key = v8::String::new(scope, class).ok_or_else(|| anyhow!("container class"))?;
+        let value = v8::String::new(scope, alias).ok_or_else(|| anyhow!("container alias"))?;
         map.set(scope, key.into(), value.into());
     }
     let key = v8::String::new(scope, "containers").unwrap();
@@ -615,6 +665,22 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 bname, cname
             ));
         }
+        for (bname, cname, key) in &config.keyed_namespaces {
+            // A queue resource is its declared binding, below, under this key.
+            if cname == celld_logic::queue::RESERVED_CLASS {
+                continue;
+            }
+            // A D1 resource is the original database client over its own key.
+            let make = if cname == crate::deploy::D1_CLASS {
+                format!("__celld.__makeD1Database(\"database\", {key:?})")
+            } else if cname == celld_logic::kv::RESERVED_CLASS {
+                let name = celld_logic::kv::cell_name("namespace", 0);
+                format!("__celld.__makeKvNamespace(\"namespace\", {name:?}, {key:?})")
+            } else {
+                format!("__celld.__cell.makeNamespace({cname:?}, {key:?})")
+            };
+            lines.push_str(&format!("e[{bname:?}] = {make};\n"));
+        }
         for (name, bucket) in r2_bindings {
             lines.push_str(&format!(
                 "e[{:?}] = __celld.__makeR2Bucket({:?}, {:?});\n",
@@ -637,12 +703,21 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
             ));
         }
         for binding in queue_bindings {
+            // An application's queue resource is keyed; the original is not.
+            let key = config
+                .keyed_namespaces
+                .iter()
+                .find(|(alias, cname, _)| {
+                    *alias == binding.environment && cname == celld_logic::queue::RESERVED_CLASS
+                })
+                .map_or("undefined".to_owned(), |(_, _, key)| format!("{key:?}"));
             lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeQueue({:?}, {:?}, {});\n",
+                "e[{:?}] = __celld.__makeQueue({:?}, {:?}, {}, {});\n",
                 binding.environment,
                 binding.queue,
                 celld_logic::queue::cell_name(&binding.queue),
                 binding.delivery_delay,
+                key,
             ));
         }
         for (name, database) in d1_bindings {
@@ -652,10 +727,22 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
             ));
         }
         for binding in workflow_bindings {
-            lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeWorkflow({:?});\n",
-                binding.environment, binding.workflow
-            ));
+            if let Some((_, class, key)) =
+                config.keyed_namespaces.iter().find(|(alias, class, _)| {
+                    alias == &binding.environment
+                        && class == &crate::deploy::workflow_class(&binding.workflow)
+                })
+            {
+                lines.push_str(&format!(
+                    "e[{:?}] = __celld.__makeWorkflow({:?}, {:?}, {:?});\n",
+                    binding.environment, binding.workflow, class, key
+                ));
+            } else {
+                lines.push_str(&format!(
+                    "e[{:?}] = __celld.__makeWorkflow({:?});\n",
+                    binding.environment, binding.workflow
+                ));
+            }
         }
         for (binding, script, entrypoint) in services {
             let entrypoint = match entrypoint {
@@ -671,9 +758,16 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
             lines.push_str(&format!("e[{:?}] = {:?};\n", name, value));
         }
         if let Some(name) = asset_binding {
+            // A guest names the alias its host-brokered binding is bound to,
+            // like its R2 buckets; the script name selects a host resolver.
+            let script = if super::guest_storage::enabled(scope) {
+                name
+            } else {
+                script_name
+            };
             lines.push_str(&format!(
                 "e[{:?}] = __celld.__makeAssetsBinding({:?});\n",
-                name, script_name
+                name, script
             ));
         }
         // One `__makeLoader()` call for each binding. Each call builds its own
@@ -721,12 +815,15 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
 /// registered the class first.
 pub(super) fn inject_queue_config(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
     let queue = crate::queue_policy::consumer_config(config)?;
+    // See `WorkerConfig::with_host_verified_names`.
+    let verified = config.host_verified_names;
     let source = format!(
         "const q = {queue};\n\
          const c = __celld.__cell;\n\
          c.queueConsumers = q.consumers;\n\
          c.queueLeaseDurationMs = q.leaseDurationMs;\n\
-         c.queueLimits = q.limits;"
+         c.queueLimits = q.limits;\n\
+         c.hostVerifiedNames = {verified};"
     );
     run_internal_snippet(scope, &source).ok_or_else(|| anyhow!("queue config install failed"))?;
     Ok(())
@@ -736,8 +833,10 @@ pub(super) fn inject_queue_config(scope: &mut v8::PinScope, config: &WorkerConfi
 /// `__cell.entrypoints`, so a service binding with `entrypoint = "Name"` can
 /// resolve it, and every export deriving from `DurableObject` in
 /// `__cell.doExports`, so misrouting a DO class as a stateless entrypoint is
-/// reported as such (Workerd getExportedHandler()). Runs once per load; the
-/// check is a prototype walk, not a call into user code.
+/// reported as such (Workerd getExportedHandler()). Every class export that
+/// is not an entrypoint or a workflow also lands in `__cell.classes`, so a
+/// facet can start it. Runs once per load; the check is a prototype walk, not a
+/// call into user code.
 pub(super) fn register_entrypoints(
     scope: &mut v8::PinScope,
     ns: v8::Local<v8::Object>,
@@ -772,6 +871,10 @@ pub(super) fn register_entrypoints(
     let durable_base = cf
         .get(scope, key.into())
         .ok_or_else(|| anyhow!("missing DurableObject base"))?;
+    let key = v8::String::new(scope, "WorkflowEntrypoint").unwrap();
+    let workflow_base = cf
+        .get(scope, key.into())
+        .ok_or_else(|| anyhow!("missing WorkflowEntrypoint base"))?;
     let Some(names) = ns.get_own_property_names(scope, Default::default()) else {
         return Ok(());
     };
@@ -800,6 +903,14 @@ pub(super) fn register_entrypoints(
             entrypoints.set(scope, name, value);
         } else if call_extends(scope, extends, value, durable_base)? {
             do_exports.set(scope, name, yes.into());
+            classes.set(scope, name, value);
+        } else if !call_extends(scope, extends, value, workflow_base)? {
+            // Workerd processEntrypointClass(): a class that extends none of
+            // the runtime bases is a Durable Object class (missingSuperclass).
+            // A loaded Worker's facet class reaches `_instance` only through
+            // this registry, so without it a plain class fails with "no DO
+            // class". It stays out of `doExports`: that entry grants RPC
+            // without the js_rpc flag, which workerd gives only a subclass.
             classes.set(scope, name, value);
         }
     }
@@ -936,7 +1047,26 @@ pub(super) fn adopt_embedded_cell(
     )
     .context("facet storage open failed")?;
     let alarm = finish_cell_adoption(tc, cell, true)?;
-    let depth = parent.facet_path.len() + 1;
+    install_facet_config(
+        tc,
+        cell,
+        startup.id_sc,
+        startup.props_sc,
+        parent.facet_path.len() + 1,
+    )?;
+    Ok(alarm)
+}
+
+/// Install the facet's id, props and depth where its `ctx` constructor reads
+/// them. A credential-free guest has no native cell to adopt, so it needs only
+/// this half; the host owns the facet's database.
+pub(super) fn install_facet_config(
+    tc: &mut v8::PinScope,
+    cell: &str,
+    id_sc: Vec<u8>,
+    props_sc: Vec<u8>,
+    depth: usize,
+) -> Result<()> {
     // Decode in the loaded isolate and install the value directly. A JSON
     // source string flattened structured-clone types before the constructor
     // could read them, and it represented absent props as an explicit null.
@@ -948,14 +1078,13 @@ pub(super) fn adopt_embedded_cell(
         .ok_or_else(|| anyhow!("missing facet config registry"))?;
     let config = v8::Object::new(tc);
     let id_key = v8::String::new(tc, "id").unwrap();
-    let id_value =
-        storage_ops::deserialize_storage_value(tc, storage::StoredValue::V8(startup.id_sc))
-            .ok_or_else(|| anyhow!("decode facet identity"))?;
+    let id_value = storage_ops::deserialize_storage_value(tc, storage::StoredValue::V8(id_sc))
+        .ok_or_else(|| anyhow!("decode facet identity"))?;
     config.set(tc, id_key.into(), id_value);
-    let props = if startup.props_sc.is_empty() {
+    let props = if props_sc.is_empty() {
         v8::undefined(tc).into()
     } else {
-        storage_ops::deserialize_storage_value(tc, storage::StoredValue::V8(startup.props_sc))
+        storage_ops::deserialize_storage_value(tc, storage::StoredValue::V8(props_sc))
             .ok_or_else(|| anyhow!("decode facet props"))?
     };
     let props_key = v8::String::new(tc, "props").unwrap();
@@ -965,7 +1094,7 @@ pub(super) fn adopt_embedded_cell(
     config.set(tc, depth_key.into(), depth_value.into());
     let cell_key = v8::String::new(tc, cell).unwrap();
     configs.set(tc, cell_key.into(), config.into());
-    Ok(alarm)
+    Ok(())
 }
 
 fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Result<Option<i64>> {
@@ -992,8 +1121,7 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
     // The release loses nothing the cell needs back: `register_actor_name`
     // persists the id name before writing it here, so the take-in below reads
     // it back.
-    let source = format!("__celld.__cell.release({cell:?});");
-    run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("adopt failed"))?;
+    release_cell_instance(tc, cell)?;
     if !owned {
         // A facet of the root's own class lives in this isolate, and nothing
         // else releases it: its realm and connection would outlive the root.
@@ -1001,6 +1129,7 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
             let source = format!("__celld.__cell.release({facet:?});");
             run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("release failed"))?;
             storage::close(&facet);
+            crate::ws_registry::ws_close_facet(&facet, "the parent Durable Object was released");
         }
         storage::close(cell);
         return Ok(None);
@@ -1008,6 +1137,21 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
     let name = storage::get_actor_name(cell).context("read actor name")?;
     register_actor_name(tc, cell, name.as_deref())?;
     Ok(storage::get_alarm(cell))
+}
+
+/// The original isolate-side residency release, shared with credential-free
+/// guests. Opening/closing SQLite and ownership remain the native host's job.
+pub(super) fn release_cell_instance(tc: &mut v8::PinScope, cell: &str) -> Result<()> {
+    release_cell_instance_value(tc, cell)?;
+    Ok(())
+}
+
+pub(super) fn release_cell_instance_value<'s>(
+    tc: &mut v8::PinScope<'s, '_>,
+    cell: &str,
+) -> Result<v8::Local<'s, v8::Value>> {
+    let source = format!("return __celld.__cell.release({cell:?});");
+    run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("adopt failed"))
 }
 
 pub(super) fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Compat) -> Result<()> {

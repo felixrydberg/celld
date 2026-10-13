@@ -6,7 +6,7 @@ use crate::engine_api::{
     HttpResponse, HttpResponseWebSocket, RequestBody, RequestId, RuntimeFetch,
 };
 use crate::http_streams::RequestBodyGuard;
-use crate::js::{CallOrder, DoCallReq};
+use crate::js::{CallOrder, DoCallReq, GuestCall};
 use crate::telemetry::TraceContext;
 use anyhow::Context as _;
 use celld_logic::{Epoch, NodeId, RequestError, Route, WebSocketKind};
@@ -42,11 +42,11 @@ impl std::error::Error for RoutedRequestError {}
 /// handler's own response.
 ///
 /// Every in-handler channel arrives here holding a `GateReq`. Reuses the routed
-/// machinery: `request` pins the cell (no eviction mid-wait) and the core gate
-/// decides. `Ok` releases the held effect; `Err` breaks the call, as a routed
-/// gate failure would.
+/// machinery: `gate_request` pins the cell (no eviction mid-wait) and the core
+/// gate decides. `Ok` releases the held effect; `Err` breaks the call, as a
+/// routed gate failure would.
 pub async fn dispatch_gate(app: AppHandle, req: crate::js::GateReq) {
-    let routed = match app.request(req.scope.clone()).await {
+    let routed = match app.gate_request(req.scope.clone()).await {
         Ok(routed) => routed,
         Err(error) => {
             let _ = req.reply.send(Err(error));
@@ -108,6 +108,8 @@ pub struct CallContext {
     /// Reclaims a streamed body abandoned by an early error. A local target or
     /// the peer HTTP body takes ownership before this guard is disarmed.
     pub body_guard: RequestBodyGuard,
+    /// Set when an application guest, not a Worker isolate, makes the call.
+    pub guest: Option<GuestCall>,
 }
 
 /// Split a proxied call into its cross-attempt context, its consumable
@@ -136,6 +138,7 @@ pub fn split_do_call(
         reply,
         order,
         parent,
+        guest,
     } = call;
     (
         CallContext {
@@ -146,6 +149,7 @@ pub fn split_do_call(
             cancel,
             order,
             body_guard,
+            guest,
         },
         CallPayload {
             name,
@@ -181,6 +185,15 @@ pub enum CallAttempt {
     /// result. A missing runtime or a refused admission can end it before
     /// the handler starts.
     Local(anyhow::Result<HttpResponse>),
+    /// The route was local, and the call failed after the cell accepted a
+    /// WebSocket. The host registry holds the socket until the dispatcher
+    /// releases it, and only the binary can deliver the close event that the
+    /// release includes. A separate variant makes every dispatcher handle the
+    /// socket, which an error that carried the target could silently drop.
+    RefusedWebSocket {
+        error: anyhow::Error,
+        websocket: crate::js::WsTarget,
+    },
     /// The route left this node. The payload comes back unconsumed for the
     /// peer forwarder.
     Remote {
@@ -257,26 +270,40 @@ pub async fn dispatch_call_attempt(
                 body,
                 headers,
             } = payload;
-            CallAttempt::Local(
-                dispatch_local_fetch(
-                    app,
-                    request,
-                    call.scope.clone(),
-                    name,
-                    RuntimeFetch {
-                        url,
-                        method,
-                        body,
-                        headers,
-                        request_id: call.request_id,
-                        order: call.order.take(),
-                        parent: call.parent,
-                    },
-                    call.cancel.take(),
-                    &mut call.body_guard,
-                )
-                .await,
+            if let Some(guest) = call.guest.take() {
+                // The scoped guest event admits and gates itself. This lookup
+                // only found the object local again.
+                drop(app.activity(request, call.scope.clone()));
+                let wire = celld_applications::invocation_wire::HttpRequest {
+                    method,
+                    url,
+                    headers,
+                    body: body.bytes().to_vec(),
+                };
+                return CallAttempt::Local(
+                    serve_guest_object(app, &call.scope, name, guest, wire)
+                        .await
+                        .and_then(|reply| reply.context("object ownership moved during the call")),
+                );
+            }
+            dispatch_local_fetch(
+                app,
+                request,
+                call.scope.clone(),
+                name,
+                RuntimeFetch {
+                    url,
+                    method,
+                    body,
+                    headers,
+                    request_id: call.request_id,
+                    order: call.order.take(),
+                    parent: call.parent,
+                },
+                call.cancel.take(),
+                &mut call.body_guard,
             )
+            .await
         }
         Route::Remote {
             node,
@@ -293,7 +320,52 @@ pub async fn dispatch_call_attempt(
     }
 }
 
+/// Run a guest's object call in this node's VM for its application, never in
+/// the Worker runtime. `None` when this node no longer owns the object.
+pub async fn serve_guest_object(
+    app: &AppHandle,
+    scope: &str,
+    name: Option<String>,
+    guest: GuestCall,
+    request: celld_applications::invocation_wire::HttpRequest,
+) -> anyhow::Result<Option<HttpResponse>> {
+    #[cfg(target_os = "linux")]
+    if let Some(applications) = crate::application_vm::hosted() {
+        let (class, id) = scope.split_once(':').context("object scope has no id")?;
+        let object = celld_applications::invocation_wire::ObjectTarget {
+            class: class.into(),
+            id: id.into(),
+            name,
+        };
+        return applications
+            .call_object(app, &guest.application, object, guest.rpc, request)
+            .await;
+    }
+    let _ = (app, scope, name, guest, request);
+    anyhow::bail!("this node hosts no application VMs")
+}
+
+/// workerd's `TypeError` text for a WebSocket response to a request that did
+/// not ask to upgrade (`Response::send` in workerd's `api/http.c++`).
+pub const WEBSOCKET_WITHOUT_UPGRADE: &str =
+    "Worker tried to return a WebSocket in a response to a \
+     request which did not contain the header \"Upgrade: websocket\".";
+
+/// Whether a request asks for a WebSocket, by the rule workerd applies before
+/// a response can carry one: an `Upgrade` field equal to `websocket`.
+pub fn requests_websocket_upgrade(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket")
+    })
+}
+
 /// Execute an admitted local call and retain its activity through the response.
+///
+/// The response is the only owner of a socket that the cell accepted, and
+/// `WsTarget` is plain data. Every failure after the cell returns a socket
+/// therefore hands the target back in [`CallAttempt::RefusedWebSocket`]: a
+/// request that did not ask to upgrade, a failed core registration, and an
+/// output-gate verdict that discards the response.
 async fn dispatch_local_fetch(
     app: &AppHandle,
     request: u64,
@@ -302,9 +374,11 @@ async fn dispatch_local_fetch(
     mut fetch: RuntimeFetch,
     cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     body_guard: &mut RequestBodyGuard,
-) -> anyhow::Result<HttpResponse> {
+) -> CallAttempt {
     let local_request_id = local_dispatch_request_id(fetch.request_id);
     fetch.request_id = local_request_id;
+    let upgrade = requests_websocket_upgrade(&fetch.headers);
+    let mut accepted = None;
     let local = app.local_request(request, scope.clone(), local_request_id, "local");
     let completed = local
         .run(async {
@@ -315,20 +389,24 @@ async fn dispatch_local_fetch(
             // owns an unread tail through its waitUntil work.
             body_guard.disarm();
             if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
-                let kind = if crate::js::ws_hibernatable(target.id).unwrap_or(false) {
+                accepted = Some(target.clone());
+                // workerd applies this check in the object's own response
+                // path, so the caller's `stub.fetch()` rejects whichever
+                // node the caller runs on.
+                anyhow::ensure!(upgrade, "TypeError: {WEBSOCKET_WITHOUT_UPGRADE}");
+                let (cell, hibernatable) = crate::js::ws_core_registration(target);
+                let kind = if hibernatable {
                     WebSocketKind::Hibernatable
                 } else {
                     WebSocketKind::Regular
                 };
-                app.websocket_opened(target.scope.clone(), target.id, kind)
-                    .await?;
+                app.websocket_opened(cell, target.id, kind).await?;
             }
             Ok(response)
         })
         .await;
     let activity = completed.activity;
-    let result = completed.result.map_err(local_request_error);
-    match result {
+    match completed.result.map_err(local_request_error) {
         Ok(mut response) => {
             let body_active = response.stream.is_some();
             activity.set_phase("response_body", true, body_active);
@@ -337,9 +415,12 @@ async fn dispatch_local_fetch(
             } else {
                 drop(activity);
             }
-            Ok(response)
+            CallAttempt::Local(Ok(response))
         }
-        Err(error) => Err(error),
+        Err(error) => match accepted {
+            Some(websocket) => CallAttempt::RefusedWebSocket { error, websocket },
+            None => CallAttempt::Local(Err(error)),
+        },
     }
 }
 

@@ -253,10 +253,15 @@ pub fn check_supported_events(object: &Map<String, Value>) -> anyhow::Result<()>
     Ok(())
 }
 
+/// `shared_runtime` leaves the interpreter's files (the glue script, the
+/// standard library, the optional memory snapshot) and its Wasm modules out of
+/// the artifact: the application platform serves them from one read-only drive
+/// per Pyodide release, so a handler's image is only its code and SDK.
 pub fn build(
     root: &Path,
     entry: &str,
     compat: &PythonCompat,
+    shared_runtime: bool,
 ) -> anyhow::Result<(BundleOutput, Value)> {
     let entry_path = Path::new(entry);
     let main_module = entry_path
@@ -273,9 +278,15 @@ pub fn build(
     let directory = tempfile::tempdir().context("create Python build directory")?;
     let out = directory.path();
     for (name, bytes) in &runtime {
-        if name != "pyodide.asm.wasm" && name != "pyodide-lock.json" {
+        let shared = matches!(name.as_str(), "pyodide.asm.js" | "python_stdlib.zip");
+        if name != "pyodide.asm.wasm" && name != "pyodide-lock.json" && !(shared && shared_runtime) {
             std::fs::write(out.join(name), bytes)?;
         }
+    }
+    // Pyodide's memory snapshot is optional: none in a bundle that carries its
+    // own interpreter, which then starts it from scratch.
+    if !shared_runtime {
+        std::fs::write(out.join("pyodide-snapshot.bin"), [])?;
     }
     let sentinel = sentinel_bytes(&runtime["pyodide.mjs"])?;
     let lock: Value = serde_json::from_slice(&runtime["pyodide-lock.json"])?;
@@ -314,7 +325,7 @@ pub fn build(
     std::fs::write(out.join("worker.js"), WORKER_JS)?;
     std::fs::write(out.join("worker.py"), WORKER_PY)?;
     std::fs::write(out.join("files.bin"), pack(&files)?)?;
-    run_esbuild(out)?;
+    run_esbuild(out, shared_runtime)?;
     let bundle = std::fs::read(out.join("index.js")).context("read Python Worker bundle")?;
 
     let descriptor = json!({
@@ -324,13 +335,17 @@ pub fn build(
         "sdk": sdk,
         "main_module": main_module,
     });
-    let wasm = vec![
-        (
-            "pyodide.asm.wasm".to_string(),
-            runtime["pyodide.asm.wasm"].clone(),
-        ),
-        ("sentinel.wasm".to_string(), sentinel),
-    ];
+    let wasm = if shared_runtime {
+        Vec::new()
+    } else {
+        vec![
+            (
+                "pyodide.asm.wasm".to_string(),
+                runtime["pyodide.asm.wasm"].clone(),
+            ),
+            ("sentinel.wasm".to_string(), sentinel),
+        ]
+    };
     Ok((BundleOutput { bundle, wasm }, descriptor))
 }
 
@@ -491,7 +506,7 @@ fn pack(files: &BTreeMap<String, Vec<u8>>) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-fn sentinel_bytes(loader: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn sentinel_bytes(loader: &[u8]) -> anyhow::Result<Vec<u8>> {
     use base64::Engine;
     let loader = std::str::from_utf8(loader)?;
     let start = loader
@@ -525,7 +540,7 @@ fn runtime_directory() -> anyhow::Result<PathBuf> {
         .join(format!("pyodide-{PYODIDE_VERSION}")))
 }
 
-fn runtime_files() -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+pub(crate) fn runtime_files() -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
     let directory = runtime_directory()?;
     let verified = |bytes: &[u8], size: u64, sha256: &str| {
         bytes.len() as u64 == size && format!("{:x}", Sha256::digest(bytes)) == sha256
@@ -628,7 +643,7 @@ fn download_from(
     .map_err(|_| anyhow!("Python runtime download panicked"))?
 }
 
-fn run_esbuild(directory: &Path) -> anyhow::Result<()> {
+fn run_esbuild(directory: &Path, shared_runtime: bool) -> anyhow::Result<()> {
     let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
     let output = Command::new(&binary)
         .current_dir(directory)
@@ -653,6 +668,16 @@ fn run_esbuild(directory: &Path) -> anyhow::Result<()> {
         .arg("--external:node:*")
         .arg("--external:./pyodide.asm.wasm")
         .arg("--external:./sentinel.wasm")
+        .args(
+            shared_runtime
+                .then_some([
+                    "--external:./pyodide.asm.js",
+                    "--external:./python_stdlib.zip",
+                    "--external:./pyodide-snapshot.bin",
+                ])
+                .into_iter()
+                .flatten(),
+        )
         .arg("--log-level=warning")
         .output()
         .map_err(|error| {

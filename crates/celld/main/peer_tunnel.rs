@@ -45,15 +45,23 @@ pub(crate) const SCOPE_HEADER: &str = "x-cells-scope";
 pub(crate) const NAME_HEADER: &str = "x-cells-do-name";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-cells-request-id";
 pub(crate) const HANDOFF_HEADER: &str = "x-cells-capacity-handoff";
+pub(crate) const GUEST_HEADER: &str = "x-cells-guest";
 
 /// The inner headers node A owns. A overwrites them on the way in and B
 /// strips them on the way out, so an application header with a reserved name
 /// is dropped rather than obeyed.
-const CONTROL_HEADERS: [&str; 4] = [SCOPE_HEADER, NAME_HEADER, REQUEST_ID_HEADER, HANDOFF_HEADER];
+const CONTROL_HEADERS: [&str; 5] = [
+    SCOPE_HEADER,
+    NAME_HEADER,
+    REQUEST_ID_HEADER,
+    HANDOFF_HEADER,
+    GUEST_HEADER,
+];
 
 enum TunnelKind {
     Do,
     Rpc,
+    Guest,
 }
 
 /// The control fields of one tunneled call, carried as inner-request headers
@@ -121,6 +129,7 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
     {
         Some(b"do") => TunnelKind::Do,
         Some(b"rpc") => TunnelKind::Rpc,
+        Some(b"guest") => TunnelKind::Guest,
         _ => {
             return peer_response(response(StatusCode::BAD_REQUEST, "unknown tunnel kind"));
         }
@@ -134,6 +143,7 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
         match kind {
             TunnelKind::Do => serve_do(upgraded, app).await,
             TunnelKind::Rpc => serve_rpc(upgraded, app).await,
+            TunnelKind::Guest => serve_guest(upgraded, app).await,
         }
     });
     let mut reply = response(StatusCode::SWITCHING_PROTOCOLS, "");
@@ -247,10 +257,17 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                 ForwardedFetchOutcome::WebSocket { target, headers } => (target, headers),
             };
             let Some((accept, upgrade)) = client_upgrade else {
-                return Ok(peer_response(response(
-                    StatusCode::BAD_GATEWAY,
-                    "the cell accepted a WebSocket for a request that did not upgrade",
-                )));
+                // `dispatch_forwarded_fetch` refuses a request without
+                // `Upgrade: websocket`, so this branch sees only a request
+                // that names the upgrade but is not a valid handshake. The
+                // socket is registered with the core by now, and the refusal
+                // must release it.
+                let refusal = super::websocket::refuse_websocket_without_upgrade(
+                    &app,
+                    HttpResponseWebSocket::Cell(target),
+                )
+                .await;
+                return Ok(peer_response(refusal));
             };
             // The cell accepted: hand the inner stream to the same socket
             // task a local client gets, and answer with the real 101. The
@@ -600,6 +617,176 @@ async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
         .await;
 }
 
+/// One inner request, one guest object call: the application and RPC method
+/// ride a header, the request rides as ordinary HTTP with a buffered body.
+async fn serve_guest(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
+    let service = service_fn(move |mut inner: Request<Incoming>| {
+        let app = app.clone();
+        async move {
+            let header = |name: &str| {
+                inner
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            };
+            let Some(scope) =
+                header(SCOPE_HEADER).filter(|scope| celld_logic::cell::valid_cell_scope(scope))
+            else {
+                return Ok::<_, Infallible>(peer_response(malformed_scope()));
+            };
+            let Some(guest) = header(GUEST_HEADER)
+                .and_then(|guest| serde_json::from_str::<celld::js::GuestCall>(&guest).ok())
+            else {
+                return Ok(peer_response(response(
+                    StatusCode::BAD_REQUEST,
+                    "guest call header is missing or invalid",
+                )));
+            };
+            let name = header(NAME_HEADER);
+            // A tunneled upgrade is the client's own handshake: the owner
+            // answers it, and the inner connection becomes the socket the
+            // object's registry entry speaks, as for a local client.
+            let client_upgrade = if fastwebsockets::upgrade::is_upgrade_request(&inner) {
+                match fastwebsockets::upgrade::upgrade(&mut inner) {
+                    Ok(pair) => Some(pair),
+                    Err(error) => {
+                        return Ok(peer_response(response(
+                            StatusCode::BAD_REQUEST,
+                            format!("tunneled upgrade: {error}"),
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
+            let (parts, body) = inner.into_parts();
+            let body = match collect_limited_body(body, MAX_PEER_FORWARD_BODY_BYTES).await {
+                Ok(body) => body,
+                Err(error) => {
+                    return Ok(peer_response(body_read_error("tunnel guest call", error)));
+                }
+            };
+            let headers = parts
+                .headers
+                .iter()
+                .filter(|(name, _)| !CONTROL_HEADERS.contains(&name.as_str()))
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                })
+                .collect();
+            let request = celld_applications::invocation_wire::HttpRequest {
+                method: parts.method.to_string(),
+                url: parts.uri.to_string(),
+                headers,
+                body: body.to_vec(),
+            };
+            let Some((accept, upgrade)) = client_upgrade else {
+                return Ok(dispatch_forwarded_guest(app, scope, name, guest, request).await);
+            };
+            let reply = match serve_guest_upgrade(&app, &scope, name, guest, request).await {
+                Ok(reply) => reply,
+                Err(reply) => return Ok(*reply),
+            };
+            tokio::spawn(async move {
+                match upgrade.await {
+                    Ok(socket) => super::websocket::websocket_task(app, reply.0, socket).await,
+                    Err(error) => eprintln!("celld tunneled guest upgrade failed: {error}"),
+                }
+            });
+            let (accept_parts, _) = accept.into_parts();
+            let mut answer = Response::from_parts(
+                accept_parts,
+                BodyExt::boxed_unsync(http_body_util::Empty::new().map_err(|never| match never {})),
+            );
+            for (name, value) in &reply.1 {
+                let lowered = name.to_ascii_lowercase();
+                if lowered == "content-length"
+                    || lowered == "upgrade"
+                    || lowered == "connection"
+                    || lowered == "sec-websocket-accept"
+                {
+                    continue;
+                }
+                let (Ok(name), Ok(value)) = (
+                    hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                    hyper::header::HeaderValue::from_str(value),
+                ) else {
+                    continue;
+                };
+                answer.headers_mut().append(name, value);
+            }
+            Ok(peer_response(answer))
+        }
+    });
+    // A tunneled guest upgrade takes over this inner connection.
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(upgraded, service)
+        .with_upgrades()
+        .await;
+}
+
+/// The owner half of a peer's guest upgrade: the object's hibernatable socket
+/// and the headers its 101 carries. Anything else the object answers is not an
+/// upgrade, and the client's handshake is refused with a plain 502.
+async fn serve_guest_upgrade(
+    app: &AppHandle,
+    scope: &str,
+    name: Option<String>,
+    guest: celld::js::GuestCall,
+    request: celld_applications::invocation_wire::HttpRequest,
+) -> Result<(celld::js::WsTarget, Vec<(String, String)>), Box<HttpReply>> {
+    let refused = |message: &str| peer_response(response(StatusCode::BAD_GATEWAY, message.to_string()));
+    match serve_guest_object(app, scope, name, guest, request).await {
+        Ok(Some(mut reply)) => match reply.websocket.take() {
+            Some(HttpResponseWebSocket::Guest(socket)) if reply.status == 101 => {
+                Ok((socket.into_target(), reply.headers))
+            }
+            _ => Err(Box::new(refused("the object answered an upgrade without a WebSocket"))),
+        },
+        Ok(None) => {
+            let mut stale = response(StatusCode::CONFLICT, "stale route");
+            stale.headers_mut().insert(
+                hyper::header::HeaderName::from_static(STALE_ROUTE_HEADER),
+                hyper::header::HeaderValue::from_static(STALE_ROUTE_VALUE),
+            );
+            Err(Box::new(peer_response(stale)))
+        }
+        Err(error) => Err(Box::new(peer_response(response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("guest object call failed: {error:#}"),
+        )))),
+    }
+}
+
+/// Node A: one guest object call through the pooled guest tunnel. A peer that
+/// does not know the kind refuses the tunnel, so the call fails closed.
+pub(crate) async fn guest_fetch(
+    peer: &Peer<'_>,
+    control: &TunnelControl,
+    guest: &celld::js::GuestCall,
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: celld::js::RequestBody,
+) -> anyhow::Result<Response<PooledResponseBody>> {
+    let guest = hyper::header::HeaderValue::from_str(&serde_json::to_string(guest)?)?;
+    send_inner(
+        peer,
+        "guest",
+        |body| {
+            let mut inner = inner_request(control, &url, &method, &headers, body)?;
+            inner.headers_mut().insert(GUEST_HEADER, guest.clone());
+            Ok(inner)
+        },
+        body,
+    )
+    .await
+}
+
 /// Node A: one RPC through the pooled rpc tunnel.
 pub(crate) async fn rpc(
     peer: &Peer<'_>,
@@ -647,6 +834,11 @@ pub(crate) fn park_upgrade(upgrade: hyper::upgrade::OnUpgrade) -> u64 {
         .unwrap()
         .insert(id, upgrade);
     id
+}
+
+/// Drop a parked 101 that no client socket took.
+pub(crate) fn release_upgrade(parked: u64) {
+    drop(remove_upgrade(parked));
 }
 
 fn remove_upgrade(parked: u64) -> Option<hyper::upgrade::OnUpgrade> {

@@ -272,6 +272,11 @@ where
     }
 }
 
+/// Followers a node recruits: three copies of an acknowledged write. The
+/// ensemble keeps acknowledging on fewer (`NodeLogManager::healthy`), and
+/// `maintain` grows it back to this width when peers allow.
+const RECRUIT_FOLLOWERS: usize = 2;
+
 /// Concurrent per-cell upload lanes during node-log recovery. The
 /// sequential version cost ~47 s for 180 entries on the lab fleet; more
 /// than a few lanes multiplied across RACING recoverers (self-recovery
@@ -3892,17 +3897,22 @@ impl FleetShipper {
 
 /// The wait before epoch GC retries a cell whose last pass decided nothing
 /// or left an epoch inside the grace.
-const EPOCH_GC_RETRY_MS: u64 = 5 * 60 * 1000;
+pub(crate) const EPOCH_GC_RETRY_MS: u64 = 5 * 60 * 1000;
+
+/// The period of the node-log maintenance loop, which runs epoch GC.
+pub(crate) const LOG_MAINTENANCE_TICK_MS: u64 = 30 * 1000;
 
 /// The wait before epoch GC looks again at a cell whose last pass deleted
 /// everything it could.
 const EPOCH_GC_SETTLED_RETRY_MS: u64 = 60 * 60 * 1000;
 
 /// The most cells one maintenance pass examines for epoch GC. Each costs a
-/// few bucket listings, and the pass shares the 30 s tick with the lease
-/// and log maintenance, so a node holding thousands of cells spreads them
-/// over several ticks instead of stalling the others behind one pass.
-const EPOCH_GC_CELLS_PER_PASS: usize = 32;
+/// few bucket listings, and on a fleet node the pass shares the 30 s tick
+/// with the lease and log maintenance, so a node holding thousands of cells
+/// spreads them over several ticks instead of stalling the others behind
+/// one pass. A bucket node runs the pass alone on the tick, and the bound
+/// still keeps one tick from listing the bucket thousands of times.
+pub(crate) const EPOCH_GC_CELLS_PER_PASS: usize = 32;
 
 /// Everything node-log recovery needs from the node: the bucket, the signed
 /// peer client, address resolution, and the raw per-cell upload.
@@ -3937,7 +3947,8 @@ pub struct NodeLogManager {
     /// Process-local; a restart re-confirms once.
     gc_confirmed_empty: Mutex<std::collections::HashSet<String>>,
     /// When each resident (cell, epoch) pair is next due for an epoch-GC
-    /// attempt, in monotonic milliseconds. A
+    /// attempt, in monotonic milliseconds. A pair enters at the time a pass
+    /// first sees it, so it waits behind the overdue pairs. A
     /// pass that decides nothing (an idle cell whose opener is not listed
     /// yet, a paged cell still filling, an epoch inside the grace) waits
     /// [`EPOCH_GC_RETRY_MS`] instead of listing the bucket every tick.
@@ -4152,13 +4163,16 @@ impl DurabilityOwner {
             stack.node_log_tasks.roots.is_empty(),
             "node-log background tasks were already started"
         );
-        if stack.fleet {
-            spawn_maintenance(
-                stack.manager.clone(),
-                stack.node_log_tasks.stop.clone(),
-                &stack.node_log_tasks.roots,
-            );
-        }
+        // Every posture runs the maintenance loop, because epoch GC
+        // (denoland/celld#240) does not depend on the posture: every
+        // activation adds a whole-database image in either one. The loop
+        // runs the fleet phases only on a fleet node.
+        spawn_maintenance(
+            stack.manager.clone(),
+            stack.node_log_tasks.stop.clone(),
+            &stack.node_log_tasks.roots,
+            stack.fleet,
+        );
         if let Some(follower) = follower {
             assert!(
                 self.follower_tasks.store.is_none(),
@@ -5637,6 +5651,15 @@ impl NodeLogManager {
         }
     }
 
+    /// Followers in the installed ensemble, whether or not it is active.
+    fn ensemble_width(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |shipper| shipper.members.len())
+    }
+
     pub fn healthy(&self) -> bool {
         self.inner
             .lock()
@@ -5668,7 +5691,14 @@ impl NodeLogManager {
         if self.task_stop.is_stopped() {
             return Ok(());
         }
-        if self.healthy() {
+        // A healthy ensemble below the recruitment target still reads peers.
+        // Returning on `healthy` alone kept a one-follower ensemble at one
+        // forever, because one follower is healthy: a third node that was not
+        // live when the ensemble formed never joined, and the acknowledged
+        // tail had one witness on a three-node fleet (denoland/celld#245).
+        // The width check below returns before any change when no further
+        // peer is eligible, so the cost is one peer listing per tick.
+        if self.healthy() && self.ensemble_width() >= RECRUIT_FOLLOWERS {
             return Ok(());
         }
         // Self-suspicion parks recruitment: opening epochs into our own
@@ -5695,10 +5725,9 @@ impl NodeLogManager {
             // latency rule can judge it again and the swap rate cap is what
             // bounds flapping.
             .filter(|peer| !self.health.lock().unwrap().quarantined(&peer.node, mono))
-            // Recruit up to two followers — three copies — while the ensemble
-            // may serve on one. Replication factor and the in-sync floor are
-            // separate numbers.
-            .take(2)
+            // Replication factor and the in-sync floor are separate numbers:
+            // recruit to the target, serve on one.
+            .take(RECRUIT_FOLLOWERS)
             .map(|peer| Member {
                 node: peer.node,
                 addr: peer.addr,
@@ -6185,15 +6214,20 @@ impl NodeLogManager {
         };
         let resident: BTreeSet<(String, u64)> = self.ltx.resident_epochs().into_iter().collect();
         let now = mono_ms();
-        // The longest-waiting cells go first, so a set of cells that never
-        // decide anything cannot hold the pass's budget ahead of the rest.
+        // The cells that have been due longest go first. A cell this pass
+        // sees for the first time is due from now, so it queues behind every
+        // overdue cell and ages like them. Due time 0 for an unseen cell put
+        // a node that gains more than `EPOCH_GC_CELLS_PER_PASS` cells per
+        // tick ahead of every overdue cell for as long as the arrivals lasted.
+        // Stamping `now` without recording it would restart the
+        // wait of an unexamined cell on every pass, so the stamp is kept.
         let due: Vec<(String, u64)> = {
             let mut schedule = self.epoch_gc_due.lock().unwrap();
             schedule.retain(|key, _| resident.contains(key));
             let mut due: Vec<(u64, (String, u64))> = resident
                 .into_iter()
                 .filter(|(cell, _)| !crate::engine_api::is_facet_cell(cell))
-                .map(|key| (schedule.get(&key).copied().unwrap_or(0), key))
+                .map(|key| (*schedule.entry(key.clone()).or_insert(now), key))
                 .filter(|(at, _)| *at <= now)
                 .collect();
             due.sort();
@@ -6469,16 +6503,29 @@ impl NodeLogManager {
 /// gray-follower detection cannot wait thirty seconds when one slow fsync
 /// tail is every ack's tail, so verdicts poll at a sub-second cadence and
 /// an eviction repairs the ensemble immediately.
+///
+/// Without `fleet`, the tick runs only epoch GC, and no eviction watch
+/// starts. A bucket node installs no registration, so it has no ensemble
+/// to recruit or repair, no bundles to collect, and no posture to watch.
+/// Its acks wait for per-cell uploads, so its restore chain base already
+/// holds every acknowledged row when epoch GC deletes below it. A fleet
+/// predecessor's follower-only rows reach the bucket before this node can
+/// hold the cell: the boot runs `recover_self` before it builds the owner
+/// and starts this loop, and a takeover runs `ensure_recovered` before the
+/// restore. The actor reaches that interlock through the manager in every
+/// posture, so neither step depends on the fleet phases here.
 fn spawn_maintenance(
     manager: Arc<NodeLogManager>,
     stop: crate::ltx_repl::StopToken,
     roots: &crate::ltx_repl::TaskGroup,
+    fleet: bool,
 ) {
     let maintenance_manager = Arc::downgrade(&manager);
     let watcher = Arc::downgrade(&manager);
     let maintenance_stop = stop.clone();
     roots.spawn_owned("node_log_maintenance", async move {
-        let mut tick = crate::asyncrt::interval(std::time::Duration::from_secs(30));
+        let mut tick =
+            crate::asyncrt::interval(std::time::Duration::from_millis(LOG_MAINTENANCE_TICK_MS));
         tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
         loop {
             crate::asyncrt::select_biased! {
@@ -6498,12 +6545,14 @@ fn spawn_maintenance(
             // archaeology session. The pass still runs to completion —
             // this observes, it does not cancel: an aborted maintenance
             // phase could orphan a half-installed ensemble.
-            for (phase, work) in [
-                ("maintain", manager.maintain().boxed()),
-                ("dead-leader sweep", manager.sweep_dead_leaders().boxed()),
-                ("bundle GC", manager.gc_bundles().boxed()),
-                ("epoch GC", manager.gc_superseded_epochs().boxed()),
-            ] {
+            let mut phases = Vec::with_capacity(4);
+            if fleet {
+                phases.push(("maintain", manager.maintain().boxed()));
+                phases.push(("dead-leader sweep", manager.sweep_dead_leaders().boxed()));
+                phases.push(("bundle GC", manager.gc_bundles().boxed()));
+            }
+            phases.push(("epoch GC", manager.gc_superseded_epochs().boxed()));
+            for (phase, work) in phases {
                 let started = mono_ms();
                 let mut work = work;
                 loop {
@@ -6528,6 +6577,9 @@ fn spawn_maintenance(
             }
         }
     });
+    if !fleet {
+        return;
+    }
     roots.spawn_owned("node_log_posture_watch", async move {
         let mut tick = crate::asyncrt::interval(std::time::Duration::from_millis(250));
         tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);

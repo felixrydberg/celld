@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 
+pub(crate) mod guest_activity;
+#[cfg(unix)]
+pub(crate) mod guest_storage;
 pub(crate) mod input_gate_lifecycle;
 use input_gate_lifecycle::{CrossEntryGateClaim, CrossEntryGateClaims};
 
@@ -194,7 +197,20 @@ pub struct DoCallReq {
     /// The dispatching handler's trace context, read from CPED at the
     /// call site, so the cell's span joins the caller's trace.
     pub parent: Option<crate::telemetry::TraceContext>,
+    /// Set when an application guest, not a Worker isolate, makes the call.
+    pub guest: Option<GuestCall>,
 }
+
+/// A guest's object call, forwarded through the original call path so the
+/// owner runs it in its own VM for this application. The cell scope, name and
+/// request ride the ordinary `DoCallReq` fields.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GuestCall {
+    pub application: celld_applications::ApplicationId,
+    /// An RPC method; the request body is then its arguments.
+    pub rpc: Option<String>,
+}
+
 static DO_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<DoCallReq>> = OnceLock::new();
 
 /// Delivery order, per caller and per cell.
@@ -565,10 +581,22 @@ fn timer_cancels() -> &'static std::sync::Mutex<HashMap<u64, tokio::sync::onesho
     TIMER_CANCELS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Only this original rejection branch consumes a guest alarm's retry limit.
+#[derive(Debug)]
+pub(crate) struct GuestAlarmRejection;
+impl std::fmt::Display for GuestAlarmRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("alarm promise rejected")
+    }
+}
+impl std::error::Error for GuestAlarmRejection {}
+
 /// Which alarm a dispatch runs, and who owns its bookkeeping.
 pub enum AlarmDispatch {
     /// Claim whatever is due now, and record the outcome.
     Due,
+    /// The trusted host owns the native claim and its final bookkeeping.
+    Guest { retry: i64 },
     #[cfg(celld_internal_tests)]
     Armed,
     #[cfg(celld_internal_tests)]
@@ -607,12 +635,17 @@ pub enum CellJob {
     WsOpen {
         scope: String,
         ws_id: u64,
+        /// As on `WsMessage`, for a socket that a facet dialed.
+        facet_opening: Option<u64>,
         protocol: String,
         reply: tokio::sync::oneshot::Sender<Result<Option<u64>>>,
     },
     WsMessage {
         scope: String,
         ws_id: u64,
+        /// The opening of the facet that accepted the socket, for an event of
+        /// a facet's socket. See `facet_socket_refusal`.
+        facet_opening: Option<u64>,
         data: WsIn,
         /// Released after the first turn, so the socket can deliver the next
         /// message in order without waiting for this handler's async work.
@@ -622,6 +655,8 @@ pub enum CellJob {
     WsClosed {
         scope: String,
         ws_id: u64,
+        /// As on `WsMessage`.
+        facet_opening: Option<u64>,
         code: u16,
         reason: String,
         was_clean: bool,
@@ -930,8 +965,20 @@ fn facet_egress_gate(
     EgressGate::Facet(Box::new(gate), root.stream, root.epoch)
 }
 
+// A failure the host loop would answer to the next proofs on this thread
+// (tests only: the real channel is process-wide).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FACET_PROVE_FAILURE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Prove a facet's stream through the host loop, which owns the replicator.
 async fn prove_facet(stream: String, epoch: u64) -> std::result::Result<(), GateRefusal> {
+    #[cfg(test)]
+    if let Some(error) = FACET_PROVE_FAILURE.with(|failure| failure.borrow().clone()) {
+        return Err(GateRefusal::Unpersisted(error));
+    }
     // No host loop means no replicator, so nothing can prove the write and
     // nothing can lose it to a later proof either.
     let Some(sender) = FACET_TX.get() else {
@@ -1064,6 +1111,7 @@ fn allocate_io_context_id() -> u64 {
 #[derive(Default)]
 struct CellGate {
     gate: celld_logic::gate::InputGate,
+    guest_residency: Option<Arc<std::sync::atomic::AtomicBool>>,
     holder: Option<u64>,
     /// A reaction can belong to an event other than the turn owner. The claim
     /// keeps that originating event and its resources active until the block
@@ -1233,6 +1281,126 @@ pub fn cell_gate_wait(cell: &str) -> Option<tokio::sync::oneshot::Receiver<Resul
     Some(waiter)
 }
 
+/// Host-owned transaction hold for one guest event. Reuses the process-wide
+/// gate and waiter queue that original JavaScript deliveries already consult.
+/// The guest never chooses the event id, cell scope or ownership context.
+pub(crate) struct GuestInputGate {
+    context: Arc<IoContext>,
+    cell: String,
+    residency: Arc<std::sync::atomic::AtomicBool>,
+    event: celld_logic::gate::EventId,
+    held: bool,
+}
+
+pub(crate) type InputGateWait = tokio::sync::oneshot::Receiver<Result<(), String>>;
+
+impl GuestInputGate {
+    pub(crate) fn event(&self) -> celld_logic::gate::EventId {
+        self.event
+    }
+
+    pub(crate) fn is_current_holder(cell: &str, residency: &Arc<AtomicBool>, event: u64) -> bool {
+        cell_gates().lock().unwrap().get(cell).is_some_and(|gate| {
+            gate.gate.is_held_by(event)
+                && gate
+                    .guest_residency
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, residency))
+        })
+    }
+
+    pub(crate) fn new(cell: String, residency: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            context: IoContext::new(),
+            cell,
+            residency,
+            event: NEXT_GATE_EVENT.fetch_add(1, Ordering::Relaxed),
+            held: false,
+        }
+    }
+
+    /// Called inside the original native turn, atomically with the operation
+    /// it admits. Nested storage transactions retain the same outer hold.
+    pub(crate) fn enter(&mut self, hold: bool) -> Result<Option<InputGateWait>> {
+        if self.held {
+            return Ok(None);
+        }
+        if !hold {
+            return Ok(cell_gate_wait(&self.cell));
+        }
+        match acquire_cell_gate(
+            &self.context,
+            &self.cell,
+            self.event,
+            None,
+            &mut None,
+            Some(self.residency.clone()),
+        ) {
+            CellGateAcquisition::Acquired => {
+                self.held = true;
+                Ok(None)
+            }
+            CellGateAcquisition::Waiting { gate, .. } => Ok(Some(gate)),
+            CellGateAcquisition::Retired => anyhow::bail!(RETIRED_INPUT_GATE),
+        }
+    }
+
+    pub(crate) fn release(&mut self) {
+        self.release_with(Ok(()));
+    }
+
+    pub(crate) fn release_with(&mut self, outcome: Result<(), String>) {
+        if self.held && self.context.release_input_gate(&self.cell, self.event) {
+            self.held = false;
+            release_cell_gate(&self.cell, self.event, outcome);
+        }
+    }
+}
+
+impl Drop for GuestInputGate {
+    fn drop(&mut self) {
+        // A normal finish releases only after native rollback/commit. An
+        // abandoned holder refuses its existing waiters as original JS does;
+        // the owning driver must quarantine any failed native settlement.
+        let _ = abandon_context_input_gates(&self.context);
+    }
+}
+
+/// Called by the native connection destructor, including same-epoch reopen
+/// and whole-Cells retirement. Only the matching guest incarnation is removed.
+pub(crate) fn retire_guest_input_gate(cell: &str, residency: &Arc<std::sync::atomic::AtomicBool>) {
+    let retired = {
+        let mut gates = cell_gates().lock().unwrap();
+        if gates.get(cell).is_some_and(|gate| {
+            gate.guest_residency
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, residency))
+        }) {
+            gates.remove(cell)
+        } else {
+            None
+        }
+    };
+    if let Some(mut retired) = retired {
+        drop(retired.clear_holder());
+        wake_gate_waiters(
+            cell,
+            Err("guest input gate storage residency changed".into()),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn live_input_gate_waiters(cell: &str) -> usize {
+    gate_waiters()
+        .lock()
+        .unwrap()
+        .get(cell)
+        .map_or(0, |waiters| {
+            waiters.iter().filter(|waiter| !waiter.is_closed()).count()
+        })
+}
+
 enum CellGateAcquisition {
     Acquired,
     Waiting {
@@ -1256,6 +1424,7 @@ fn acquire_cell_gate(
     event: celld_logic::gate::EventId,
     owner: Option<u64>,
     origin: &mut Option<CrossEntryGateClaim>,
+    guest_residency: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> CellGateAcquisition {
     let mut claims = context.input_gates.lock().unwrap();
     if claims.retired {
@@ -1267,6 +1436,10 @@ fn acquire_cell_gate(
         .or_default()
         .take(event, owner, origin)
     {
+        gates
+            .get_mut(cell)
+            .expect("acquired cell gate")
+            .guest_residency = guest_residency;
         let previous = claims.held.insert(event, cell.to_string());
         assert!(previous.is_none(), "an input-gate event id was reused");
         return CellGateAcquisition::Acquired;
@@ -1879,6 +2052,10 @@ pub struct WorkerConfig {
     origin: WorkerOrigin,
     do_classes: Vec<String>,
     bindings: Vec<(String, String)>,
+    /// Namespaces keyed by the host rather than by script: (environment name,
+    /// class, namespace key). An application guest's ids must authenticate
+    /// under the key of the resource it is bound to.
+    keyed_namespaces: Vec<(String, String, String)>,
     /// `r2_buckets`: (environment name, bucket name). The bucket name is
     /// the key space the binding owns inside the fleet bucket; see [[r2]].
     r2_bindings: Vec<(String, String)>,
@@ -1891,6 +2068,8 @@ pub struct WorkerConfig {
     kv_bindings: Vec<(String, String)>,
     queue_bindings: Vec<QueueBinding>,
     pub(crate) queue_consumers: Vec<QueueConsumerRegistration>,
+    /// Actor names reach this Worker's cells already verified by the host.
+    host_verified_names: bool,
     /// This script declared a consumer in its own manifest. The deployment-
     /// wide catalog later replaces `queue_consumers` in every isolate, so the
     /// catalog cannot answer whether this particular default export can omit
@@ -1927,6 +2106,9 @@ pub struct WorkerConfig {
     /// `containers` from the deployment: the classes whose `ctx.container`
     /// exists. Empty for a loaded worker.
     pub containers: Vec<crate::container::ContainerSpec>,
+    /// An application guest's `(class, binding alias)` pairs. The spec stays
+    /// with the host; the guest sees only that the class has a container.
+    pub container_aliases: Vec<(String, String)>,
     /// The application generation this configuration belongs to. Every
     /// isolate built from it carries the value as a slot, so its host calls
     /// resolve against the deployment graph it was built with.
@@ -2007,6 +2189,14 @@ fn tail_log_limit_bytes_for_test() -> usize {
 }
 
 impl WorkerConfig {
+    pub(crate) fn with_keyed_namespaces(
+        mut self,
+        namespaces: Vec<(String, String, String)>,
+    ) -> Self {
+        self.keyed_namespaces = namespaces;
+        self
+    }
+
     pub fn new(options: WorkerConfigOptions) -> Self {
         let WorkerConfigOptions {
             src,
@@ -2043,11 +2233,13 @@ impl WorkerConfig {
             origin: WorkerOrigin::Deployment,
             do_classes,
             bindings,
+            keyed_namespaces: Vec::new(),
             r2_bindings,
             d1_bindings,
             kv_bindings,
             queue_bindings,
             queue_consumers,
+            host_verified_names: false,
             declares_queue_consumer,
             workflow_bindings,
             vars,
@@ -2063,6 +2255,7 @@ impl WorkerConfig {
             tail_reporting: false,
             crons: Vec::new(),
             containers: Vec::new(),
+            container_aliases: Vec::new(),
             generation: 0,
             main_imports,
             module_imports,
@@ -2071,6 +2264,11 @@ impl WorkerConfig {
 
     pub fn with_containers(mut self, containers: Vec<crate::container::ContainerSpec>) -> Self {
         self.containers = containers;
+        self
+    }
+
+    pub(crate) fn with_container_aliases(mut self, aliases: Vec<(String, String)>) -> Self {
+        self.container_aliases = aliases;
         self
     }
 
@@ -2087,6 +2285,15 @@ impl WorkerConfig {
 
     pub fn with_queue_consumers(mut self, consumers: Vec<QueueConsumerRegistration>) -> Self {
         self.queue_consumers = consumers;
+        self
+    }
+
+    /// The trusted application pool: its host derived each cell's scope from the
+    /// bound resource and names the cell itself, and the pool holds no namespace
+    /// keys to derive that scope again. A script name cannot prove this, so only
+    /// this construction path sets it.
+    pub(crate) fn with_host_verified_names(mut self) -> Self {
+        self.host_verified_names = true;
         self
     }
 
@@ -2437,10 +2644,14 @@ struct ActorRuntimeState {
     /// Weak references record every continuation context without extending
     /// an event's lifetime merely to flush its output.
     ws_capture_touched: Mutex<Vec<Weak<IoContext>>>,
+    #[cfg(unix)]
+    guest_storage_enabled: AtomicBool,
     egress: EgressPolicy,
     resource_limits: Option<ResourceLimits>,
     tail_reporting: bool,
     script_name: String,
+    #[cfg(target_os = "linux")]
+    application_storage: bool,
     event_hooks: OnceLock<EventHooks>,
     /// See [`internals`].
     internals: OnceLock<v8::Global<v8::Object>>,
@@ -3075,7 +3286,7 @@ fn send_answer_after_arm_gates<T: Send + 'static>(
         .wake_entry()
         .drop_next_gated_reply_task
         .swap(false, Ordering::AcqRel);
-    asyncrt::spawn(async move {
+    asyncrt::spawn(guest_activity::track(async move {
         #[cfg(celld_internal_tests)]
         if drop_task {
             return;
@@ -3157,7 +3368,7 @@ fn send_answer_after_arm_gates<T: Send + 'static>(
             }
         };
         let _ = completed.send(completion);
-    })
+    }))
     .detach();
     Some(GatedReplyRx {
         completion,
@@ -3283,6 +3494,9 @@ pub struct InFlight {
     /// request stays in flight until it settles, as the single-request loop
     /// keeps driving it.
     background: Option<v8::Global<v8::Promise>>,
+    /// Guest lifecycle cleanup must join promises even when they currently
+    /// await no native operation. A deadline/reaping path bounds non-cooperation.
+    cleanup: Option<Vec<v8::Global<v8::Promise>>>,
     /// A successfully completed Durable Object event keeps every referenced
     /// native operation alive. Workerd does not require `waitUntil` for this
     /// I/O, so dropping these operations loses detached timers and subrequests.
@@ -3327,13 +3541,50 @@ impl InFlight {
         tc: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
     ) {
+        #[cfg(unix)]
+        // HTTP decoding runs user getters. Lifecycle acknowledgements have
+        // no response payload and may settle under cleanup-only admission.
+        if matches!(self.reply.as_ref(), Some(Answer::Fetch(_))) && self.context.has_guest_storage()
+        {
+            let admitted = (|| {
+                let owner = self
+                    .context
+                    .continuation_id()
+                    .context("guest response has no event owner")?;
+                anyhow::ensure!(
+                    Arc::ptr_eq(&current_context(), &self.context)
+                        && reaction_continuation_id(tc) == Some(owner)
+                        && operation_continuation_id(tc) == Some(owner),
+                    "guest response requires its owning event and operation driver"
+                );
+                self.context
+                    .guest_storage
+                    .get()
+                    .context("guest response has no storage channel")?
+                    .require_response_turn(
+                        self.scope
+                            .as_deref()
+                            .context("guest response has no cell")?,
+                        owner,
+                    )
+            })();
+            if let Err(error) = admitted {
+                let _ = end_event_context(tc);
+                self.context.seal_wait_until();
+                self.fail_in_turn(error);
+                return;
+            }
+        }
         let Some(reply) = self.reply.take() else {
             return;
         };
         // A cell whose SQL failed fatally cannot answer whatever the handler
         // returned: the storage the handler read may not be what the cell
         // has.
-        if let Some(error) = self.scope.as_deref().and_then(storage::sql_critical_error) {
+        if let Some(error) = self
+            .local_storage_scope()
+            .and_then(storage::sql_critical_error)
+        {
             let _ = end_event_context(tc);
             self.context.seal_wait_until();
             if self.trace.is_some_and(|trace| trace.sampled) {
@@ -3446,6 +3697,7 @@ impl InFlight {
                 let alarm = self
                     .scope
                     .as_deref()
+                    .filter(|_| !self.context.has_guest_storage())
                     .map(|cell| observe_alarm(cell, storage::get_alarm(cell)))
                     .unwrap_or_else(|| celld_logic::wake::AlarmSnapshot::without_wake(None));
                 send_and_end(
@@ -3472,9 +3724,19 @@ impl InFlight {
     /// baseline. One sample serves both, so they cannot disagree about what
     /// the cell holds.
     fn gate_positions(&self) -> Result<(Option<u64>, Option<u64>)> {
-        match self.scope.as_deref() {
+        match self.local_storage_scope() {
             Some(scope) => gate_positions(scope, self.writes_before),
             None => Ok((None, None)),
+        }
+    }
+
+    /// Guest replies carry no trusted SQLite positions. The host broker
+    /// samples and proves the host connection before publishing their output.
+    fn local_storage_scope(&self) -> Option<&str> {
+        if self.context.has_guest_storage() {
+            None
+        } else {
+            self.scope.as_deref()
         }
     }
 
@@ -3665,6 +3927,7 @@ impl InFlight {
         self.reply.is_none()
             && self.gated_reply.is_none()
             && self.background.is_none()
+            && self.cleanup.is_none()
             // A block that holds the gate is still this event's work:
             // retiring would close the sockets its callback may still read.
             && !self.holds_gate()
@@ -3737,6 +4000,7 @@ impl InFlight {
     /// awaited, and the gate stayed shut for every later event (#733).
     pub(crate) fn keeps_native_ops(&self) -> bool {
         self.reply.is_some()
+            || self.cleanup.is_some()
             || self.completed_cell_event
             || !self.io_context_ops.is_empty()
             || self.keeps_native_ops_after_disconnect()
@@ -3764,6 +4028,15 @@ impl InFlight {
     /// Whether this event holds a cell's input gate now, or is queued to
     /// take one.
     fn engages_gate(&self) -> bool {
+        #[cfg(unix)]
+        if self
+            .context
+            .guest_storage
+            .get()
+            .is_some_and(|channel| channel.holds_critical_section())
+        {
+            return true;
+        }
         gate_engagement(self.scope.as_deref(), &self.context) != GateEngagement::None
     }
 
@@ -3772,6 +4045,15 @@ impl InFlight {
     /// queue count from a future that was never adopted must not keep the
     /// event from retiring.
     fn holds_gate(&self) -> bool {
+        #[cfg(unix)]
+        if self
+            .context
+            .guest_storage
+            .get()
+            .is_some_and(|channel| channel.holds_critical_section())
+        {
+            return true;
+        }
         gate_engagement(self.scope.as_deref(), &self.context) == GateEngagement::Holds
     }
 
@@ -4141,10 +4423,67 @@ pub(crate) fn current_trace_context(
 /// An isolate's heap as V8 accounts for it, for `/state`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HeapBytes {
+    /// Bytes V8 currently uses inside the heap.
+    pub used: u64,
     /// Physical memory committed to the heap.
     pub physical: u64,
     /// External memory the isolate tracks: array buffer stores and the like.
     pub external: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn guest_available_from_meminfo(meminfo: &str) -> Option<u64> {
+    if meminfo.len() > 16 * 1024 {
+        return None;
+    }
+    let line = meminfo
+        .lines()
+        .find(|line| line.starts_with("MemAvailable:"))?;
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "MemAvailable:" {
+        return None;
+    }
+    let kib = fields.next()?.parse::<u64>().ok()?;
+    if fields.next()? != "kB" || fields.next().is_some() {
+        return None;
+    }
+    kib.checked_mul(1024)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // Bounded kernel telemetry, never application data.
+fn guest_available_memory() -> Option<u64> {
+    let file = std::fs::File::open("/proc/meminfo").ok()?;
+    let mut reader = std::io::Read::take(file, 16 * 1024 + 1);
+    let mut meminfo = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut meminfo).ok()?;
+    guest_available_from_meminfo(&meminfo)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn guest_available_memory() -> Option<u64> {
+    None
+}
+
+#[cfg(test)]
+#[test]
+fn guest_available_memory_is_bounded_and_checks_units() {
+    assert_eq!(
+        guest_available_from_meminfo("MemTotal: 9 kB\nMemAvailable: 7 kB\n"),
+        Some(7168)
+    );
+    for invalid in [
+        "MemFree: 7 kB",
+        "MemAvailable: 7 B",
+        "MemAvailable: 7 kB extra",
+        "MemAvailable: 18446744073709551615 kB",
+    ] {
+        assert_eq!(guest_available_from_meminfo(invalid), None);
+    }
+    assert_eq!(
+        guest_available_from_meminfo(&format!("MemAvailable: 7 kB\n{}", " ".repeat(16 * 1024))),
+        None
+    );
 }
 
 impl Worker {
@@ -4156,9 +4495,99 @@ impl Worker {
         let (mut locker, _cells) = inner.lock();
         let statistics = locker.get_heap_statistics();
         Some(HeapBytes {
+            used: statistics.used_heap_size() as u64,
             physical: statistics.total_physical_size() as u64,
             external: statistics.external_memory() as u64,
         })
+    }
+
+    /// Guest diagnostics run between turns. Child permits are tried, never
+    /// awaited, and overlapping heap, allocator, and RSS counters stay separate.
+    pub(crate) fn memory_sample(&self) -> celld_applications::invocation_wire::GuestMemorySample {
+        use celld_applications::invocation_wire::{
+            AllocatorMemory, GuestMemorySample, HeapMemory, LibcMemory,
+        };
+        let heap = |bytes: HeapBytes| HeapMemory {
+            used_bytes: bytes.used,
+            physical_bytes: bytes.physical,
+            external_bytes: bytes.external,
+        };
+        let root = self.heap_bytes();
+        let mut sample = GuestMemorySample {
+            rss_bytes: crate::memory::resident_bytes(),
+            available_bytes: guest_available_memory(),
+            root: root.map(heap).unwrap_or_default(),
+            total: root.map(heap).unwrap_or_default(),
+            isolates: u32::from(root.is_some()),
+            busy_isolates: 0,
+            loading_isolates: 0,
+            complete: root.is_some(),
+            jemalloc: crate::memory::allocator_stats().map(|stats| AllocatorMemory {
+                allocated_bytes: stats.allocated_bytes,
+                active_bytes: stats.active_bytes,
+                resident_bytes: stats.resident_bytes,
+                mapped_bytes: stats.mapped_bytes,
+                retained_bytes: stats.retained_bytes,
+            }),
+            libc_malloc: crate::memory::libc_malloc_stats().map(|stats| LibcMemory {
+                in_use_bytes: stats.in_use_bytes,
+                free_bytes: stats.free_bytes,
+                mmap_bytes: stats.mmap_bytes,
+                arena_bytes: stats.arena_bytes,
+            }),
+        };
+        let mut slots = Vec::new();
+        match loader_registry().try_lock() {
+            Ok(registry) => {
+                for entry in registry.values() {
+                    match &*entry.state.borrow() {
+                        LoaderState::Ready(slot) => slots.push(slot.clone()),
+                        LoaderState::Loading => {
+                            sample.loading_isolates = sample.loading_isolates.saturating_add(1);
+                            sample.complete = false;
+                        }
+                        LoaderState::Failed(_) => {}
+                    }
+                }
+            }
+            Err(_) => sample.complete = false,
+        }
+        if let Some(facets) = ROOT_FACETS.get() {
+            match facets.try_lock() {
+                Ok(facets) => {
+                    for entry in facets.values() {
+                        sample.complete &= entry.pending == 0;
+                        slots.extend(entry.open.iter().map(|facet| facet.slot.clone()));
+                    }
+                }
+                Err(_) => sample.complete = false,
+            }
+        }
+        // Loaded children and recorded facets never include the root's own
+        // isolate. Several stubs/facets can keep the same child slot alive.
+        let mut seen = std::collections::HashSet::new();
+        for slot in slots {
+            if !seen.insert(Arc::as_ptr(&slot)) {
+                continue;
+            }
+            match slot.try_heap_bytes() {
+                Ok(Some(bytes)) => {
+                    sample.isolates = sample.isolates.saturating_add(1);
+                    sample.total.used_bytes = sample.total.used_bytes.saturating_add(bytes.used);
+                    sample.total.physical_bytes =
+                        sample.total.physical_bytes.saturating_add(bytes.physical);
+                    sample.total.external_bytes =
+                        sample.total.external_bytes.saturating_add(bytes.external);
+                }
+                Ok(None) => {}
+                Err(()) => {
+                    sample.isolates = sample.isolates.saturating_add(1);
+                    sample.busy_isolates = sample.busy_isolates.saturating_add(1);
+                    sample.complete = false;
+                }
+            }
+        }
+        sample
     }
 
     /// Run a request's first turn.
@@ -4240,7 +4669,7 @@ impl Worker {
     /// flag is host state — so this is reached only when it has actually
     /// fired, rather than on a timer as the blocking run loop did.
     pub fn turn_cancel(&mut self, entry: &mut InFlight) -> Vec<Op> {
-        self.cancel_turn(entry, false)
+        self.cancel_turn(entry, CancelMode::Client)
     }
 
     /// The runtime is stopping: end the event as a client hang-up does, but
@@ -4249,10 +4678,14 @@ impl Worker {
     /// abandoned and the events queued behind it are refused now rather
     /// than left waiting through the shutdown.
     pub fn turn_cancel_for_shutdown(&mut self, entry: &mut InFlight) -> Vec<Op> {
-        self.cancel_turn(entry, true)
+        self.cancel_turn(entry, CancelMode::Shutdown)
     }
 
-    fn cancel_turn(&mut self, entry: &mut InFlight, shutdown: bool) -> Vec<Op> {
+    fn turn_cancel_for_guest_cleanup(&mut self, entry: &mut InFlight) -> Vec<Op> {
+        self.cancel_turn(entry, CancelMode::GuestCleanup)
+    }
+
+    fn cancel_turn(&mut self, entry: &mut InFlight, mode: CancelMode) -> Vec<Op> {
         let Some(inner) = self.inner.as_mut() else {
             return Vec::new();
         };
@@ -4272,7 +4705,7 @@ impl Worker {
             entry.context.remaining_cpu_budget(),
             entry.context.cpu_limit_ms(),
         );
-        cancel(tc, entry, shutdown);
+        cancel(tc, entry, mode);
         drop(cpu_watchdog);
         let ops = finish_turn(tc, entry);
         restore_trace(tc, previous);
@@ -4397,7 +4830,7 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     entry.context.begin_cpu_turn();
     {
         let _cpu_watchdog = cpu_watchdog_for_context(tc, &entry.context);
-        settle(tc, entry);
+        settle(tc, entry, false);
         tc.perform_microtask_checkpoint();
         // V8 schedules FinalizationRegistry cleanup as a foreground task,
         // not a microtask. Without driving that queue, collected loader
@@ -4427,7 +4860,7 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
         ws_capture_flush_touched(tc, &entry.runtime_state);
         return Vec::new();
     }
-    settle(tc, entry);
+    settle(tc, entry, true);
     // 5. **release what suspended WebSocket handlers have sent** — after the
     //    settles above, so a handler that answered in this turn keeps the
     //    whole-batch path its answer carries. The set comes from each capture
@@ -4438,6 +4871,13 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     // 7. **close the request's sockets** — see above.
     if entry.retired() {
         entry.context.close_sockets();
+    }
+    if entry.context.has_guest_storage() && entry.finished() {
+        if let Some(id) = entry.request_id {
+            // Guest lifecycle cancellation may arrive after the HTTP reply.
+            // Retain its original signal until owned background/cleanup drains.
+            finish_incoming_request(tc, id);
+        }
     }
     ops
 }
@@ -4565,6 +5005,7 @@ fn begin<'s>(
     if let Some(stream_id) = body.stream_id() {
         context.own_body_stream(stream_id);
     }
+    context.mark_event_driver();
     let guard = CurrentGuard::enter(context.clone());
     context.begin_cpu_turn();
     let target = match entrypoint {
@@ -4613,6 +5054,7 @@ fn begin<'s>(
                 reply: Some(Answer::Fetch(reply)),
                 gated_reply: None,
                 background: None,
+                cleanup: None,
                 completed_cell_event: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
@@ -4660,6 +5102,7 @@ fn begin_entrypoint_rpc(
         actor_runtime_state(tc).resource_limits,
         invocation_limits,
     ));
+    context.mark_event_driver();
     let guard = CurrentGuard::enter(context.clone());
     context.begin_cpu_turn();
     let started = (|| {
@@ -4707,6 +5150,7 @@ fn begin_entrypoint_rpc(
                 reply: Some(Answer::Rpc(reply)),
                 gated_reply: None,
                 background: None,
+                cleanup: None,
                 completed_cell_event: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
@@ -4916,6 +5360,7 @@ fn begin_queue(
     reply: tokio::sync::oneshot::Sender<Result<QueueDispatchResult>>,
 ) -> Begun {
     let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
+    context.mark_event_driver();
     let guard = CurrentGuard::enter(context.clone());
     context.begin_cpu_turn();
     let started = (|| {
@@ -4946,6 +5391,7 @@ fn begin_queue(
                 reply: Some(Answer::Queue(reply)),
                 gated_reply: None,
                 background: None,
+                cleanup: None,
                 completed_cell_event: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
@@ -5066,6 +5512,8 @@ struct AlarmClaim {
 /// sample the writes its answer will be gated on, open an event context, and
 /// keep the promise the dispatcher returned. Only the call and the shape of
 /// the answer differ, which is what the arguments say.
+// A guest event adopts a caller-supplied IoContext, one more than the original event shape.
+#[allow(clippy::too_many_arguments)]
 fn start_cell_event<'s>(
     tc: &mut v8::PinScope<'s, '_>,
     scope: &str,
@@ -5073,20 +5521,26 @@ fn start_cell_event<'s>(
     request_id: Option<RequestId>,
     body_stream_id: Option<u64>,
     capture_frames: bool,
+    context: Option<Arc<IoContext>>,
     call: impl FnOnce(&mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>>,
 ) -> Begun {
     let runtime_state = actor_runtime_state(tc);
-    let context = IoContext::tracked(&runtime_state);
+    let context = context.unwrap_or_else(|| IoContext::tracked(&runtime_state));
     if let Some(stream_id) = body_stream_id {
         context.own_body_stream(stream_id);
     }
+    context.mark_event_driver();
     let guard = CurrentGuard::enter(context.clone());
     let previous_io_context = install_io_context(tc, &context);
     context.begin_cpu_turn();
     // Sampled before the handler runs so the output gate can tell a write
     // this event made from celld's own activation writes. The first sample of
     // an activation is also the baseline a read-only answer observes above.
-    let writes_before = storage::event_start_position(scope);
+    let writes_before = if context.has_guest_storage() {
+        None
+    } else {
+        storage::event_start_position(scope)
+    };
     // No guard: this frame is the context's outermost one and the context
     // ends with the event, so there is nothing to pop it before.
     context.egress.lock().unwrap().push(EgressFrame {
@@ -5095,7 +5549,11 @@ fn start_cell_event<'s>(
         // A facet event stores here and gates on the cell that owns the root
         // database. Read once, with the position, so no later effect can take
         // one without the other.
-        root: storage::embedded_root_gate(scope),
+        root: if context.has_guest_storage() {
+            None
+        } else {
+            storage::embedded_root_gate(scope)
+        },
     });
     if capture_frames {
         ws_capture_begin();
@@ -5129,6 +5587,7 @@ fn start_cell_event<'s>(
                 reply: Some(answer),
                 gated_reply: None,
                 background: None,
+                cleanup: None,
                 completed_cell_event: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
@@ -5154,7 +5613,12 @@ fn start_cell_event<'s>(
             // The handler ran synchronously before it threw, and a
             // synchronous storage call both commits and reads, so the error
             // carries the positions it reached like a rejection does.
-            let error = match gate_positions(scope, writes_before) {
+            let positions = if context.has_guest_storage() {
+                Ok((None, None))
+            } else {
+                gate_positions(scope, writes_before)
+            };
+            let error = match positions {
                 Ok(positions) => fail_in_turn_error(error, positions),
                 Err(sample) => sample,
             };
@@ -5184,6 +5648,7 @@ fn start_cell_event<'s>(
                     reply: None,
                     gated_reply,
                     background,
+                    cleanup: None,
                     completed_cell_event: false,
                     ops: std::collections::HashSet::new(),
                     io_context_ops: std::collections::HashSet::new(),
@@ -5202,6 +5667,24 @@ fn start_cell_event<'s>(
     }
 }
 
+/// Why an event of a facet's socket must not run, if it must not.
+///
+/// The check runs in the turn that would start the handler, so no abort or
+/// give-back can close the facet between the check and the dispatch. An
+/// event for a facet that is not open would otherwise reach `_instance`,
+/// which constructs a missing instance: the class would run under the
+/// facet's scope with no storage and outside its root's lifetime.
+///
+/// The check compares the opening, not the root epoch. A facet that its root
+/// reopened is a new actor that never accepted the socket, and a generation
+/// swap reopens a facet at the same epoch. The new isolate's owner counter
+/// starts again, so the facet's scope can repeat too.
+fn facet_socket_refusal(scope: &str, facet_opening: Option<u64>) -> Option<anyhow::Error> {
+    let opening = facet_opening?;
+    (storage::facet_opening(scope) != Some(opening))
+        .then(|| anyhow!("the Durable Object facet that holds this WebSocket is no longer running"))
+}
+
 /// Start a cell event's first turn.
 ///
 /// The counterpart of `begin` for the events a cell receives. Where the
@@ -5209,7 +5692,12 @@ fn start_cell_event<'s>(
 /// serviced other cells' events inside *that* — each is now an entry a tokio
 /// task drives, so two events of one cell interleave by suspending rather
 /// than by nesting.
-fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
+fn begin_cell(
+    tc: &mut v8::PinScope,
+    job: CellJob,
+    event_time: i64,
+    context: Option<Arc<IoContext>>,
+) -> Begun {
     match job {
         CellJob::Fetch {
             request_id,
@@ -5227,6 +5715,9 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 return Begun::Nothing;
             }
             let body_stream_id = body.stream_id();
+            let retain_signal = context
+                .as_ref()
+                .is_some_and(|context| context.has_guest_storage());
             start_cell_event(
                 tc,
                 &scope,
@@ -5234,6 +5725,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 request_id,
                 body_stream_id,
                 false,
+                context,
                 |tc| {
                     let f = internal_function(tc, "__dispatchTo")?;
                     // A held body crosses as its bytes; a streamed body crosses as
@@ -5261,6 +5753,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                             None => v8::null(tc).into(),
                         },
                         stream_id,
+                        v8::Boolean::new(tc, retain_signal).into(),
                     ];
                     let recv = v8::undefined(tc).into();
                     f.call(tc, recv, &arguments)
@@ -5287,6 +5780,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 request_id,
                 None,
                 false,
+                context,
                 |tc| {
                     let f = internal_function(tc, "__dispatchRpc")?;
                     let arguments = [
@@ -5303,68 +5797,115 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
         CellJob::WsOpen {
             scope,
             ws_id,
+            facet_opening,
             protocol,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
-            let f = internal_function(tc, "__wsOpen")?;
-            let arguments = [
-                v8::String::new(tc, &scope).unwrap().into(),
-                v8::Number::new(tc, ws_id as f64).into(),
-                v8::String::new(tc, &protocol).unwrap().into(),
-            ];
-            let recv = v8::undefined(tc).into();
-            f.call(tc, recv, &arguments)
-                .ok_or_else(|| anyhow!("wsOpen threw"))
-        }),
+        } => {
+            // The dial fails rather than open a socket that no handler of
+            // the facet can receive.
+            if let Some(refusal) = facet_socket_refusal(&scope, facet_opening) {
+                let _ = reply.send(Err(refusal));
+                return Begun::Nothing;
+            }
+            start_cell_event(
+                tc,
+                &scope,
+                Answer::Ack(reply),
+                None,
+                None,
+                false,
+                context,
+                |tc| {
+                    let f = internal_function(tc, "__wsOpen")?;
+                    let arguments = [
+                        v8::String::new(tc, &scope).unwrap().into(),
+                        v8::Number::new(tc, ws_id as f64).into(),
+                        v8::String::new(tc, &protocol).unwrap().into(),
+                    ];
+                    let recv = v8::undefined(tc).into();
+                    f.call(tc, recv, &arguments)
+                        .ok_or_else(|| anyhow!("wsOpen threw"))
+                },
+            )
+        }
         CellJob::WsMessage {
             scope,
             ws_id,
+            facet_opening,
             data,
             reply,
             ..
-        } => start_cell_event(
-            tc,
-            &scope,
-            Answer::WsMessage(reply),
-            None,
-            None,
-            true,
-            |tc| {
-                let (name, data) = match data {
-                    WsIn::Text(text) => ("__wsMessage", v8::String::new(tc, &text).unwrap().into()),
-                    WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
-                };
-                let f = internal_function(tc, name)?;
-                let arguments = [
-                    v8::String::new(tc, &scope).unwrap().into(),
-                    v8::Number::new(tc, ws_id as f64).into(),
-                    data,
-                ];
-                let recv = v8::undefined(tc).into();
-                f.call(tc, recv, &arguments)
-                    .ok_or_else(|| anyhow!("WebSocket message dispatch threw"))
-            },
-        ),
+        } => {
+            if let Some(refusal) = facet_socket_refusal(&scope, facet_opening) {
+                let _ = reply.send(Err(refusal));
+                return Begun::Nothing;
+            }
+            start_cell_event(
+                tc,
+                &scope,
+                Answer::WsMessage(reply),
+                None,
+                None,
+                true,
+                context,
+                |tc| {
+                    let (name, data) = match data {
+                        WsIn::Text(text) => {
+                            ("__wsMessage", v8::String::new(tc, &text).unwrap().into())
+                        }
+                        WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
+                    };
+                    let f = internal_function(tc, name)?;
+                    let arguments = [
+                        v8::String::new(tc, &scope).unwrap().into(),
+                        v8::Number::new(tc, ws_id as f64).into(),
+                        data,
+                    ];
+                    let recv = v8::undefined(tc).into();
+                    f.call(tc, recv, &arguments)
+                        .ok_or_else(|| anyhow!("WebSocket message dispatch threw"))
+                },
+            )
+        }
         CellJob::WsClosed {
             scope,
             ws_id,
+            facet_opening,
             code,
             reason,
             was_clean,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
-            let f = internal_function(tc, "__wsClosed")?;
-            let arguments = [
-                v8::String::new(tc, &scope).unwrap().into(),
-                v8::Number::new(tc, ws_id as f64).into(),
-                v8::Number::new(tc, f64::from(code)).into(),
-                v8::String::new(tc, &reason).unwrap().into(),
-                v8::Boolean::new(tc, was_clean).into(),
-            ];
-            let recv = v8::undefined(tc).into();
-            f.call(tc, recv, &arguments)
-                .ok_or_else(|| anyhow!("wsClosed threw"))
-        }),
+        } => {
+            // A facet that stopped is not told that its socket closed, as an
+            // aborted actor in workerd is not: the socket closed because the
+            // facet stopped, and no handler is left to run.
+            if facet_socket_refusal(&scope, facet_opening).is_some() {
+                let _ = reply.send(Ok(None));
+                return Begun::Nothing;
+            }
+            start_cell_event(
+                tc,
+                &scope,
+                Answer::Ack(reply),
+                None,
+                None,
+                false,
+                context,
+                |tc| {
+                    let f = internal_function(tc, "__wsClosed")?;
+                    let arguments = [
+                        v8::String::new(tc, &scope).unwrap().into(),
+                        v8::Number::new(tc, ws_id as f64).into(),
+                        v8::Number::new(tc, f64::from(code)).into(),
+                        v8::String::new(tc, &reason).unwrap().into(),
+                        v8::Boolean::new(tc, was_clean).into(),
+                    ];
+                    let recv = v8::undefined(tc).into();
+                    f.call(tc, recv, &arguments)
+                        .ok_or_else(|| anyhow!("wsClosed threw"))
+                },
+            )
+        }
         CellJob::Alarm {
             request_id,
             scope,
@@ -5379,6 +5920,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             request_id,
             reply,
             event_time,
+            context,
         ),
         #[cfg(celld_internal_tests)]
         CellJob::SyncErrorForTest {
@@ -5387,25 +5929,34 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             socket_id,
             terminate,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
-            register_arm_gate_with_current_event(gate, installed_context());
-            if let Some(socket_id) = socket_id {
-                current_context().sockets.lock().unwrap().push(socket_id);
-            }
-            if terminate {
-                let state = actor_runtime_state(tc);
-                *state.termination.lock().expect("termination lock poisoned") =
-                    Some(ExecutionTermination {
-                        error: "synchronous V8 termination sentinel".to_string(),
-                        actor_scope: None,
-                        context_id: None,
-                    });
-                tc.terminate_execution();
-                Err(anyhow!("generic synchronous dispatch failure"))
-            } else {
-                Err(anyhow!("synchronous cell dispatch sentinel"))
-            }
-        }),
+        } => start_cell_event(
+            tc,
+            &scope,
+            Answer::Ack(reply),
+            None,
+            None,
+            false,
+            None,
+            |tc| {
+                register_arm_gate_with_current_event(gate, installed_context());
+                if let Some(socket_id) = socket_id {
+                    current_context().sockets.lock().unwrap().push(socket_id);
+                }
+                if terminate {
+                    let state = actor_runtime_state(tc);
+                    *state.termination.lock().expect("termination lock poisoned") =
+                        Some(ExecutionTermination {
+                            error: "synchronous V8 termination sentinel".to_string(),
+                            actor_scope: None,
+                            context_id: None,
+                        });
+                    tc.terminate_execution();
+                    Err(anyhow!("generic synchronous dispatch failure"))
+                } else {
+                    Err(anyhow!("synchronous cell dispatch sentinel"))
+                }
+            },
+        ),
     }
 }
 
@@ -5414,6 +5965,8 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
 /// The claim is recorded on the entry rather than closed here, because the
 /// handler has not run yet: the outcome is known only when the event ends,
 /// which is now many turns away.
+// The alarm path threads the guest event's IoContext through the original parameters.
+#[allow(clippy::too_many_arguments)]
 fn begin_alarm(
     tc: &mut v8::PinScope,
     scope: &str,
@@ -5422,7 +5975,22 @@ fn begin_alarm(
     request_id: Option<RequestId>,
     reply: tokio::sync::oneshot::Sender<Result<(celld_logic::wake::AlarmSnapshot, Option<u64>)>>,
     event_time: i64,
+    context: Option<Arc<IoContext>>,
 ) -> Begun {
+    // The host has already claimed the exact native deadline. A guest clock
+    // cannot grant that authority or invalidate the host's due-time sample.
+    if let AlarmDispatch::Guest { retry } = claim {
+        return fire_alarm_handler(
+            tc,
+            scope,
+            scheduled_ms,
+            retry,
+            None,
+            request_id,
+            reply,
+            context,
+        );
+    }
     if event_time < scheduled_ms {
         let _ = reply.send(Err(anyhow!("alarm dispatched before its deadline")));
         return Begun::Nothing;
@@ -5433,12 +6001,22 @@ fn begin_alarm(
             let _ = reply.send(Err(anyhow!("alarm dispatched without a claim")));
             return Begun::Nothing;
         };
-        return fire_alarm_handler(tc, scope, scheduled_at, retry, None, request_id, reply);
+        return fire_alarm_handler(
+            tc,
+            scope,
+            scheduled_at,
+            retry,
+            None,
+            request_id,
+            reply,
+            context,
+        );
     }
     let due_by = match claim {
         #[cfg(celld_internal_tests)]
         AlarmDispatch::Armed => i64::MAX,
         AlarmDispatch::Due => event_time,
+        AlarmDispatch::Guest { .. } => unreachable!("guest alarms return above"),
         #[cfg(celld_internal_tests)]
         AlarmDispatch::Claimed(_) => unreachable!("claimed alarms return above"),
     };
@@ -5458,10 +6036,13 @@ fn begin_alarm(
         Some(AlarmClaim { now_ms: event_time }),
         request_id,
         reply,
+        context,
     )
 }
 
 /// Call `alarm()`, carrying whatever claim its outcome must close.
+// The alarm path threads the guest event's IoContext through the original parameters.
+#[allow(clippy::too_many_arguments)]
 fn fire_alarm_handler(
     tc: &mut v8::PinScope,
     scope: &str,
@@ -5470,6 +6051,7 @@ fn fire_alarm_handler(
     claim: Option<AlarmClaim>,
     request_id: Option<RequestId>,
     reply: tokio::sync::oneshot::Sender<Result<(celld_logic::wake::AlarmSnapshot, Option<u64>)>>,
+    context: Option<Arc<IoContext>>,
 ) -> Begun {
     let begun = start_cell_event(
         tc,
@@ -5478,6 +6060,7 @@ fn fire_alarm_handler(
         request_id,
         None,
         false,
+        context,
         |tc| {
             let f = internal_function(tc, "__fireAlarm")?;
             let arguments = [
@@ -5534,7 +6117,22 @@ fn cancelled(tc: &mut v8::PinScope, entry: &mut InFlight) {
         return;
     }
     let shutdown = take_shutdown_cancellation(entry.request_id);
-    cancel(tc, entry, shutdown);
+    cancel(
+        tc,
+        entry,
+        if shutdown {
+            CancelMode::Shutdown
+        } else {
+            CancelMode::Client
+        },
+    );
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CancelMode {
+    Client,
+    Shutdown,
+    GuestCleanup,
 }
 
 /// End a request whose cancellation has already been taken.
@@ -5542,7 +6140,15 @@ fn cancelled(tc: &mut v8::PinScope, entry: &mut InFlight) {
 /// Split from [`cancelled`] because a suspended request observes the
 /// cancellation *outside* the isolate — the flag is host state and costs no
 /// V8 — and only then enters to act on it.
-fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
+fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, mode: CancelMode) {
+    let shutdown = mode != CancelMode::Client;
+    let mut cleanup = if mode == CancelMode::GuestCleanup {
+        let mut promises = vec![entry.promise.clone()];
+        promises.extend(entry.background.take());
+        Some(promises)
+    } else {
+        None
+    };
     let guard = CurrentGuard::enter(entry.context.clone());
     // The id that names this request to the JS side. A stateless handler is
     // registered by the shell, and only once it suspends, so the shell holds
@@ -5559,6 +6165,9 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
     }
     let background = end_event_context(tc).ok().flatten();
     entry.background = background.map(|promise| v8::Global::new(tc, promise));
+    if let Some(promises) = &mut cleanup {
+        promises.extend(entry.background.take());
+    }
     if shutdown {
         finish_retired_input_gate_context(tc, &entry.context);
     }
@@ -5581,11 +6190,38 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
     if shutdown || !entry.keeps_native_ops_after_disconnect() {
         entry.abandon();
     }
+    if let Some(mut promises) = cleanup {
+        // Original shutdown still retires old I/O/resolvers and gate labels.
+        // Keep raw native Promise handles for cleanup; user-overridden
+        // Promise.allSettled cannot certify that this owned work is finished.
+        let mut events = entry.context.events.lock().unwrap();
+        events.wait_until_active = true;
+        promises.append(&mut events.guest_wait_until);
+        promises.append(&mut events.guest_callbacks);
+        events.late_wait_until.clear();
+        entry.cleanup = Some(promises);
+    }
 }
 
 /// Answer a request whose handler promise has settled, and retire its
 /// `waitUntil` work once that settles too.
-fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
+fn settle(tc: &mut v8::PinScope, entry: &mut InFlight, after_checkpoint: bool) {
+    if let Some(promises) = &mut entry.cleanup {
+        let mut events = entry.context.events.lock().unwrap();
+        promises.append(&mut events.guest_wait_until);
+        promises.append(&mut events.guest_callbacks);
+        events.late_wait_until.clear();
+        promises.retain(|promise| {
+            matches!(
+                v8::Local::new(tc, promise).state(),
+                v8::PromiseState::Pending
+            )
+        });
+        if promises.is_empty() && after_checkpoint {
+            entry.cleanup = None;
+            events.wait_until_active = false;
+        }
+    }
     if entry.reply.is_some() {
         let promise = v8::Local::new(tc, &entry.promise);
         match promise.state() {
@@ -5612,11 +6248,50 @@ fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
                     finish_incoming_request(tc, request_id);
                 }
                 drop(guard);
-                entry.fail_in_turn(anyhow!("rejected: {reason}"));
+                let error = anyhow!("rejected: {reason}");
+                // The host owns guest alarm bookkeeping. Preserve precisely
+                // this original counted-rejection branch in its guest result.
+                let error = if entry.context.has_guest_storage()
+                    && matches!(entry.reply.as_ref(), Some(Answer::Alarm(_)))
+                {
+                    error.context(GuestAlarmRejection)
+                } else {
+                    error
+                };
+                entry.fail_in_turn(error);
             }
         }
     }
-    if let Some(background) = &entry.background {
+    if entry.cleanup.is_some() {
+        // Raw guest promises are the lifecycle authority. An application may
+        // replace the background aggregate; keep late registrations open
+        // until the owned promises and final checkpoint have drained.
+        entry.background = None;
+        entry.context.events.lock().unwrap().wait_until_active = true;
+    }
+    if entry.context.has_guest_storage() {
+        if after_checkpoint && entry.cleanup.is_none() {
+            // Ordinary guest retirement has the same raw-promise obligation
+            // as cancellation. An application can replace allSettled or make
+            // it return early; that aggregate cannot authorize Drained/Failed.
+            // Keep the registration window open through the checkpoint so a
+            // completed promise's reaction can register nested waitUntil work.
+            let mut events = entry.context.events.lock().unwrap();
+            events.guest_wait_until.retain(|promise| {
+                matches!(
+                    v8::Local::new(tc, promise).state(),
+                    v8::PromiseState::Pending
+                )
+            });
+            events.late_wait_until.clear(); // These same registrations are in the raw ledger.
+            if entry.reply.is_none() {
+                // A representative raw promise keeps the original InFlight
+                // retirement rule intact, including unreferenced operations.
+                entry.background = events.guest_wait_until.first().cloned();
+                events.wait_until_active = entry.background.is_some();
+            }
+        }
+    } else if let Some(background) = &entry.background {
         let promise = v8::Local::new(tc, background);
         if !matches!(promise.state(), v8::PromiseState::Pending) {
             let late = entry.context.take_late_wait_until();
@@ -5752,6 +6427,12 @@ impl Worker {
     }
 
     pub fn load_config(config: Arc<WorkerConfig>) -> Result<Worker> {
+        Self::load_config_inner(config, false)
+    }
+
+    fn load_config_inner(config: Arc<WorkerConfig>, guest: bool) -> Result<Worker> {
+        let began = guest.then(Instant::now);
+        let elapsed = || began.map(|began| began.elapsed()).unwrap_or_default();
         let src = config.src.as_str();
         let script_name = config.script_name.as_str();
         let do_classes = config.do_classes.as_slice();
@@ -5771,10 +6452,20 @@ impl Worker {
         });
         let runtime_state = Arc::new(ActorRuntimeState {
             promises: std::sync::Mutex::new(PromiseMap::new()),
-            egress: config.egress.clone(),
+            // Before module evaluation: guest code must never fall through
+            // to native storage or direct egress while no event is attached.
+            #[cfg(unix)]
+            guest_storage_enabled: AtomicBool::new(guest),
+            egress: if guest {
+                EgressPolicy::Deny
+            } else {
+                config.egress.clone()
+            },
             resource_limits: config.resource_limits,
             tail_reporting: config.tail_reporting,
             script_name: script_name.to_string(),
+            #[cfg(target_os = "linux")]
+            application_storage: config.host_verified_names && !guest,
             ..Default::default()
         });
         let loader_owner = LoaderOwner::fresh(script_name, config.generation);
@@ -5793,28 +6484,43 @@ impl Worker {
             tree: OnceLock::new(),
         }));
         isolate.add_near_heap_limit_callback(near_heap_limit, heap_limit_state_ptr);
-        let (context, fetch) = {
+        let (
+            context,
+            fetch,
+            isolate_ready,
+            ops_ready,
+            prelude_ready,
+            harness_ready,
+            module_started,
+            module_ready,
+        ) = {
             v8::scope!(let hs, &mut isolate);
             let context = v8::Context::new(hs, Default::default());
             let cs = &mut v8::ContextScope::new(hs, context);
             let tc = std::pin::pin!(v8::TryCatch::new(cs));
             let scope = &mut tc.init();
 
+            let isolate_ready = elapsed();
             let arguments = install_ops(scope);
+            let ops_ready = elapsed();
             install_prelude(scope, &arguments)?; // Web Platform APIs
+            let prelude_ready = elapsed();
             install_harness(scope, &arguments)?; // DO object model + minimal Response
+            let harness_ready = elapsed();
             install_lazy_globals(scope)?;
             // A global, so it must exist before the module evaluates: bundles
             // read Cloudflare.compatibilityFlags at module scope.
             inject_compatibility_flags(scope, compat)?;
             inject_storage_compatibility(scope, compat)?;
 
+            let module_started = elapsed();
             let module = match compile_module(scope, &config.main_module_name, src) {
                 Some(m) => m,
                 None => return Err(anyhow!("compile: {}", exc!(scope))),
             };
             register_stubs(scope, &config); // cloudflare:*/node:* + text modules
             register_wasm_modules(scope, &config.modules);
+            register_data_modules(scope, &config.modules);
             register_loader_modules(scope, &config, module);
             module
                 .instantiate_module(scope, resolve_external)
@@ -5850,6 +6556,7 @@ impl Worker {
                 }
             }
 
+            let module_ready = elapsed();
             let ns = module
                 .get_module_namespace()
                 .to_object(scope)
@@ -5888,8 +6595,13 @@ impl Worker {
             }
             inject_namespace_keys(scope, script_name, do_classes)?;
             inject_crons(scope, &config.crons)?;
-            inject_workflows(scope, script_name, &config.workflow_bindings)?;
-            inject_containers(scope, &config.containers)?;
+            inject_workflows(
+                scope,
+                script_name,
+                &config.workflow_bindings,
+                &config.keyed_namespaces,
+            )?;
+            inject_containers(scope, &config.containers, &config.container_aliases)?;
             inject_kv_limits(scope)?;
             inject_queue_config(scope, &config)?;
             populate_cf_exports(scope, ns, do_classes)?;
@@ -6018,7 +6730,16 @@ impl Worker {
                     }
                 }
             }
-            (v8::Global::new(scope, context), v8::Global::new(scope, f))
+            (
+                v8::Global::new(scope, context),
+                v8::Global::new(scope, f),
+                isolate_ready,
+                ops_ready,
+                prelude_ready,
+                harness_ready,
+                module_started,
+                module_ready,
+            )
         };
         // Module evaluation and harness installation allocate temporary V8
         // objects. No request can reuse them after these scopes close, and a
@@ -6027,7 +6748,25 @@ impl Worker {
         // a missing settlement notification pass the regression.
         #[cfg(all(test, celld_internal_tests))]
         install_heap_collection_observer_for_test(&mut isolate);
+        let heap_started = elapsed();
         settle_isolate_heap(&mut isolate);
+        if guest {
+            let finished = elapsed();
+            let ms = |elapsed: Duration| elapsed.as_secs_f64() * 1000.0;
+            tracing::info!(
+                event = "guest_worker_initialization",
+                isolate_ms = ms(isolate_ready),
+                ops_ms = ms(ops_ready - isolate_ready),
+                prelude_ms = ms(prelude_ready - ops_ready),
+                harness_ms = ms(harness_ready - prelude_ready),
+                globals_ms = ms(module_started - harness_ready),
+                module_compile_eval_ms = ms(module_ready - module_started),
+                bindings_ms = ms(heap_started - module_ready),
+                heap_settlement_ms = ms(finished - heap_started),
+                total_ms = ms(finished),
+                "guest worker initialization timing"
+            );
+        }
         Ok(Worker {
             inner: Some(WorkerIsolate {
                 // Every setup scope above has closed, so nothing is entered
@@ -6111,15 +6850,15 @@ impl Worker {
         id_sc: Vec<u8>,
         props_sc: Vec<u8>,
         file: (std::path::PathBuf, bool),
-    ) -> Result<Option<i64>> {
+    ) -> Result<u64> {
         let compat = self.inner.as_ref().expect("live worker isolate").compat;
         let (mut locker, _cells) = self.lock();
-        if storage::activation_epoch(cell).is_some() {
+        if let Some(opening) = storage::facet_opening(cell) {
             // The facet is already open, but this call carries a newer sample
             // of the root cell. Take it: the egress of this call must wait for
             // what the root cell had committed when the call left it.
             storage::refresh_embedded_root(cell, parent);
-            return Ok(None);
+            return Ok(opening);
         }
         v8::scope!(let hs, &mut *locker);
         let realm = self.realm(hs);
@@ -6140,7 +6879,73 @@ impl Worker {
                 restored,
             },
             compat,
-        )
+        )?;
+        storage::facet_opening(cell).context("the facet opened without an embedded backing")
+    }
+
+    /// The opening of the facet `scope` in this isolate, for a test that
+    /// addresses a facet's socket event to it.
+    #[cfg(all(test, celld_internal_tests))]
+    pub(crate) fn facet_opening_for_test(&mut self, scope: &str) -> Option<u64> {
+        let (_locker, _cells) = self.lock();
+        storage::facet_opening(scope)
+    }
+
+    /// Close the facet `cell` at `facet_path` of `root`, and every facet
+    /// below it that this isolate runs, deepest first. Answers each scope it
+    /// closed, including those whose close failed.
+    ///
+    /// workerd aborts a facet's children with it. A child left open keeps
+    /// its stream and its sockets, and the root can reopen the parent and
+    /// start a second instance of the same child stream.
+    fn close_facet_tree(
+        &mut self,
+        cell: &str,
+        root: &str,
+        facet_path: &[String],
+    ) -> (Vec<String>, Result<()>) {
+        let compat = self.inner.as_ref().expect("live worker isolate").compat;
+        let (mut locker, _cells) = self.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = self.realm(hs);
+        let context = realm.context;
+        let cs = &mut v8::ContextScope::new(hs, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+        let mut closed = storage::embedded_facets_below(root, facet_path);
+        closed.push(cell.to_string());
+        let mut outcome = Ok(());
+        for scope in &closed {
+            if let Err(error) = adopt_cell(tc, scope, None, compat) {
+                outcome = outcome.and(Err(error));
+            }
+        }
+        (closed, outcome)
+    }
+
+    /// A credential-free guest's facet: the host owns the database, so this
+    /// only selects the facet's instance identity and lets its events attach a
+    /// guest storage channel. A loaded worker is stateless until its first facet.
+    #[cfg(unix)]
+    fn own_guest_facet(
+        &mut self,
+        cell: &str,
+        id_sc: Vec<u8>,
+        props_sc: Vec<u8>,
+        depth: usize,
+    ) -> Result<()> {
+        let inner = self.inner.as_ref().expect("live worker isolate");
+        inner
+            .runtime_state
+            .guest_storage_enabled
+            .store(true, Ordering::Release);
+        let (mut locker, _cells) = self.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = self.realm(hs);
+        let cs = &mut v8::ContextScope::new(hs, realm.context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+        bootstrap::install_facet_config(tc, cell, id_sc, props_sc, depth)
     }
 
     /// Drain the alarm moves the last turn committed in this isolate.
@@ -6162,6 +6967,24 @@ impl Worker {
         storage::take_alarm_moves()
     }
 
+    /// Native guest operations enter the same lock and storage context as a
+    /// JS turn. The synchronous callback cannot retain that lock across I/O.
+    pub(crate) fn storage_turn<T>(
+        &mut self,
+        cell: &str,
+        epoch: u64,
+        f: impl FnOnce(&storage::Cells) -> T,
+    ) -> Result<(T, Vec<(String, celld_logic::wake::AlarmSnapshot)>)> {
+        let inner = self.inner.as_ref().context("cell worker was retired")?;
+        let (_locker, _installed) = inner.lock();
+        anyhow::ensure!(
+            storage::activation_epoch(cell) == Some(epoch),
+            "guest storage activation changed"
+        );
+        let result = f(&inner.cells);
+        Ok((result, storage::take_alarm_moves()))
+    }
+
     pub fn set_id_name(&mut self, scope: &str, name: &str) -> Result<()> {
         let (mut locker, _cells) = self.lock();
         v8::scope!(let hs, &mut *locker);
@@ -6181,9 +7004,58 @@ impl Worker {
         job: CellJob,
         trace: Option<crate::telemetry::TraceContext>,
     ) -> (Option<InFlight>, Vec<Op>) {
+        self.turn_begin_cell_with_context(job, trace, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn turn_begin_application_cell(
+        &mut self,
+        job: CellJob,
+        trace: Option<crate::telemetry::TraceContext>,
+        metadata: Option<Arc<crate::application_vm::ScopeMetadata>>,
+    ) -> (Option<InFlight>, Vec<Op>) {
+        if crate::application_vm::hosted().is_some()
+            && self
+                .inner
+                .as_ref()
+                .is_some_and(|inner| inner.runtime_state.application_storage != metadata.is_some())
+        {
+            job.fail(anyhow!(
+                "cell event application classification does not match its isolate"
+            ));
+            return (None, Vec::new());
+        }
+        let context = metadata.and_then(|metadata| {
+            self.inner.as_ref().map(|inner| {
+                let context = IoContext::tracked(&inner.runtime_state);
+                let _ = context.application_scope.set(metadata);
+                context
+            })
+        });
+        self.turn_begin_cell_with_context(job, trace, context)
+    }
+
+    fn turn_begin_cell_with_context(
+        &mut self,
+        job: CellJob,
+        trace: Option<crate::telemetry::TraceContext>,
+        guest_context: Option<Arc<IoContext>>,
+    ) -> (Option<InFlight>, Vec<Op>) {
         let Some(inner) = self.inner.as_mut() else {
             return (None, Vec::new());
         };
+        #[cfg(unix)]
+        if inner
+            .runtime_state
+            .guest_storage_enabled
+            .load(Ordering::Acquire)
+            && guest_context.is_none()
+        {
+            job.fail(anyhow!(
+                "guest cell entry requires its host-selected storage channel"
+            ));
+            return (None, Vec::new());
+        }
         let (mut locker, _cells) = inner.lock();
         inner.recover_heap(&mut locker);
         v8::scope!(let hs, &mut *locker);
@@ -6195,6 +7067,14 @@ impl Worker {
 
         let event_time = advance_io_time(tc);
         let previous = install_trace(tc, trace.as_ref());
+        // Identity registration runs before the DO constructor. Both must
+        // see the same host-selected event, including through CPED reactions.
+        let guest_guard = guest_context
+            .as_ref()
+            .map(|context| CurrentGuard::enter(context.clone()));
+        let previous_guest_context = guest_context
+            .as_ref()
+            .and_then(|context| install_io_context(tc, context));
         let cpu_watchdog = inner.cpu_watchdog(
             inner.initial_cpu_budget(),
             inner
@@ -6202,7 +7082,7 @@ impl Worker {
                 .resource_limits
                 .and_then(|limits| limits.cpu_ms),
         );
-        let begun = begin_cell(tc, job, event_time);
+        let begun = begin_cell(tc, job, event_time, guest_context);
         drop(cpu_watchdog);
         let out = match begun {
             Begun::Running(mut entry) => {
@@ -6225,6 +7105,8 @@ impl Worker {
             }
             Begun::Nothing => (None, Vec::new()),
         };
+        restore_io_context(tc, previous_guest_context);
+        drop(guest_guard);
         restore_trace(tc, previous);
         out
     }
@@ -6623,6 +7505,7 @@ ops! { OP_NAMES, install_op_functions,
         "__ws_send_binary" => websocket::op_ws_send_binary,
         "__ws_close" => websocket::op_ws_close,
         "__ws_alloc" => websocket::op_ws_alloc,
+        "__ws_guest" => websocket::op_ws_guest,
         "__ws_prepare_worker_handoff" => websocket::op_ws_prepare_worker_handoff,
         "__ws_accept" => websocket::op_ws_accept,
         "__ws_accept_regular" => websocket::op_ws_accept_regular,
@@ -6662,6 +7545,13 @@ ops! { OP_NAMES, install_op_functions,
         "__container_exec_wait" => container::op_container_exec_wait,
         "__container_exec_kill" => container::op_container_exec_kill,
         "__container_exec_drop" => container::op_container_exec_drop,
+        "__container_port_fetch" => container::op_container_port_fetch,
+        "__container_connect" => container::op_container_connect,
+        "__container_tcp_read" => container::op_container_tcp_read,
+        "__container_tcp_write" => container::op_container_tcp_write,
+        "__container_tcp_shutdown" => container::op_container_tcp_shutdown,
+        "__container_tcp_close" => container::op_container_tcp_close,
+        "__container_tcp_starttls" => container::op_container_tcp_starttls,
         "__storage_get" => storage_ops::op_storage_get,
         "__storage_get_many" => storage_ops::op_storage_get_many,
         "__sql_ingest" => storage_ops::op_sql_ingest,
@@ -6683,6 +7573,8 @@ ops! { OP_NAMES, install_op_functions,
         "__storage_cancel_pending_puts" => storage_ops::op_storage_cancel_pending_puts,
         "__actor_abort" => op_actor_abort,
         "__cron_plan" => op_cron_plan,
+        "__cron_schedule" => op_cron_schedule,
+        "__cron_dispatch" => op_cron_dispatch,
         "__kv_blob" => op_kv_blob,
         "__process_exit" => op_process_exit,
         "__storage_delete" => storage_ops::op_storage_delete,
@@ -6719,9 +7611,11 @@ ops! { OP_NAMES, install_op_functions,
         "__svc_rpc" => op_svc_rpc,
         "__queue_dispatch" => op_queue_dispatch,
         "__queue_policy" => op_queue_policy,
+        "__queue_consumer" => op_queue_consumer,
         "__do_call_cancellable" => op_do_call_cancellable,
         "__do_call_cancel" => op_do_call_cancel,
         "__rpc_signal_new" => op_rpc_signal_new,
+        "__rpc_signal_guest" => op_rpc_signal_guest,
         "__rpc_signal_abort" => op_rpc_signal_abort,
         "__rpc_signal_release" => op_rpc_signal_release,
         "__rpc_signal_poll" => op_rpc_signal_poll,
@@ -6775,6 +7669,7 @@ ops! { OP_NAMES, install_op_functions,
         "$$timingSafeEqual" => crypto::op_timing_safe_equal,
         "__event_begin" => op_event_begin,
         "__event_end" => op_event_end,
+        "__guest_cleanup_track" => op_guest_cleanup_track,
         "__pending_event_begin" => op_pending_event_begin,
         "__pending_event_end" => op_pending_event_end,
         "__vfs_mkdir" => op_vfs_mkdir,
@@ -6923,6 +7818,104 @@ fn op_queue_dispatch(
     rv.set(promise_for(scope, id));
 }
 
+/// `__queue_consumer()`: the consumer settings the host catalog holds for the
+/// running event's own Queue cell, as JSON, or `undefined` for a queue that is
+/// not an application's or has no consumer. The cell is the event's, never an
+/// argument, so no cell can read another's settings.
+fn op_queue_consumer(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    #[cfg(target_os = "linux")]
+    if crate::application_vm::hosted().is_some() {
+        let context = event_context(scope);
+        let Some(cell) = current_cell_event(&context).map(|frame| frame.storage) else {
+            return loader_throw(scope, "a Queue consumer lookup needs a cell event");
+        };
+        if let Some(consumer) = context
+            .application_scope
+            .get()
+            .filter(|metadata| metadata.scope == cell)
+            .and_then(|metadata| metadata.queue.clone())
+            .and_then(|entry| entry.consumer_wire())
+        {
+            rv.set(
+                v8::String::new(scope, &consumer.to_string())
+                    .unwrap()
+                    .into(),
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (scope, &mut rv);
+}
+
+/// `__cron_schedule()`: the expressions the host catalog holds for the running
+/// event's own `.cron` cell, as a JSON array (empty once its trigger is gone), or
+/// `undefined` for a cell that is not an application's. The cell is the event's,
+/// never an argument.
+fn op_cron_schedule(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    #[cfg(target_os = "linux")]
+    if crate::application_vm::hosted().is_some() {
+        let context = event_context(scope);
+        let Some(cell) = current_cell_event(&context).map(|frame| frame.storage) else {
+            return loader_throw(scope, "a cron schedule lookup needs a cell event");
+        };
+        if let Some(entry) = context
+            .application_scope
+            .get()
+            .filter(|metadata| metadata.scope == cell)
+            .and_then(|metadata| metadata.cron.as_ref())
+        {
+            let crons: Vec<_> = entry
+                .schedule
+                .iter()
+                .map(|s| s.expression.as_str())
+                .collect();
+            rv.set(
+                v8::String::new(scope, &serde_json::json!(crons).to_string())
+                    .unwrap()
+                    .into(),
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (scope, &mut rv);
+}
+
+/// `__cron_dispatch(cron, scheduledTime)`: run one scheduled event of the
+/// running event's own application `.cron` cell in its trigger's pinned VM, and
+/// resolve with the guest's JSON result. The target is the host catalog's.
+fn op_cron_dispatch(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        let cron = args.get(0).to_rust_string_lossy(scope);
+        let scheduled_ms = args.get(1).number_value(scope).unwrap_or(-1.0) as i64;
+        let cell = current_cell_event(&event_context(scope)).map(|frame| frame.storage);
+        let id = asyncrt::enqueue(async move {
+            let cell = cell.ok_or("a cron dispatch needs a cell event")?;
+            let hosted = crate::application_vm::hosted().ok_or("no application VM host")?;
+            hosted
+                .dispatch_scheduled(&cell, &cron, scheduled_ms)
+                .await
+                .map(asyncrt::OpOut::Str)
+                .map_err(|error| format!("{error:#}"))
+        });
+        rv.set(promise_for(scope, id));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (scope, args, &mut rv);
+}
+
 /// The Queue policy boundary, `crate::queue_policy::run` behind one
 /// synchronous op.
 fn op_queue_policy(
@@ -6934,7 +7927,7 @@ fn op_queue_policy(
         match serde_json::from_str(&args.get(0).to_rust_string_lossy(scope)) {
             Ok(request) => request,
             Err(error) => {
-                return loader_throw(scope, &format!("invalid Queue policy input: {error}"))
+                return loader_throw(scope, &format!("invalid Queue policy input: {error}"));
             }
         };
     #[cfg(celld_internal_tests)]
@@ -6991,6 +7984,45 @@ fn op_svc_rpc(
         }
     };
     let props = view_bytes(args.get(4)).unwrap_or_default();
+    #[cfg(unix)]
+    if guest_storage::enabled(scope) {
+        // A property read (`get`) passes no signal list.
+        let signals = if args.get(5).is_null_or_undefined() {
+            Ok(Vec::new())
+        } else {
+            serde_json::from_str::<Vec<String>>(&args.get(5).to_rust_string_lossy(scope))
+        };
+        let signals = match signals {
+            Ok(signals) => signals,
+            Err(error) => {
+                return loader_throw(scope, &format!("service RPC signals are invalid: {error}"))
+            }
+        };
+        let (path, body, get) = match operation {
+            crate::WorkerRpcOperation::Get { path } => (path, vec![], true),
+            crate::WorkerRpcOperation::Call { path, args } => (path, args, false),
+        };
+        let invocation = celld_applications::invocation_wire::ServiceInvocation {
+            entrypoint: Some(entrypoint),
+            props,
+            rpc: Some(path),
+            get,
+            signals,
+            signal_owner: None,
+        };
+        let request = celld_applications::invocation_wire::HttpRequest {
+            method: "POST".into(),
+            url: "https://service.celld.internal/".into(),
+            headers: vec![],
+            body,
+        };
+        return match guest_storage::service_call(
+            scope, script, invocation, request, None, None, None,
+        ) {
+            Ok(id) => rv.set(promise_for(scope, id)),
+            Err(error) => loader_throw(scope, &error),
+        };
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
     let request = SvcRpcReq {
@@ -7073,10 +8105,10 @@ fn op_svc_call_impl(
                     &format!(
                         "service binding: the request headers are not a name/value list: {error}"
                     ),
-                )
+                );
             }
         };
-    let body_guard = match body.stream_id() {
+    let mut body_guard = match body.stream_id() {
         Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
             Some(guard) => guard,
             None => return loader_throw(scope, "service binding: the body stream is not owned"),
@@ -7104,6 +8136,48 @@ fn op_svc_call_impl(
     } else {
         (None, None, None)
     };
+    #[cfg(unix)]
+    if guest_storage::enabled(scope) {
+        let invocation = celld_applications::invocation_wire::ServiceInvocation {
+            entrypoint: entrypoint.as_ref().map(|value| value.name.clone()),
+            props: entrypoint.map_or_else(Vec::new, |value| value.props),
+            rpc: None,
+            get: false,
+            signals: vec![],
+            signal_owner: None,
+        };
+        let (body, upload) = match body {
+            RequestBody::Bytes(body) => (body.to_vec(), None),
+            RequestBody::Stream(stream) => match body_guard.take_stream(stream) {
+                Ok(source) => (vec![], Some(source)),
+                Err(error) => return loader_throw(scope, &error),
+            },
+        };
+        let request = celld_applications::invocation_wire::HttpRequest {
+            method,
+            url,
+            headers,
+            body,
+        };
+        return match guest_storage::service_call(
+            scope,
+            script,
+            invocation,
+            request,
+            upload,
+            cancel,
+            cancel_guard,
+        ) {
+            Ok(id) => {
+                let promise = promise_for(scope, id);
+                if let Some(request_id) = request_id {
+                    attach_cancel_id(scope, promise, request_id);
+                }
+                rv.set(promise);
+            }
+            Err(error) => loader_throw(scope, &error),
+        };
+    }
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
     let request = SvcCallReq {
         cancel,
@@ -7253,15 +8327,25 @@ const MAX_LOADED_WORKERS: usize = 256;
 // Reserve only the final process slot. A fixed fraction needlessly reduces
 // single-script capacity without giving every competing principal a share.
 const MAX_LOADED_WORKERS_PER_PRINCIPAL: usize = MAX_LOADED_WORKERS - 1;
+/// An application VM has 384 MiB for the parent isolate, the runtime and every
+/// child; one idle isolate costs roughly 10 MiB after the prelude and harness
+/// install, so eight children leave the parent most of the VM. This bounds idle
+/// isolate creation only: a child's own 128 MiB heap limit still applies.
+const MAX_GUEST_LOADED_WORKERS: usize = 8;
 
 /// Check both limits and install the live state under one registry lock. A
 /// separate check and insert lets concurrent isolates exceed either limit.
 fn admit_loaded_worker(
     owner: LoaderOwner,
     state: tokio::sync::watch::Receiver<LoaderState>,
+    guest: bool,
 ) -> Result<u64, String> {
     let mut registry = loader_registry().lock().unwrap();
-    let principal_limit = MAX_LOADED_WORKERS_PER_PRINCIPAL;
+    let principal_limit = if guest {
+        MAX_GUEST_LOADED_WORKERS
+    } else {
+        MAX_LOADED_WORKERS_PER_PRINCIPAL
+    };
     let principal_count = registry
         .values()
         .filter(|entry| entry.owner.principal == owner.principal)
@@ -7281,6 +8365,16 @@ fn admit_loaded_worker(
     let id = LOADER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     registry.insert(id, LoaderEntry { owner, state });
     Ok(id)
+}
+
+fn in_guest(scope: &mut v8::PinScope) -> bool {
+    #[cfg(unix)]
+    return guest_storage::enabled(scope);
+    #[cfg(not(unix))]
+    {
+        let _ = scope;
+        false
+    }
 }
 
 fn loader_throw(scope: &mut v8::PinScope, message: &str) {
@@ -7423,7 +8517,7 @@ fn op_loader_load(
             .iter()
             .map(|(_, source)| match source {
                 ModuleSource::Text(source) | ModuleSource::EsModule(source) => source.len(),
-                ModuleSource::Wasm(bytes) => bytes.len(),
+                ModuleSource::Wasm(bytes) | ModuleSource::Data(bytes) => bytes.len(),
             })
             .sum::<usize>();
     let max_code_bytes = dynamic_worker_code_limit();
@@ -7507,6 +8601,30 @@ fn op_loader_load(
     }
     let outbound = args.get(2);
     let outbound_props = args.get(3);
+    // A guest has no egress to hand a child: a Fetcher, a Service Binding
+    // capability or a Tail Worker would run on this process's service
+    // registry, not on the application's brokered bindings. Refuse, never
+    // load the child without the contract the caller asked for.
+    if in_guest(scope) {
+        let unsupported = if !outbound.is_undefined() && !outbound.is_null() {
+            Some("a globalOutbound Fetcher")
+        } else if loader_env
+            .as_ref()
+            .is_some_and(|env| !env.routes.is_empty())
+        {
+            Some("Service Binding capabilities in env")
+        } else if tail_reporting {
+            Some("tails")
+        } else {
+            None
+        };
+        if let Some(unsupported) = unsupported {
+            return loader_throw(
+                scope,
+                &format!("worker loader: {unsupported} are not available in application guests"),
+            );
+        }
+    }
     let egress = if outbound.is_undefined() {
         actor_runtime_state(scope).egress.clone()
     } else if outbound.is_null() {
@@ -7518,7 +8636,7 @@ fn op_loader_load(
                 return loader_throw(
                     scope,
                     &format!("worker loader: malformed globalOutbound route: {error}"),
-                )
+                );
             }
         };
         let props = match view_bytes(outbound_props) {
@@ -7527,7 +8645,7 @@ fn op_loader_load(
                 return loader_throw(
                     scope,
                     "worker loader: globalOutbound props are not a typed array",
-                )
+                );
             }
         };
         let entrypoint = match route.entrypoint {
@@ -7537,7 +8655,7 @@ fn op_loader_load(
                 return loader_throw(
                     scope,
                     "worker loader: globalOutbound props require an entrypoint",
-                )
+                );
             }
         };
         EgressPolicy::Broker(OutboundBroker {
@@ -7562,7 +8680,7 @@ fn op_loader_load(
         Err(error) => return loader_throw(scope, &format!("worker loader: {error}")),
     };
     let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
-    let id = match admit_loaded_worker(owner, state) {
+    let id = match admit_loaded_worker(owner, state, in_guest(scope)) {
         Ok(id) => id,
         Err(error) => return loader_throw(scope, &error),
     };
@@ -7593,21 +8711,27 @@ fn op_loader_load(
         .with_tail_reporting(tail_reporting)
         .with_loader_env(loader_env),
     );
-    handle.spawn(async move {
-        let state = match tokio::task::spawn_blocking(move || Worker::load_config(config)).await {
-            Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
+    let drained = loaded_worker_drain(scope);
+    handle.spawn(guest_activity::track(async move {
+        let _drained = drained;
+        let state = match tokio::task::spawn_blocking(guest_activity::blocking(move || {
+            Worker::load_config(config)
+        }))
+        .await
+        {
+            Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::loaded_worker(worker)),
             Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
             Err(error) => LoaderState::Failed(Arc::from(format!(
                 "worker loader: load task failed: {error}"
             ))),
         };
         loaded.send_replace(state);
-    });
+    }));
     rv.set(v8::Number::new(scope, id as f64).into());
 }
 
 /// `__loader_fetch(id, url, method, body, headersJson, streamId, entrypoint,
-/// propsSc, limitsJson, tailReporting)` -> Promise<json> or
+/// propsSc, limitsJson, tailReporting, cancellable)` -> Promise<json> or
 /// [Promise<json>, Promise<json>].
 /// The loaded-worker analog of `__svc_call`: it encodes the response the same
 /// way and can return a separate report after the invocation finishes.
@@ -7663,10 +8787,29 @@ fn op_loader_fetch(
                     &format!(
                         "worker loader: the request headers are not a name/value list: {error}"
                     ),
-                )
+                );
             }
         };
     let want_tail_report = args.get(9).boolean_value(scope);
+    // The caller's AbortSignal cancels through the registry that
+    // `__do_call_cancel` already reads, as a service-binding call does. Only a
+    // call with a signal registers, because nothing else can name the id.
+    let cancellable = args.get(10).boolean_value(scope);
+    let (cancel_id, cancel, cancel_guard) = if cancellable {
+        let request_id = next_do_request_id();
+        let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+        do_call_cancels()
+            .lock()
+            .unwrap()
+            .insert(request_id, cancel_sender);
+        (
+            Some(request_id),
+            Some(cancel_receiver),
+            Some(DoCallCancelGuard::new(request_id)),
+        )
+    } else {
+        (None, None, None)
+    };
     let (tail_report, tail_receive) = if want_tail_report {
         let (send, receive) = tokio::sync::oneshot::channel();
         (Some(send), Some(receive))
@@ -7685,9 +8828,17 @@ fn op_loader_fetch(
         .unwrap()
         .get(&id)
         .map(|entry| entry.state.clone());
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
+    // A guest cannot sample trusted SQLite; the stateless child has no storage
+    // or egress, and its result returns into this event, which the host gates.
+    let gate = if in_guest(scope) {
+        EgressGate::NoCell
+    } else {
+        egress_gate_request(&event_context(scope), celld_logic::Channel::Service)
+    };
     let stream_service = http_stream_service();
-    let async_id = asyncrt::enqueue(async move {
+    let drained = loaded_worker_drain(scope);
+    let async_id = asyncrt::enqueue(guest_activity::track(async move {
+        let mut cancel_guard = cancel_guard;
         // The child's own `IoContext` has an empty egress stack, so nothing
         // inside it gates what it sends onward. Holding the call until the
         // caller's writes are proven makes every effect of the loaded worker
@@ -7705,29 +8856,47 @@ fn op_loader_fetch(
             body,
             headers,
             // A loaded Worker receives an incoming request like a service
-            // target does. The id selects the stream-aware construction path
-            // and gives an abandoned request a lifecycle owner.
-            request_id: Some(next_request_id()),
+            // target does. The lifetime below supplies the id, which selects
+            // the stream-aware construction path and gives an abandoned
+            // request a lifecycle owner.
+            request_id: None,
             tail_report,
             reply,
         };
-        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
-        match receive.await {
-            Ok(Ok(response)) => {
-                // The response proves that the loaded Worker installed its
-                // request context. That context owns an unread body tail
-                // through its waitUntil work.
-                body_guard.disarm();
-                encode_http_response(response, false, &stream_service)
+        // Without this shared lifetime, a caller's abort rejected only the
+        // caller's promise and the child ran to completion with a live
+        // `request.signal` (denoland/celld#257).
+        let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
+        let driver = cancellation.clone().drive_fetch_job(slot, job);
+        let driving = tokio::spawn(guest_activity::track(async move {
+            let _drained = drained;
+            driver.await;
+        }));
+        let response = async {
+            match receive.await {
+                Ok(response) => response,
+                Err(_) => Err(match driving.await {
+                    Err(error) => anyhow::anyhow!("loaded worker task died: {error}"),
+                    Ok(()) => anyhow::anyhow!("loaded worker dropped response"),
+                }),
             }
-            Ok(Err(error)) => Err(format!("{error}")),
-            Err(_) => match driving.await {
-                Err(error) => Err(format!("loaded worker task died: {error}")),
-                Ok(()) => Err("loaded worker dropped response".to_string()),
-            },
+        };
+        let response =
+            crate::runtime::receive_service_fetch_response(response, cancellation, cancel).await;
+        if let Some(cancel_guard) = cancel_guard.as_mut() {
+            cancel_guard.disarm();
         }
-    });
+        let response = response.map_err(|error| format!("{error}"))?;
+        // The response proves that the loaded Worker installed its request
+        // context. That context owns an unread body tail through its
+        // waitUntil work.
+        body_guard.disarm();
+        encode_http_response(response, false, &stream_service)
+    }));
     let response = promise_for(scope, async_id);
+    if let Some(request_id) = cancel_id {
+        attach_cancel_id(scope, response, request_id);
+    }
     let Some(tail_receive) = tail_receive else {
         rv.set(response);
         return;
@@ -7740,6 +8909,23 @@ fn op_loader_fetch(
     let report = promise_for(scope, report_id);
     let pair = v8::Array::new_with_elements(scope, &[response, report]);
     rv.set(pair.into());
+}
+
+/// Keep the originating guest event alive until a loaded descendant drains.
+/// The op is attributed synchronously; its sender moves into the actual driver.
+fn loaded_worker_drain(scope: &mut v8::PinScope) -> Option<tokio::sync::oneshot::Sender<()>> {
+    // Stateless drivers need no CPED token; module defaults have no driver.
+    if !guest_activity::enabled()
+        || (operation_continuation_id(scope).is_none() && !event_context(scope).has_event_driver())
+    {
+        return None;
+    }
+    let (drained, receive) = tokio::sync::oneshot::channel();
+    asyncrt::enqueue_io_context(async move {
+        let _ = receive.await;
+        Ok::<String, String>(String::new())
+    });
+    Some(drained)
 }
 
 /// `__loader_rpc(id, entrypoint, method, argsSc, propsSc, limitsJson)` ->
@@ -7773,8 +8959,13 @@ fn op_loader_rpc(
         .unwrap()
         .get(&id)
         .map(|entry| entry.state.clone());
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
-    let async_id = asyncrt::enqueue(async move {
+    let gate = if in_guest(scope) {
+        EgressGate::NoCell
+    } else {
+        egress_gate_request(&event_context(scope), celld_logic::Channel::Service)
+    };
+    let drained = loaded_worker_drain(scope);
+    let async_id = asyncrt::enqueue(guest_activity::track(async move {
         // The same rule as `op_loader_fetch`: the call carries cell state.
         await_egress_gate(gate).await?;
         let state = loaded.ok_or_else(|| "worker loader: unknown worker".to_string())?;
@@ -7790,7 +8981,11 @@ fn op_loader_rpc(
             invocation_limits,
             reply,
         };
-        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        let driver = crate::runtime::drive(slot, job, None);
+        let driving = tokio::spawn(guest_activity::track(async move {
+            let _drained = drained;
+            driver.await;
+        }));
         match receive.await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(error)) => Err(format!("{error}")),
@@ -7799,11 +8994,11 @@ fn op_loader_rpc(
                 Ok(()) => Err("loaded worker dropped RPC result".to_string()),
             },
         }
-    });
+    }));
     rv.set(promise_for(scope, async_id));
 }
 
-fn facet_scope(class_name: &str, parent_scope: &str, owner: &str, name: &str) -> String {
+pub(crate) fn facet_scope(class_name: &str, parent_scope: &str, owner: &str, name: &str) -> String {
     use sha2::Digest as _;
     let mut digest = sha2::Sha256::new();
     digest.update(parent_scope.as_bytes());
@@ -7823,22 +9018,26 @@ async fn open_facet_file(
 ) -> Result<(std::path::PathBuf, bool), String> {
     let mut names = parent.facet_path.clone();
     names.push(name.to_string());
+    match request_facet_file(&parent.root_scope, parent.epoch, names.clone()).await? {
+        Some(file) => Ok(file),
+        None => Ok(facet_file_beside_root(parent, &names)),
+    }
+}
+
+/// Ask the host loop to activate the stream of the facet at `names` below
+/// `root`. `None` when no host loop runs a replicator.
+pub(crate) async fn request_facet_file(
+    root: &str,
+    epoch: u64,
+    names: Vec<String>,
+) -> Result<Option<(std::path::PathBuf, bool)>, String> {
     let Some(sender) = FACET_TX.get() else {
-        // No host loop runs the replicator, so the file sits beside the
-        // root's database and is named after it, as workerd names a facet
-        // `<id>.<facet>.sqlite`.
-        let stream = crate::engine_api::facet_cell(&parent.root_scope, &names);
-        let facet = stream[parent.root_scope.len()..]
-            .trim_start_matches('/')
-            .replace('/', "-");
-        let root = std::path::Path::new(&parent.root_path);
-        let file = root.file_name().unwrap().to_string_lossy();
-        return Ok((root.with_file_name(format!("{file}.{facet}.sqlite")), false));
+        return Ok(None);
     };
     let (reply, receive) = tokio::sync::oneshot::channel();
     let request = FacetReq::Open {
-        root: parent.root_scope.clone(),
-        epoch: parent.epoch,
+        root: root.to_string(),
+        epoch,
         names,
         reply,
     };
@@ -7848,7 +9047,65 @@ async fn open_facet_file(
     receive
         .await
         .map_err(|_| "the facet open was dropped".to_string())?
+        .map(Some)
         .map_err(|error| format!("open the facet database: {error:#}"))
+}
+
+/// The file of a facet when no host loop runs the replicator: beside the
+/// root's database and named after it, as workerd names a facet
+/// `<id>.<facet>.sqlite`.
+pub(crate) fn facet_file_beside_root(
+    parent: &storage::StorageIdentity,
+    names: &[String],
+) -> (std::path::PathBuf, bool) {
+    let stream = crate::engine_api::facet_cell(&parent.root_scope, names);
+    let facet = stream[parent.root_scope.len()..]
+        .trim_start_matches('/')
+        .replace('/', "-");
+    let root = std::path::Path::new(&parent.root_path);
+    let file = root.file_name().unwrap().to_string_lossy();
+    (root.with_file_name(format!("{file}.{facet}.sqlite")), false)
+}
+
+/// Whether a host loop replicates the streams of facets.
+pub(crate) fn facet_streams_replicated() -> bool {
+    FACET_TX.get().is_some()
+}
+
+/// Ask the host loop to delete the stream of the facet at `names` below
+/// `root` and every stream below it. Without a host loop the files beside the
+/// root are the caller's to remove (`remove_facet_file`).
+pub(crate) async fn request_facet_delete(
+    root: &str,
+    epoch: u64,
+    names: Vec<String>,
+) -> Result<(), String> {
+    let Some(sender) = FACET_TX.get() else {
+        return Ok(());
+    };
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let request = FacetReq::Delete {
+        root: root.to_string(),
+        epoch,
+        names,
+        reply,
+    };
+    sender
+        .send(request)
+        .map_err(|_| "the facet channel closed".to_string())?;
+    receive
+        .await
+        .map_err(|_| "the facet delete was dropped".to_string())?
+        .map_err(|error| format!("delete facet storage: {error:#}"))
+}
+
+/// Remove a facet database kept beside its root's (see `facet_file_beside_root`).
+pub(crate) fn remove_facet_file(path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.to_path_buf().into_os_string();
+        file.push(suffix);
+        let _ = asyncrt::fs().remove_file(std::path::Path::new(&file));
+    }
 }
 
 struct FacetStart {
@@ -7865,11 +9122,55 @@ struct FacetStart {
 struct LoadedFacet {
     slot: Arc<crate::pool::Slot>,
     scope: String,
+    /// The cell whose database holds the facet's, which owns the facet.
+    root: String,
     stream: String,
     epoch: u64,
+    /// See `storage::facet_opening`.
+    opening: u64,
 }
 
 impl LoadedFacet {
+    /// Route the socket of a facet's upgrade through the facet's root.
+    ///
+    /// Recorded here, where the host knows which facet answered, because the
+    /// response's target names only the facet's scope. A target that the
+    /// facet did not accept keeps its own route.
+    fn attach_websocket(&self, response: &HttpResponse) {
+        if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
+            ws_attach_facet(
+                target.id,
+                &self.scope,
+                FacetSocket {
+                    root: self.root.clone(),
+                    stream: self.stream.clone(),
+                    epoch: self.epoch,
+                    opening: self.opening,
+                },
+            );
+        }
+    }
+
+    /// Prove the facet's stream before its response leaves, and release a
+    /// socket that the facet accepted for a response that fails this proof.
+    ///
+    /// The response carries the only reference the host has to that socket.
+    /// A dropped response would keep the registration and its regular-socket
+    /// count for the life of the process. Only the proof is covered: the
+    /// later encode fails only when the stream service has closed, and the
+    /// facet's own response read fails first on that service.
+    ///
+    /// Takes the socket's id rather than the response: a response with a
+    /// body stream is not `Sync`, so a borrow of it across the proof would
+    /// make the op's future not `Send`.
+    async fn gate_response(&self, socket: Option<u64>) -> Result<(), String> {
+        let gated = self.gate_reply().await;
+        if let (Err(_), Some(id)) = (&gated, socket) {
+            ws_release_unanswered(id, &self.scope);
+        }
+        gated
+    }
+
     /// A facet's reply leaves as workerd's facet output gate lets it: after
     /// every write the facet committed is durable on its own stream. That
     /// covers an earlier call's write this reply can reveal as well as the
@@ -7914,10 +9215,21 @@ impl FacetHost {
             Self::Own(slot) => Ok(slot),
         }
     }
+
+    /// Whether the facet runs in a loaded Worker's isolate, which the root's
+    /// give-back must close and which `ROOT_FACETS` records. A facet of a
+    /// loaded Worker's own class runs in that Worker's isolate too.
+    fn is_loaded_worker(&self) -> bool {
+        match self {
+            Self::Loaded(_) => true,
+            Self::Own(slot) => slot.is_loaded_worker(),
+        }
+    }
 }
 
 /// The facets that each root runs in loaded Workers' isolates, by the root's
-/// cell and epoch.
+/// cell and epoch. A facet of a loaded Worker's own class counts, because it
+/// runs in that Worker's isolate.
 ///
 /// A loaded Worker can outlive a root through another stub or until garbage
 /// collection. Neither lifetime tells the loaded isolate when a root stops,
@@ -7928,9 +9240,10 @@ impl FacetHost {
 /// state. The adoption turn records each facet here, and the root's
 /// give-back closes them.
 ///
-/// A facet of the root's own class is not recorded: `finish_cell_adoption`
-/// closes it in the root's give-back turn, and its slot can be freed while a
-/// reference is held, so a later turn on it would panic.
+/// A facet that runs in the root's own isolate is not recorded:
+/// `finish_cell_adoption` closes it in the root's give-back turn, and its
+/// slot can be freed while a reference is held, so a later turn on it would
+/// panic.
 static ROOT_FACETS: OnceLock<Mutex<HashMap<(String, u64), RootFacets>>> = OnceLock::new();
 
 fn root_facets() -> std::sync::MutexGuard<'static, HashMap<(String, u64), RootFacets>> {
@@ -7951,7 +9264,16 @@ struct RootFacets {
     stopped: bool,
     /// Each slot keeps its loaded isolate alive until the release closes
     /// the facet in it.
-    open: Vec<(Arc<crate::pool::Slot>, String)>,
+    open: Vec<RecordedFacet>,
+}
+
+/// A facet that a root runs in a loaded Worker's isolate.
+struct RecordedFacet {
+    slot: Arc<crate::pool::Slot>,
+    scope: String,
+    /// The facet names from the root down to this facet, which find the
+    /// facets below an aborted one.
+    path: Vec<String>,
 }
 
 /// One facet call of a root, from its start until its adoption turn.
@@ -7974,7 +9296,12 @@ impl PendingFacet {
     /// Record the facet before its adoption. Call inside the adoption turn:
     /// a release that takes the record queues its close behind this turn on
     /// the same slot, and a release that came first makes this refuse.
-    fn record(&self, slot: &Arc<crate::pool::Slot>, scope: &str) -> Result<(), String> {
+    fn record(
+        &self,
+        slot: &Arc<crate::pool::Slot>,
+        scope: &str,
+        path: &[String],
+    ) -> Result<(), String> {
         let mut roots = root_facets();
         let entry = roots
             .get_mut(&self.key)
@@ -7985,9 +9312,13 @@ impl PendingFacet {
         if !entry
             .open
             .iter()
-            .any(|(open, name)| Arc::ptr_eq(open, slot) && name == scope)
+            .any(|open| Arc::ptr_eq(&open.slot, slot) && open.scope == scope)
         {
-            entry.open.push((slot.clone(), scope.to_string()));
+            entry.open.push(RecordedFacet {
+                slot: slot.clone(),
+                scope: scope.to_string(),
+                path: path.to_vec(),
+            });
         }
         Ok(())
     }
@@ -8043,11 +9374,55 @@ pub(crate) async fn release_root_facets(root: &str, epoch: u64, release: RootRel
         open
     };
     // A nested facet records after its parent, so it closes first.
-    for (slot, scope) in open.into_iter().rev() {
+    for RecordedFacet { slot, scope, .. } in open.into_iter().rev() {
         if let Err(error) = slot.turn(|worker| worker.own_cell(&scope, None)).await {
             tracing::warn!(root, epoch, facet = %scope, %error, "a facet did not close with its root");
         }
+        ws_close_facet(&scope, "the parent Durable Object was released");
     }
+}
+
+/// Take the records of the facets below the facet at `path`, deepest first.
+/// Their isolates can differ from the aborted facet's: a child of a loaded
+/// class runs in its own loaded Worker.
+fn take_recorded_facets_below(root: &str, epoch: u64, path: &[String]) -> Vec<RecordedFacet> {
+    let key = (root.to_string(), epoch);
+    let mut roots = root_facets();
+    let Some(entry) = roots.get_mut(&key) else {
+        return Vec::new();
+    };
+    let (mut below, kept) = std::mem::take(&mut entry.open)
+        .into_iter()
+        .partition::<Vec<_>, _>(|open| open.path.len() > path.len() && open.path.starts_with(path));
+    entry.open = kept;
+    if entry.pending == 0 && entry.open.is_empty() {
+        roots.remove(&key);
+    }
+    below.sort_by_key(|open| std::cmp::Reverse(open.path.len()));
+    below
+}
+
+/// The loaded isolate that runs the facet `scope` of `root` at `epoch`, while
+/// the root's give-back has not closed it. `None` also answers for a facet in
+/// the root's own isolate, which the root's residency pins instead.
+pub(crate) fn recorded_facet_slot(
+    root: &str,
+    epoch: u64,
+    scope: &str,
+) -> Option<Arc<crate::pool::Slot>> {
+    root_facets()
+        .get(&(root.to_string(), epoch))?
+        .open
+        .iter()
+        .find(|open| open.scope == scope)
+        .map(|open| open.slot.clone())
+}
+
+/// Prove every write that a facet committed on its own stream.
+pub(crate) async fn prove_facet_stream(stream: String, epoch: u64) -> anyhow::Result<()> {
+    prove_facet(stream, epoch)
+        .await
+        .map_err(|refusal| anyhow!("facet output: {refusal}"))
 }
 
 /// Drop an aborted facet's record, which its abort closed already.
@@ -8057,7 +9432,7 @@ fn forget_root_facet(root: &str, epoch: u64, slot: &Arc<crate::pool::Slot>, scop
     if let Some(entry) = roots.get_mut(&key) {
         entry
             .open
-            .retain(|(open, name)| !(Arc::ptr_eq(open, slot) && name == scope));
+            .retain(|open| !(Arc::ptr_eq(&open.slot, slot) && open.scope == scope));
         if entry.pending == 0 && entry.open.is_empty() {
             roots.remove(&key);
         }
@@ -8065,12 +9440,13 @@ fn forget_root_facet(root: &str, epoch: u64, slot: &Arc<crate::pool::Slot>, scop
 }
 
 async fn prepare_facet(host: FacetHost, start: FacetStart) -> Result<LoadedFacet, String> {
-    let pending = match host {
-        FacetHost::Loaded(_) => Some(PendingFacet::begin(
+    let pending = if host.is_loaded_worker() {
+        Some(PendingFacet::begin(
             &start.parent.root_scope,
             start.parent.epoch,
-        )?),
-        FacetHost::Own(_) => None,
+        )?)
+    } else {
+        None
     };
     let slot = host.slot().await?;
     let file = open_facet_file(&start.parent, &start.name).await?;
@@ -8084,29 +9460,83 @@ async fn prepare_facet(host: FacetHost, start: FacetStart) -> Result<LoadedFacet
         &start.owner,
         &start.name,
     );
-    slot.turn(|worker| {
-        if let Some(pending) = &pending {
-            pending.record(&slot, &scope)?;
-        }
-        worker
-            .own_embedded_cell(
-                &scope,
-                &start.parent,
-                &start.name,
-                start.id_sc,
-                start.props_sc,
-                file,
-            )
-            .map_err(|error| format!("{error}"))
-    })
-    .await
-    .map_err(|error| format!("worker loader facet: {error}"))?;
+    let opening = slot
+        .turn(|worker| {
+            if let Some(pending) = &pending {
+                pending.record(&slot, &scope, &names)?;
+            }
+            worker
+                .own_embedded_cell(
+                    &scope,
+                    &start.parent,
+                    &start.name,
+                    start.id_sc,
+                    start.props_sc,
+                    file,
+                )
+                .map_err(|error| format!("{error}"))
+        })
+        .await
+        .map_err(|error| format!("worker loader facet: {error}"))?;
     Ok(LoadedFacet {
         slot,
         scope,
+        root: start.parent.root_scope,
         stream,
         epoch,
+        opening,
     })
+}
+
+/// One facet event opened through the root's live session. The host chose the
+/// facet's scope and storage grant; this only carries its code and props.
+#[cfg(unix)]
+struct GuestFacet {
+    loaded: Option<tokio::sync::watch::Receiver<LoaderState>>,
+    facet: guest_storage::FacetGrant,
+    id_sc: Vec<u8>,
+    props_sc: Vec<u8>,
+}
+
+#[cfg(unix)]
+fn guest_facet_open(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments,
+) -> Result<GuestFacet, String> {
+    let loader = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let class_name = args.get(1).to_rust_string_lossy(scope);
+    let parent_scope = args.get(2).to_rust_string_lossy(scope);
+    let owner = args.get(3).to_rust_string_lossy(scope);
+    let name = args.get(4).to_rust_string_lossy(scope);
+    let id_sc = view_bytes(args.get(5)).ok_or("facet identity is not a typed array")?;
+    let props_sc = loader_props_bytes(args.get(6))?;
+    let facet = guest_storage::facet_open(scope, &parent_scope, &class_name, &owner, &name)?;
+    let loaded = loader_registry()
+        .lock()
+        .unwrap()
+        .get(&loader)
+        .map(|entry| entry.state.clone());
+    Ok(GuestFacet {
+        loaded,
+        facet,
+        id_sc,
+        props_sc,
+    })
+}
+
+#[cfg(unix)]
+async fn guest_facet_slot(
+    call: GuestFacet,
+) -> Result<(Arc<crate::pool::Slot>, guest_storage::FacetGrant), String> {
+    let loaded = call
+        .loaded
+        .ok_or_else(|| "worker loader: unknown worker".to_string())?;
+    let slot = loaded_worker_slot(loaded).await?;
+    let (scope, depth) = (call.facet.scope.clone(), call.facet.depth);
+    slot.turn(|worker| worker.own_guest_facet(&scope, call.id_sc, call.props_sc, depth))
+        .await
+        .map_err(|error| format!("worker loader facet: {error}"))?;
+    Ok((slot, call.facet))
 }
 
 fn op_facet_rpc(
@@ -8114,6 +9544,40 @@ fn op_facet_rpc(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    #[cfg(unix)]
+    if in_guest(scope) {
+        let call = match guest_facet_open(scope, &args) {
+            Ok(call) => call,
+            Err(error) => return loader_throw(scope, &error),
+        };
+        let method = args.get(7).to_rust_string_lossy(scope);
+        let call_args = view_bytes(args.get(8)).unwrap_or_default();
+        let async_id = asyncrt::enqueue(guest_activity::track(async move {
+            let (slot, facet) = guest_facet_slot(call).await?;
+            let (reply, inner) = tokio::sync::oneshot::channel();
+            let job = CellJob::Rpc {
+                request_id: None,
+                scope: facet.scope.clone(),
+                name: None,
+                method,
+                args: RpcData::V8(call_args.into()),
+                reply,
+            };
+            let (receive, mut driver) = guest_storage::spawn_facet(facet, slot, job, inner);
+            let outcome = receive.await;
+            driver.detach();
+            match outcome {
+                Ok(Ok(outcome)) => match outcome.data {
+                    RpcData::V8(bytes) => Ok(Vec::<u8>::from(bytes)),
+                    RpcData::Json(_) => Err("facet RPC answered JSON".to_string()),
+                },
+                Ok(Err(error)) => Err(format!("{error}")),
+                Err(_) => Err("facet dropped RPC result".to_string()),
+            }
+        }));
+        rv.set(promise_for(scope, async_id));
+        return;
+    }
     let loader = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let class_name = args.get(1).to_rust_string_lossy(scope);
     let parent_scope = args.get(2).to_rust_string_lossy(scope);
@@ -8134,13 +9598,13 @@ fn op_facet_rpc(
             return loader_throw(
                 scope,
                 "facets are available only inside a Durable Object event",
-            )
+            );
         }
         Err(error) => return loader_throw(scope, &error.to_string()),
     };
     let host = FacetHost::of(loader);
     let trace = current_trace_context(scope);
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue(guest_activity::track(async move {
         let facet = prepare_facet(
             host?,
             FacetStart {
@@ -8163,12 +9627,12 @@ fn op_facet_rpc(
             args: RpcData::V8(call_args.into()),
             reply,
         };
-        let driving = tokio::spawn(crate::runtime::drive_cell(
+        let driving = tokio::spawn(guest_activity::track(crate::runtime::drive_cell(
             facet.slot.affiliate(),
             job,
             None,
             trace,
-        ));
+        )));
         let replied = receive.await;
         if replied.is_ok() {
             facet.gate_reply().await?;
@@ -8187,7 +9651,7 @@ fn op_facet_rpc(
                 Ok(()) => Err("facet dropped RPC result".to_string()),
             },
         }
-    });
+    }));
     rv.set(promise_for(scope, async_id));
 }
 
@@ -8231,20 +9695,68 @@ fn op_facet_fetch(
         },
         None => RequestBodyGuard::of(&body),
     };
+    #[cfg(unix)]
+    if in_guest(scope) {
+        let facet =
+            match guest_storage::facet_open(scope, &parent_scope, &class_name, &owner, &name) {
+                Ok(facet) => facet,
+                Err(error) => return loader_throw(scope, &error),
+            };
+        let loaded = loader_registry()
+            .lock()
+            .unwrap()
+            .get(&loader)
+            .map(|entry| entry.state.clone());
+        let call = GuestFacet {
+            loaded,
+            facet,
+            id_sc,
+            props_sc,
+        };
+        let stream_service = http_stream_service();
+        let async_id = asyncrt::enqueue(guest_activity::track(async move {
+            let (slot, facet) = guest_facet_slot(call).await?;
+            let (reply, inner) = tokio::sync::oneshot::channel();
+            let job = CellJob::Fetch {
+                request_id: None,
+                scope: facet.scope.clone(),
+                name: None,
+                url,
+                method,
+                body,
+                headers,
+                reply,
+                order: None,
+            };
+            let (receive, mut driver) = guest_storage::spawn_facet(facet, slot, job, inner);
+            let outcome = receive.await;
+            driver.detach();
+            match outcome {
+                Ok(Ok(response)) => {
+                    body_guard.disarm();
+                    encode_http_response(response, false, &stream_service)
+                }
+                Ok(Err(error)) => Err(format!("{error}")),
+                Err(_) => Err("facet dropped fetch response".to_string()),
+            }
+        }));
+        rv.set(promise_for(scope, async_id));
+        return;
+    }
     let parent = match storage::storage_identity(&parent_scope) {
         Ok(Some(parent)) => parent,
         Ok(None) => {
             return loader_throw(
                 scope,
                 "facets are available only inside a Durable Object event",
-            )
+            );
         }
         Err(error) => return loader_throw(scope, &error.to_string()),
     };
     let host = FacetHost::of(loader);
     let trace = current_trace_context(scope);
     let stream_service = http_stream_service();
-    let async_id = asyncrt::enqueue(async move {
+    let async_id = asyncrt::enqueue(guest_activity::track(async move {
         let facet = prepare_facet(
             host?,
             FacetStart {
@@ -8270,21 +9782,26 @@ fn op_facet_fetch(
             reply,
             order: None,
         };
-        let driving = tokio::spawn(crate::runtime::drive_cell(
+        let driving = tokio::spawn(guest_activity::track(crate::runtime::drive_cell(
             facet.slot.affiliate(),
             job,
             None,
             trace,
-        ));
+        )));
         let replied = receive.await;
-        if replied.is_ok() {
+        if let Ok(Err(_)) = &replied {
             facet.gate_reply().await?;
         }
         match replied {
             Ok(Ok(response)) => {
                 body_guard.disarm();
-                facet.gate_reply().await?;
-                encode_http_response(response, false, &stream_service)
+                let socket = match &response.websocket {
+                    Some(HttpResponseWebSocket::Cell(target)) => Some(target.id),
+                    _ => None,
+                };
+                facet.gate_response(socket).await?;
+                facet.attach_websocket(&response);
+                encode_http_response(response, true, &stream_service)
             }
             Ok(Err(error)) => Err(format!("{error}")),
             Err(_) => match driving.await {
@@ -8292,7 +9809,7 @@ fn op_facet_fetch(
                 Ok(()) => Err("facet dropped fetch response".to_string()),
             },
         }
-    });
+    }));
     rv.set(promise_for(scope, async_id));
 }
 
@@ -8306,26 +9823,65 @@ fn op_facet_abort(
     let parent_scope = args.get(2).to_rust_string_lossy(scope);
     let owner = args.get(3).to_rust_string_lossy(scope);
     let name = args.get(4).to_rust_string_lossy(scope);
+    // A guest closes the host's facet sessions and cell. A released object's
+    // lifecycle channel refuses that, and its sessions are already retired.
+    #[cfg(unix)]
+    if in_guest(scope) {
+        guest_storage::facet_abort(scope, &parent_scope, &class_name, &owner, &name);
+    }
     let host = FacetHost::of(loader);
     let facet_scope = facet_scope(&class_name, &parent_scope, &owner, &name);
-    // The root that recorded the facet. A parent without storage has no
-    // record to drop.
+    // The root that recorded the facet, and the facet's place below it. A
+    // parent without storage has no record to drop and no facet below.
     let root = storage::storage_identity(&parent_scope)
         .ok()
         .flatten()
-        .map(|parent| (parent.root_scope, parent.epoch));
-    let async_id = asyncrt::enqueue(async move {
+        .map(|parent| {
+            let mut path = parent.facet_path;
+            path.push(name.clone());
+            (parent.root_scope, parent.epoch, path)
+        });
+    let async_id = asyncrt::enqueue(guest_activity::track(async move {
         let host = host?;
-        let loaded = matches!(host, FacetHost::Loaded(_));
+        let recorded = host.is_loaded_worker();
         let slot = host.slot().await?;
-        slot.turn(|worker| worker.own_cell(&facet_scope, None))
-            .await
-            .map_err(|error| format!("abort facet: {error}"))?;
-        if let (true, Some((root, epoch))) = (loaded, root) {
-            forget_root_facet(&root, epoch, &slot, &facet_scope);
+        const ABORTED: &str = "the Durable Object facet was aborted";
+        // A facet below this one can run in another loaded Worker, which
+        // only its root's record names.
+        let below = match &root {
+            Some((root, epoch, path)) => take_recorded_facets_below(root, *epoch, path),
+            None => Vec::new(),
+        };
+        for RecordedFacet { slot, scope, .. } in below {
+            if let Err(error) = slot.turn(|worker| worker.own_cell(&scope, None)).await {
+                tracing::warn!(facet = %scope, %error, "a facet did not close with its parent");
+            }
+            ws_close_facet(&scope, ABORTED);
         }
+        let (closed, outcome) = match &root {
+            Some((root, _, path)) => {
+                slot.turn(|worker| worker.close_facet_tree(&facet_scope, root, path))
+                    .await
+            }
+            None => {
+                let outcome = slot
+                    .turn(|worker| worker.own_cell(&facet_scope, None))
+                    .await
+                    .map(|_| ());
+                (vec![facet_scope.clone()], outcome)
+            }
+        };
+        // Close the sockets whether or not the close turn succeeded: no
+        // later event can reach a facet that its parent aborted.
+        for scope in &closed {
+            ws_close_facet(scope, ABORTED);
+        }
+        if let (true, Some((root, epoch, _))) = (recorded, &root) {
+            forget_root_facet(root, *epoch, &slot, &facet_scope);
+        }
+        outcome.map_err(|error| format!("abort facet: {error}"))?;
         Ok(Vec::new())
-    });
+    }));
     rv.set(promise_for(scope, async_id));
 }
 
@@ -8336,13 +9892,20 @@ fn op_facet_delete(
 ) {
     let parent_scope = args.get(0).to_rust_string_lossy(scope);
     let name = args.get(1).to_rust_string_lossy(scope);
+    #[cfg(unix)]
+    if in_guest(scope) {
+        if let Err(error) = guest_storage::facet_delete(scope, &parent_scope, &name) {
+            loader_throw(scope, &format!("delete facet storage: {error}"));
+        }
+        return;
+    }
     let parent = match storage::storage_identity(&parent_scope) {
         Ok(Some(parent)) => parent,
         Ok(None) => {
             return loader_throw(
                 scope,
                 "facets are available only inside a Durable Object event",
-            )
+            );
         }
         Err(error) => return loader_throw(scope, &error.to_string()),
     };
@@ -8352,29 +9915,11 @@ fn op_facet_delete(
     let mut names = parent.facet_path.clone();
     names.push(name);
     let async_id = asyncrt::enqueue(async move {
-        let Some(sender) = FACET_TX.get() else {
-            let (path, _) = open_facet_file(&parent, names.last().unwrap()).await?;
-            for suffix in ["", "-wal", "-shm"] {
-                let mut file = path.clone().into_os_string();
-                file.push(suffix);
-                let _ = asyncrt::fs().remove_file(std::path::Path::new(&file));
-            }
+        if FACET_TX.get().is_none() {
+            remove_facet_file(&facet_file_beside_root(&parent, &names).0);
             return Ok(Vec::new());
-        };
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        let request = FacetReq::Delete {
-            root: parent.root_scope,
-            epoch: parent.epoch,
-            names,
-            reply,
-        };
-        sender
-            .send(request)
-            .map_err(|_| "the facet channel closed".to_string())?;
-        receive
-            .await
-            .map_err(|_| "the facet delete was dropped".to_string())?
-            .map_err(|error| format!("delete facet storage: {error:#}"))?;
+        }
+        request_facet_delete(&parent.root_scope, parent.epoch, names).await?;
         Ok(Vec::new())
     });
     rv.set(promise_for(scope, async_id));
@@ -8395,7 +9940,7 @@ fn op_loader_drop(
         // different isolate is entered on the same thread. Hand the final
         // reference to the host scheduler so destruction happens after this
         // turn has left V8.
-        asyncrt::op_handle().spawn(async move { drop(entry.state) });
+        asyncrt::op_handle().spawn(guest_activity::track(async move { drop(entry.state) }));
     }
 }
 
@@ -8450,9 +9995,29 @@ fn op_do_call_impl(
                     &format!(
                         "durable object: the request headers are not a name/value list: {error}"
                     ),
-                )
+                );
             }
         };
+    // A guest reaches objects only through the trusted host's namespace grants.
+    #[cfg(unix)]
+    if guest_storage::enabled(scope) {
+        let RequestBody::Bytes(body) = body else {
+            return loader_throw(
+                scope,
+                "durable object: guest request bodies must be buffered",
+            );
+        };
+        let request = celld_applications::invocation_wire::HttpRequest {
+            method,
+            url,
+            headers,
+            body: body.to_vec(),
+        };
+        return match guest_storage::object_call(scope, &cell, name, None, request) {
+            Ok(id) => rv.set(promise_for(scope, id)),
+            Err(error) => loader_throw(scope, &format!("durable object: {error}")),
+        };
+    }
     let body_guard = match body.stream_id() {
         Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
             Some(guard) => guard,
@@ -8489,6 +10054,7 @@ fn op_do_call_impl(
         reply: tx,
         order,
         parent: current_trace_context(scope),
+        guest: None,
     };
     let stream_service = http_stream_service();
     let id = asyncrt::enqueue(async move {
@@ -8525,6 +10091,18 @@ fn op_do_call_cancel(
 /// Allocate a process-wide signal identity. The structured-clone RPC envelope
 /// carries this identity between isolates, and the registry carries the one
 /// state transition that a snapshot cannot represent.
+fn op_rpc_signal_guest(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    #[cfg(unix)]
+    let guest = guest_storage::enabled(scope);
+    #[cfg(not(unix))]
+    let guest = false;
+    rv.set(v8::Boolean::new(scope, guest).into());
+}
+
 fn op_rpc_signal_new(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
@@ -8547,7 +10125,13 @@ fn op_rpc_signal_abort(
     let Some(signal) = parse_request_id(&args.get(0).to_rust_string_lossy(scope)) else {
         return;
     };
-    let reason = view_bytes(args.get(1)).unwrap_or_default();
+    rpc_signal_abort(signal, view_bytes(args.get(1)).unwrap_or_default());
+}
+
+/// The one state transition of a signal: record the reason and wake every
+/// subscriber. Idempotent, and the same entry point serves a host-relayed
+/// abort of a mirrored remote signal.
+pub(crate) fn rpc_signal_abort(signal: RequestId, reason: Vec<u8>) {
     let subscribers = {
         let mut signals = rpc_signals().lock().unwrap();
         let Some(state) = signals.get_mut(&signal) else {
@@ -8574,12 +10158,114 @@ fn op_rpc_signal_release(
     let Some(signal) = parse_request_id(&args.get(0).to_rust_string_lossy(scope)) else {
         return;
     };
+    rpc_signal_release(signal);
+}
+
+fn rpc_signal_release(signal: RequestId) {
     let state = rpc_signals().lock().unwrap().remove(&signal);
     if let Some(RpcSignalState::Live(subscribers)) = state {
         for subscriber in subscribers.into_values() {
             let _ = subscriber.send(None);
         }
     }
+}
+
+/// Signals a service caller declared for callee events, mirrored under the
+/// caller's ids with a count of the events that hold each.
+// ponytail: the first host-assigned owner wins a mirror, so a service already
+// trusted with a signal could race its true source to another callee and abort
+// it there; owner-qualified signal ids in the marker close this if it matters.
+static REMOTE_SIGNALS: OnceLock<std::sync::Mutex<HashMap<RequestId, (String, usize)>>> =
+    OnceLock::new();
+
+/// Mirror caller-declared signals as `Live` entries and return the ids this
+/// event now holds. An id that is already a local signal, or a mirror of
+/// another owner, is not held: the first source stays authoritative, so a
+/// relayed abort cannot touch it, nor can a receiver that merely saw the id.
+pub(crate) fn rpc_signal_declare_remote(owner: &str, ids: &[RequestId]) -> Vec<RequestId> {
+    let mut remote = REMOTE_SIGNALS.get_or_init(Default::default).lock().unwrap();
+    let mut signals = rpc_signals().lock().unwrap();
+    let mut held = Vec::new();
+    for id in ids {
+        if let Some((holder, count)) = remote.get_mut(id) {
+            if holder != owner {
+                continue;
+            }
+            *count += 1;
+        } else if signals.contains_key(id) {
+            continue;
+        } else {
+            remote.insert(*id, (owner.to_owned(), 1));
+            signals.insert(*id, RpcSignalState::Live(HashMap::new()));
+        }
+        held.push(*id);
+    }
+    held
+}
+
+/// Drop one event's hold on its mirrors. A mirror nobody holds is released
+/// exactly like a collected source: waiters resolve and never abort.
+pub(crate) fn rpc_signal_release_remote(ids: &[RequestId]) {
+    let mut remote = REMOTE_SIGNALS.get_or_init(Default::default).lock().unwrap();
+    for id in ids {
+        match remote.get_mut(id) {
+            Some((_, count)) if *count > 1 => *count -= 1,
+            Some(_) => {
+                remote.remove(id);
+                rpc_signal_release(*id);
+            }
+            None => {}
+        }
+    }
+}
+
+/// A signal subscription: `(subscription, immediate, receiver)`.
+type SignalSubscription = (
+    RequestId,
+    Option<Option<Vec<u8>>>,
+    tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
+);
+
+/// Subscribe to a signal: `(subscription, immediate, receiver)`, where
+/// `immediate` is the settled outcome (`Some(None)` = released).
+fn rpc_signal_subscribe(signal: RequestId) -> SignalSubscription {
+    let subscription = next_request_id();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let immediate = {
+        let mut signals = rpc_signals().lock().unwrap();
+        match signals.get_mut(&signal) {
+            Some(RpcSignalState::Live(subscribers)) => {
+                subscribers.insert(subscription, tx);
+                None
+            }
+            Some(RpcSignalState::Aborted(reason)) => Some(Some(reason.clone())),
+            None => Some(None),
+        }
+    };
+    (subscription, immediate, rx)
+}
+
+/// The abort reason of `signal`, or `None` once it is released.
+async fn rpc_signal_settle(
+    signal: RequestId,
+    subscription: RequestId,
+    immediate: Option<Option<Vec<u8>>>,
+    rx: tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
+) -> Option<Vec<u8>> {
+    let _guard = RpcSignalSubscriptionGuard {
+        signal,
+        subscription,
+    };
+    match immediate {
+        Some(reason) => reason,
+        None => rx.await.unwrap_or(None),
+    }
+}
+
+/// Resolves with the reason when `signal` aborts, `None` when it is released.
+pub(crate) async fn rpc_signal_watch(signal: RequestId) -> Option<Vec<u8>> {
+    let (subscription, immediate, rx) = rpc_signal_subscribe(signal);
+    rpc_signal_settle(signal, subscription, immediate, rx).await
 }
 
 fn op_rpc_signal_unsubscribe(
@@ -8626,33 +10312,15 @@ fn op_rpc_signal_wait(
     let Some(signal) = parse_request_id(&signal_text) else {
         return loader_throw(scope, "invalid RPC AbortSignal id");
     };
-    let subscription = next_request_id();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let immediate = {
-        let mut signals = rpc_signals().lock().unwrap();
-        match signals.get_mut(&signal) {
-            Some(RpcSignalState::Live(subscribers)) => {
-                subscribers.insert(subscription, tx);
-                None
-            }
-            Some(RpcSignalState::Aborted(reason)) => Some(Some(reason.clone())),
-            None => Some(None),
-        }
-    };
+    let (subscription, immediate, rx) = rpc_signal_subscribe(signal);
     // The subscription must receive aborts while the handler or `waitUntil`
     // work is live, but a listener alone is not pending application work. An
     // ordinary handler op pins every successful Durable Object event until
     // the source aborts, including events unrelated to the retained signal.
     let id = asyncrt::enqueue_unrefed(async move {
-        let _guard = RpcSignalSubscriptionGuard {
-            signal,
-            subscription,
-        };
-        let reason = match immediate {
-            Some(reason) => reason,
-            None => rx.await.unwrap_or(None),
-        };
-        Ok(reason.unwrap_or_default())
+        Ok(rpc_signal_settle(signal, subscription, immediate, rx)
+            .await
+            .unwrap_or_default())
     });
     let promise = promise_for(scope, id);
     if let Some(object) = promise.to_object(scope) {
@@ -8674,7 +10342,23 @@ fn op_rpc_call(
     let name_value = args.get(1);
     let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
     let method = args.get(2).to_rust_string_lossy(scope);
-    let args = RpcData::V8(view_bytes(args.get(3)).unwrap_or_default().into());
+    let args = view_bytes(args.get(3)).unwrap_or_default();
+    #[cfg(unix)]
+    if guest_storage::enabled(scope) {
+        // The request line is a placeholder: the host dispatches on the RPC
+        // method, never on a URL.
+        let request = celld_applications::invocation_wire::HttpRequest {
+            method: "POST".into(),
+            url: "http://object.invalid/".into(),
+            headers: vec![],
+            body: args,
+        };
+        return match guest_storage::object_call(scope, &cell, name, Some(method), request) {
+            Ok(id) => rv.set(promise_for(scope, id)),
+            Err(error) => loader_throw(scope, &format!("durable object: {error}")),
+        };
+    }
+    let args = RpcData::V8(args.into());
     let (tx, rx) = tokio::sync::oneshot::channel();
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
     let request = RpcCallReq {
@@ -8709,9 +10393,14 @@ fn op_fetch(
         return loader_throw(scope, &error);
     }
     let egress = actor_runtime_state(scope).egress.clone();
+    // A guest has no network device: the trusted host brokers its fetch.
+    #[cfg(unix)]
+    let guest = guest_storage::enabled(scope);
+    #[cfg(not(unix))]
+    let guest = false;
     // A loaded worker with globalOutbound: null has no ambient egress: it must
     // reach the world through `env` capabilities. Message matches workerd.
-    if egress == EgressPolicy::Deny {
+    if egress == EgressPolicy::Deny && !guest {
         return loader_throw(
             scope,
             "This worker is not permitted to access the internet via global \
@@ -8750,7 +10439,7 @@ fn op_fetch(
             return loader_throw(
                 scope,
                 &format!("fetch: the request headers are not a name/value list: {error}"),
-            )
+            );
         }
     };
     let redirect = args.get(4).to_rust_string_lossy(scope);
@@ -8771,6 +10460,15 @@ fn op_fetch(
     match redirect.as_str() {
         "follow" | "manual" | "error" => {}
         other => return loader_throw(scope, &format!("fetch: unknown redirect mode {other}")),
+    }
+    #[cfg(unix)]
+    if guest {
+        drop(body_guard);
+        match guest_storage::fetch(scope, method, url, headers, body, redirect) {
+            Ok(id) => rv.set(promise_for(scope, id)),
+            Err(error) => loader_throw(scope, &format!("fetch: {error}")),
+        }
+        return;
     }
     if let EgressPolicy::Broker(broker) = egress {
         let (request_id, cancel, cancel_guard) = if cancellable {
@@ -9016,9 +10714,34 @@ fn op_asset_fetch(
                 return loader_throw(
                     scope,
                     &format!("assets: the request headers are not a name/value list: {error}"),
-                )
+                );
             }
         };
+    if guest_storage::enabled(scope) {
+        // `script` is the handler's assets alias; the host resolves it against
+        // the pinned deployment's resource, never against guest input.
+        let request = celld_applications::invocation_wire::HttpRequest {
+            method,
+            url,
+            headers,
+            body: Vec::new(),
+        };
+        let response = guest_storage::resource_http_request(
+            scope,
+            script,
+            celld_applications::resource_wire::ResourceOperation::Assets {},
+            request,
+        );
+        let stream_service = http_stream_service();
+        let id = asyncrt::enqueue(async move {
+            let response = response?
+                .await
+                .map_err(|_| "assets guest operation was abandoned".to_string())??;
+            encode_http_response(response, false, &stream_service)
+        });
+        rv.set(promise_for(scope, id));
+        return;
+    }
     let generation = current_generation(scope);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sent = ASSET_CALL_TX.get().is_some_and(|sender| {
@@ -9052,7 +10775,7 @@ fn tee_http_stream(
     source: HttpTransferredStream,
 ) -> Result<(u64, u64), &'static str> {
     let (ids, pump) = prepare_http_stream_tee(service, source)?;
-    asyncrt::op_handle().spawn(pump);
+    asyncrt::op_handle().spawn(guest_activity::track(pump));
     Ok(ids)
 }
 
@@ -9157,7 +10880,15 @@ fn op_response_stream_write(
     // expiry still runs during the wait, so a proof that never lands ends the
     // body with an error rather than releasing the chunk, which is the
     // direction this gate exists to fail in.
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Response);
+    let context = event_context(scope);
+    // A guest writer feeds its bounded, VM-local response queue. It cannot
+    // sample trusted SQLite or authorize publication. The receiving host must
+    // take its own per-chunk output ticket before exposing these bytes.
+    let gate = if context.has_guest_storage() {
+        EgressGate::NoCell
+    } else {
+        egress_gate_request(&context, celld_logic::Channel::Response)
+    };
     let service = http_stream_service();
     let id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
@@ -9300,6 +11031,21 @@ fn op_gate_acquire(
     // The harness installs the driver before acquisition. A missing driver
     // is rejected above instead of transferring a stale block to its origin.
     let owner = owner_context.continuation_id();
+    #[cfg(unix)]
+    if guest_storage::enabled(scope) {
+        match guest_storage::critical_start(scope, &cell, event, &context, &owner_context) {
+            Ok(()) => {
+                let id = asyncrt::enqueue_io_context(async move { Ok(String::new()) });
+                let promise = promise_for(scope, id);
+                return_gate_acquisition(scope, rv, event, owner, promise);
+            }
+            Err(error) => {
+                let promise = rejected_promise(scope, &error);
+                return_gate_acquisition(scope, rv, event, None, promise);
+            }
+        }
+        return;
+    }
     // Queued until taken or refused, either way once: the guard counts the
     // event out when the future ends, however it ends.
     struct Queued {
@@ -9356,7 +11102,7 @@ fn op_gate_acquire(
         };
         Some(claim)
     };
-    let id = match acquire_cell_gate(&owner_context, &cell, event, owner, &mut origin) {
+    let id = match acquire_cell_gate(&owner_context, &cell, event, owner, &mut origin, None) {
         CellGateAcquisition::Acquired => {
             asyncrt::enqueue_io_context(async move { Ok(String::new()) })
         }
@@ -9387,13 +11133,13 @@ fn op_gate_acquire(
                         // fresh gate.
                         Ok(Err(failure)) => return Err(failure),
                         Err(_) => {
-                            return Err("cell stopped while waiting for its input gate".to_string())
+                            return Err("cell stopped while waiting for its input gate".to_string());
                         }
                     }
                     let Some(context) = context.upgrade() else {
                         return Err(RETIRED_INPUT_GATE.to_string());
                     };
-                    match acquire_cell_gate(&context, &cell, event, owner, &mut origin) {
+                    match acquire_cell_gate(&context, &cell, event, owner, &mut origin, None) {
                         CellGateAcquisition::Acquired => {
                             return Ok(String::new());
                         }
@@ -9436,6 +11182,14 @@ fn op_gate_wait(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    #[cfg(unix)]
+    if guest_storage::enabled(scope) {
+        rv.set(rejected_promise(
+            scope,
+            "guest stub input-gate wait bridge is not implemented",
+        ));
+        return;
+    }
     let id = asyncrt::enqueue(async move {
         loop {
             match cell_gate_wait(&cell) {
@@ -9444,7 +11198,7 @@ fn op_gate_wait(
                     Ok(Ok(())) => {}
                     Ok(Err(failure)) => return Err(failure),
                     Err(_) => {
-                        return Err("cell stopped while waiting for its input gate".to_string())
+                        return Err("cell stopped while waiting for its input gate".to_string());
                     }
                 },
             }
@@ -9484,6 +11238,17 @@ fn op_gate_release(
     let Some(context) = context else {
         return;
     };
+    #[cfg(unix)]
+    if guest_storage::enabled(scope) {
+        if let Err(error) =
+            guest_storage::critical_finish(scope, &cell, event, &context, outcome.is_err())
+        {
+            let message = v8::String::new(scope, &error).unwrap();
+            let exception = v8::Exception::error(scope, message);
+            scope.throw_exception(exception);
+        }
+        return;
+    }
     if !context.release_input_gate(&cell, event) {
         return;
     }
@@ -9524,6 +11289,16 @@ fn register_actor_name(
     let Some(name) = name else {
         return Ok(());
     };
+    #[cfg(unix)]
+    let guest_channel = guest_storage::channel(scope, actor_scope).map_err(anyhow::Error::msg)?;
+    #[cfg(unix)]
+    if let Some(channel) = &guest_channel {
+        let host_name = guest_storage::actor_name(scope, channel).map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            host_name.as_deref() == Some(name),
+            "actor name conflicts with host identity for {actor_scope}"
+        );
+    }
     let cell = cell_state(scope)?;
     let names_key = v8::String::new(scope, "idNames").unwrap();
     let names = cell
@@ -9540,25 +11315,44 @@ fn register_actor_name(
         }
     }
 
-    let (class_name, id) = actor_scope
-        .split_once(':')
-        .ok_or_else(|| anyhow!("named Durable Object scope has no class separator"))?;
-    let namespace_keys_key = v8::String::new(scope, "namespaceKeys").unwrap();
-    let namespace_keys = cell
-        .get(scope, namespace_keys_key.into())
-        .and_then(|value| value.to_object(scope))
-        .ok_or_else(|| anyhow!("missing Durable Object namespace registry"))?;
-    let class_name_key = v8::String::new(scope, class_name).unwrap();
-    let namespace_key = namespace_keys
-        .get(scope, class_name_key.into())
-        .filter(|value| value.is_string())
-        .ok_or_else(|| anyhow!("missing namespace key for Durable Object class {class_name}"))?
-        .to_rust_string_lossy(scope);
-    let expected = durable_object_id_hex(&durable_object_id_for_name(&namespace_key, name));
-    if id != expected {
-        anyhow::bail!("actor name does not match Durable Object ID for {actor_scope}");
+    // A guest's trusted host derived this scope from the bound resource's
+    // namespace and the name, and persisted the name it checked above. One
+    // guest worker can serve several resources, so its per-class key cannot
+    // re-derive that scope; the original isolate still derives and persists.
+    #[cfg(unix)]
+    let host_verified = guest_channel.is_some();
+    #[cfg(not(unix))]
+    let host_verified = false;
+    // The trusted application pool takes the name from its host, which derived
+    // the scope from the resource; persist it, but there is nothing to re-derive.
+    let verified_key = v8::String::new(scope, "hostVerifiedNames").unwrap();
+    let host_named = cell
+        .get(scope, verified_key.into())
+        .is_some_and(|value| value.is_true());
+    if host_named {
+        storage::set_actor_name(actor_scope, name)?;
     }
-    storage::set_actor_name(actor_scope, name)?;
+    if !host_verified && !host_named {
+        let (class_name, id) = actor_scope
+            .split_once(':')
+            .ok_or_else(|| anyhow!("named Durable Object scope has no class separator"))?;
+        let namespace_keys_key = v8::String::new(scope, "namespaceKeys").unwrap();
+        let namespace_keys = cell
+            .get(scope, namespace_keys_key.into())
+            .and_then(|value| value.to_object(scope))
+            .ok_or_else(|| anyhow!("missing Durable Object namespace registry"))?;
+        let class_name_key = v8::String::new(scope, class_name).unwrap();
+        let namespace_key = namespace_keys
+            .get(scope, class_name_key.into())
+            .filter(|value| value.is_string())
+            .ok_or_else(|| anyhow!("missing namespace key for Durable Object class {class_name}"))?
+            .to_rust_string_lossy(scope);
+        let expected = durable_object_id_hex(&durable_object_id_for_name(&namespace_key, name));
+        if id != expected {
+            anyhow::bail!("actor name does not match Durable Object ID for {actor_scope}");
+        }
+        storage::set_actor_name(actor_scope, name)?;
+    }
 
     let name_value = v8::String::new(scope, name).unwrap();
     if !names
@@ -9568,6 +11362,71 @@ fn register_actor_name(
         anyhow::bail!("could not register Durable Object name");
     }
     Ok(())
+}
+
+/// The trusted application pool takes a queue cell's name from its host, while
+/// every other Worker still re-derives the scope from its own namespace key.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn check_host_verified_actor_names() {
+    Engine::init();
+    let directory = tempfile::tempdir().unwrap();
+    for trusted in [true, false] {
+        let digit = if trusted { "7" } else { "8" };
+        let scope = format!(
+            "{}:{}",
+            celld_logic::queue::RESERVED_CLASS,
+            digit.repeat(64)
+        );
+        let mut config = WorkerConfig::new(WorkerConfigOptions {
+            src: "export default { fetch() { return new Response('ok'); } };".into(),
+            script_name: "celld-application-kv".into(),
+            do_classes: vec![],
+            bindings: vec![],
+            r2_bindings: vec![],
+            d1_bindings: vec![],
+            kv_bindings: vec![],
+            queue_bindings: vec![],
+            queue_consumers: vec![],
+            workflow_bindings: vec![],
+            vars: vec![],
+            node: "check".into(),
+            modules: vec![],
+            compat: Default::default(),
+        });
+        // A script name alone, even this pool's, proves nothing.
+        if trusted {
+            config = config.with_host_verified_names();
+        }
+        let mut worker = Worker::load_config(Arc::new(config)).unwrap();
+        let path = directory.path().join(format!("{trusted}.sqlite"));
+        worker
+            .own_cell(
+                &scope,
+                Some(CellStorage {
+                    path: path.to_str().unwrap(),
+                    epoch: 1,
+                    replicated_wake: false,
+                    vfs: None,
+                }),
+            )
+            .unwrap();
+        let named = worker.set_id_name(&scope, "jobs");
+        if trusted {
+            named.unwrap();
+            // The name is persisted, so an alarm-driven activation recovers it.
+            let persisted = {
+                let _cells = worker.lock();
+                storage::get_actor_name(&scope).unwrap()
+            };
+            assert_eq!(persisted.as_deref(), Some("jobs"));
+            assert!(worker.set_id_name(&scope, "other").is_err());
+        } else {
+            let error = named.unwrap_err().to_string();
+            assert!(error.contains("missing namespace key"), "{error}");
+            let _cells = worker.lock();
+            assert_eq!(storage::get_actor_name(&scope).unwrap(), None);
+        }
+    }
 }
 
 fn op_do_id(
@@ -9665,10 +11524,10 @@ fn webcrypto_return_bytes(
     rv.set(view.into());
 }
 
-mod container;
+pub(crate) mod container;
 mod crypto;
 mod html_rewriter;
-mod tcp;
+pub(crate) mod tcp;
 #[cfg(celld_internal_tests)]
 pub use tcp::test_extra_tls_root;
 mod zlib;
@@ -9683,6 +11542,18 @@ fn op_actor_abort(
     };
     let cell = args.get(0).to_rust_string_lossy(scope);
     let reason = args.get(1).to_rust_string_lossy(scope);
+    // The trusted host must latch the abort before the guest stops: it keeps
+    // native holds and retires the VM instead of trusting guest termination.
+    #[cfg(unix)]
+    if let Ok(Some(channel)) = guest_storage::channel(scope, &cell) {
+        guest_storage::cancel(&channel);
+        let reason: String = reason.chars().take(1024).collect();
+        let _ = guest_storage::unit(
+            scope,
+            &channel,
+            celld_applications::storage_wire::Operation::AbortObject { reason },
+        );
+    }
     let state = actor_runtime_state(scope);
     state
         .pending_puts
@@ -9787,7 +11658,8 @@ fn op_log(
 /// calls it from Pyodide's fatal hook, where Cloudflare aborts the isolate.
 /// It condemns only the isolate running the call, so a guest can cost itself
 /// a cold start and nothing else. `false` for a Dynamic Worker, whose slot
-/// has no pool to replace it.
+/// has no pool to replace it. An application guest has no pool: it asks the
+/// host to retire its VM instead, which is the same replacement.
 fn op_isolate_condemn(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -9798,7 +11670,10 @@ fn op_isolate_condemn(
     if let Some((cut, _)) = reason.char_indices().nth(MAX_CONDEMN_REASON_CHARS) {
         reason.truncate(cut);
     }
-    let condemned = crate::pool::current_slot().is_some_and(|slot| slot.condemn(&reason));
+    let condemned = crate::pool::current_slot().map_or_else(
+        || guest_storage::condemn(&reason),
+        |slot| slot.condemn(&reason),
+    );
     rv.set(v8::Boolean::new(scope, condemned).into());
 }
 
@@ -10388,6 +12263,10 @@ struct IoEventState {
     /// frame ended. The driver folds each batch into a new aggregate before
     /// it retires the event, so one callback can extend the same lifetime.
     late_wait_until: Vec<v8::Global<v8::Promise>>,
+    /// Guest-only raw registrations retained for host-admitted lifecycle
+    /// cancellation. Ordinary/native event behavior still uses its aggregate.
+    guest_wait_until: Vec<v8::Global<v8::Promise>>,
+    guest_callbacks: Vec<v8::Global<v8::Promise>>,
     /// True from the top-level frame's first non-empty drain until the driver
     /// observes that drain settled with no later registrations. Keeping this
     /// state on the request prevents a foreign event in the same isolate from
@@ -10476,7 +12355,7 @@ impl BundleTree {
                 ModuleSource::Text(source) | ModuleSource::EsModule(source) => {
                     bytes::Bytes::copy_from_slice(source.as_bytes())
                 }
-                ModuleSource::Wasm(bytes) => bytes.clone(),
+                ModuleSource::Wasm(bytes) | ModuleSource::Data(bytes) => bytes.clone(),
             };
             (name.as_str(), bytes)
         });
@@ -10623,6 +12502,10 @@ impl RequestVfs {
 /// The gate releases that claim when the block ends. The interiors are
 /// `Mutex`; only the isolate's holder reaches them.
 pub struct IoContext {
+    #[cfg(target_os = "linux")]
+    application_scope: OnceLock<Arc<crate::application_vm::ScopeMetadata>>,
+    #[cfg(unix)]
+    guest_storage: OnceLock<Arc<guest_storage::Channel>>,
     /// A process-wide identity captured by V8 with each promise reaction.
     /// The process-wide cell-gate map also uses it, so another isolate must
     /// not reuse it. The isolate registry holds only a `Weak`, so a
@@ -10630,6 +12513,8 @@ pub struct IoContext {
     /// cross-entry input gate adds an explicit claim that prevents this
     /// context's `InFlight` from retiring while its callback still runs.
     continuation: Option<(u64, Weak<ActorRuntimeState>)>,
+    /// Real event drivers adopt operations even when they have no CPED token.
+    event_driver: AtomicBool,
     /// This caller's delivery order for each cell it has called. See
     /// `CallOrder` — it is here rather than in a process-wide map because
     /// nothing outside this caller ever reads it.
@@ -10746,6 +12631,25 @@ pub struct IoContext {
 type HandedOp = (u64, asyncrt::OpFuture, asyncrt::OpLifetime);
 
 impl IoContext {
+    fn mark_event_driver(&self) {
+        self.event_driver.store(true, Ordering::Release);
+    }
+
+    fn has_event_driver(&self) -> bool {
+        self.event_driver.load(Ordering::Acquire)
+    }
+
+    fn has_guest_storage(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.guest_storage.get().is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     fn record_tail_log(&self, level: &str, body: &str) {
         if !self.tail_reporting {
             return;
@@ -10891,7 +12795,12 @@ impl IoContext {
 
     fn with_options(limits: Option<ResourceLimits>, tail_reporting: bool) -> Arc<Self> {
         Arc::new(Self {
+            #[cfg(target_os = "linux")]
+            application_scope: OnceLock::new(),
             continuation: None,
+            event_driver: AtomicBool::new(false),
+            #[cfg(unix)]
+            guest_storage: OnceLock::new(),
             call_chains: Mutex::new(CallChains::default()),
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
@@ -10923,7 +12832,12 @@ impl IoContext {
     fn tracked(runtime_state: &Arc<ActorRuntimeState>) -> Arc<Self> {
         let id = allocate_io_context_id();
         let context = Arc::new(Self {
+            #[cfg(target_os = "linux")]
+            application_scope: OnceLock::new(),
             continuation: Some((id, Arc::downgrade(runtime_state))),
+            event_driver: AtomicBool::new(false),
+            #[cfg(unix)]
+            guest_storage: OnceLock::new(),
             call_chains: Mutex::new(CallChains::default()),
             events: Mutex::new(IoEventState::default()),
             vfs: OnceLock::new(),
@@ -11050,6 +12964,7 @@ impl IoContext {
     /// so no op can sit here waiting for a driver that will never run again.
     #[must_use]
     fn close_handed_ops(&self) -> Vec<HandedOp> {
+        self.event_driver.store(false, Ordering::Release);
         let mut handed = self.handed.lock().unwrap();
         self.handed_len.store(0, Ordering::Release);
         handed.take().unwrap_or_default()
@@ -11106,6 +13021,9 @@ impl IoContext {
 
     fn register_wait_until(&self, promise: v8::Global<v8::Promise>) {
         let mut events = self.events.lock().unwrap();
+        if self.has_guest_storage() && (!events.frames.is_empty() || events.wait_until_active) {
+            events.guest_wait_until.push(promise.clone());
+        }
         if let Some(frame) = events.frames.last_mut() {
             frame.wait_until.push(promise);
         } else if events.wait_until_active {
@@ -11455,6 +13373,27 @@ fn current_context() -> Arc<IoContext> {
 #[cfg(celld_internal_tests)]
 fn installed_context() -> Option<Arc<IoContext>> {
     CURRENT.with(|current| current.borrow().clone())
+}
+
+fn op_guest_cleanup_track(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(context) =
+        reaction_or_current_context(scope).filter(|context| context.has_guest_storage())
+    else {
+        return;
+    };
+    rv.set_bool(true);
+    if let Ok(promise) = args.get(0).try_cast::<v8::Promise>() {
+        context
+            .events
+            .lock()
+            .unwrap()
+            .guest_callbacks
+            .push(v8::Global::new(scope, promise));
+    }
 }
 
 fn op_event_begin(
@@ -11812,6 +13751,25 @@ fn op_alarm_set(
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
     let at = args.get(1).number_value(scope).unwrap_or(0.0) as i64;
+    #[cfg(unix)]
+    match guest_storage::channel(scope, &s) {
+        Ok(Some(channel)) => {
+            if let Err(error) = guest_storage::unit(
+                scope,
+                &channel,
+                celld_applications::storage_wire::Operation::SetAlarm { at_ms: at },
+            ) {
+                throw_storage_error(scope, "setAlarm", error);
+            }
+            // The trusted host samples/arms the alarm before gated publication.
+            return;
+        }
+        Err(error) => {
+            throw_storage_error(scope, "setAlarm", error);
+            return;
+        }
+        Ok(None) => {}
+    }
     let timing_started = (tracing::enabled!(target: "queue_timing", tracing::Level::DEBUG)
         && s.split_once(':')
             .is_some_and(|(class, _)| class == crate::deploy::QUEUE_CLASS))
@@ -11849,6 +13807,9 @@ fn op_queue_alarm_set_wait(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    if storage_ops::refuse_unbridged_guest_op(scope, "queue alarm proof") {
+        return;
+    }
     let cell = args.get(0).to_rust_string_lossy(scope);
     let at_ms = args.get(1).number_value(scope).unwrap_or(0.0) as i64;
     let committed = match storage::set_alarm(&cell, at_ms) {
@@ -11879,6 +13840,22 @@ fn op_alarm_get(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
+    #[cfg(unix)]
+    match guest_storage::channel(scope, &s) {
+        Ok(Some(channel)) => {
+            match guest_storage::alarm(scope, &channel) {
+                Ok(Some(at)) => rv.set(v8::Number::new(scope, at as f64).into()),
+                Ok(None) => rv.set(v8::null(scope).into()),
+                Err(error) => throw_storage_error(scope, "getAlarm", error),
+            }
+            return;
+        }
+        Err(error) => {
+            throw_storage_error(scope, "getAlarm", error);
+            return;
+        }
+        Ok(None) => {}
+    }
     match storage::get_alarm(&s) {
         Some(at) => rv.set(v8::Number::new(scope, at as f64).into()),
         None => rv.set(v8::null(scope).into()),
@@ -11890,6 +13867,24 @@ fn op_alarm_delete(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
+    #[cfg(unix)]
+    match guest_storage::channel(scope, &s) {
+        Ok(Some(channel)) => {
+            if let Err(error) = guest_storage::unit(
+                scope,
+                &channel,
+                celld_applications::storage_wire::Operation::DeleteAlarm {},
+            ) {
+                throw_storage_error(scope, "deleteAlarm", error);
+            }
+            return;
+        }
+        Err(error) => {
+            throw_storage_error(scope, "deleteAlarm", error);
+            return;
+        }
+        Ok(None) => {}
+    }
     if let Err(error) = storage::delete_alarm(&s) {
         throw_storage_error(scope, "deleteAlarm", error);
     }
@@ -12201,8 +14196,8 @@ use bootstrap::{
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
-    register_loader_modules, register_stubs, register_wasm_modules, resolve_external,
-    ModuleRegistry,
+    register_data_modules, register_loader_modules, register_stubs, register_wasm_modules,
+    resolve_external, ModuleRegistry,
 };
 use v8_strings::key as static_key;
 /// Like `make_request`, but marks the request as incoming. Its signal is
@@ -12392,3 +14387,84 @@ pub fn init_engine_for_tests() {
 
 #[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_JS_OBSERVERS"));
+
+#[cfg(test)]
+mod rpc_signal_mirror_tests {
+    use super::*;
+
+    #[test]
+    fn mirrors_are_counted_never_alias_local_signals_and_release_unaborted() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (mirror, local) = (next_request_id(), next_request_id());
+        rpc_signals()
+            .lock()
+            .unwrap()
+            .insert(local, RpcSignalState::Live(HashMap::new()));
+        // A declared id naming a local signal is not mirrored, so the relay
+        // cannot abort it; the mirrored id is held once per declaration.
+        assert_eq!(
+            rpc_signal_declare_remote("a", &[mirror, local, mirror]),
+            vec![mirror, mirror]
+        );
+        // Another owner that merely learned the id holds nothing, so its abort
+        // frame is ignored and its release cannot drop the real owner's hold.
+        assert!(rpc_signal_declare_remote("b", &[mirror]).is_empty());
+        let waiting = runtime.spawn(rpc_signal_watch(mirror));
+        let aborted = runtime.block_on(async {
+            tokio::task::yield_now().await;
+            rpc_signal_abort(mirror, vec![7]);
+            waiting.await.unwrap()
+        });
+        assert_eq!(aborted, Some(vec![7]), "abort reaches the mirrored waiter");
+        // An abort that precedes the subscription is still delivered.
+        assert_eq!(runtime.block_on(rpc_signal_watch(mirror)), Some(vec![7]));
+        rpc_signal_release_remote(&[mirror]);
+        assert!(
+            rpc_signals().lock().unwrap().contains_key(&mirror),
+            "other event still holds it"
+        );
+        rpc_signal_release_remote(&[mirror]);
+        assert!(!rpc_signals().lock().unwrap().contains_key(&mirror));
+        // A mirror released before any abort resolves waiters "released".
+        let second = next_request_id();
+        rpc_signal_declare_remote("a", &[second]);
+        let waiting = runtime.spawn(rpc_signal_watch(second));
+        let released = runtime.block_on(async {
+            tokio::task::yield_now().await;
+            rpc_signal_release_remote(&[second]);
+            waiting.await.unwrap()
+        });
+        assert_eq!(
+            released, None,
+            "an unaborted mirror never fires after release"
+        );
+        assert!(matches!(
+            rpc_signals().lock().unwrap().get(&local),
+            Some(RpcSignalState::Live(_))
+        ));
+        rpc_signal_release(local);
+    }
+}
+
+#[cfg(test)]
+mod loader_drain_context_tests {
+    use super::*;
+
+    #[test]
+    fn stateless_driver_ownership_outlives_handler_frame() {
+        let context = IoContext::new();
+        assert!(context.continuation_id().is_none());
+        assert!(!context.has_event_driver());
+        context.mark_event_driver();
+        context.begin_event();
+        assert!(context.end_event().is_some());
+        context.seal_wait_until();
+        assert!(!context.accepts_wait_until());
+        assert!(context.has_event_driver());
+        assert!(!IoContext::new().has_event_driver());
+        assert!(context.close_handed_ops().is_empty());
+        assert!(!context.has_event_driver());
+    }
+}

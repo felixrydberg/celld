@@ -6,7 +6,7 @@
 //! path.
 use crate::asyncrt;
 use crate::engine_api::WsTarget;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -32,6 +32,10 @@ pub struct OutboundWsReq {
     /// to run and no connection to open: the host only has to carry frames
     /// between two isolates.
     pub target: Option<WsTarget>,
+    /// The facet that dialed, when `scope` names a Durable Object facet. The
+    /// op derives it from the running event, so the socket routes through
+    /// the facet's root and never names the facet as a cell.
+    pub facet: Option<FacetSocket>,
     pub reply: tokio::sync::oneshot::Sender<Result<OutboundWsOpen>>,
 }
 
@@ -200,10 +204,10 @@ pub(crate) const WS_PULL_QUEUE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Tags for the byte frame `__ws_next` resolves with. A tagged buffer keeps a
 /// binary message on its fast path instead of base64 through a JSON envelope.
-const WS_PULL_TAG_TEXT: u8 = 0;
-const WS_PULL_TAG_BINARY: u8 = 1;
+pub(crate) const WS_PULL_TAG_TEXT: u8 = 0;
+pub(crate) const WS_PULL_TAG_BINARY: u8 = 1;
 const WS_PULL_TAG_OPEN: u8 = 2;
-const WS_PULL_TAG_CLOSE: u8 = 3;
+pub(crate) const WS_PULL_TAG_CLOSE: u8 = 3;
 
 impl WsPull {
     pub(crate) fn encode(self) -> Vec<u8> {
@@ -503,6 +507,33 @@ pub struct WsMeta {
     /// unix ms. Lives here rather than in the isolate because the reply is
     /// sent while the cell may not be resident at all.
     pub auto_response_at: Option<f64>,
+    /// The root cell and facet stream behind a socket that a Durable Object
+    /// facet accepted, dialed, or bound. `None` for a socket of an ordinary
+    /// cell. `scope` then names the facet.
+    pub facet: Option<FacetSocket>,
+    /// False only for a guest object's accepted socket whose upgrade response
+    /// no client has consumed yet. The host hands it out once.
+    pub claimed: bool,
+}
+
+/// Where the events of a facet's socket go, and what proves their output.
+///
+/// A facet is not a cell: no Worker exports its class under the facet's
+/// scope, so routing an event by that scope activated a cell that cannot
+/// start (denoland/celld#252). The root cell owns the facet, its residency,
+/// and its gate, so the socket routes and registers under `root`. The facet's
+/// own writes are proved on `stream` at `epoch`.
+///
+/// Recorded by the host, never read from a `WsTarget`. A target crosses
+/// application JavaScript, which could otherwise name another root.
+#[derive(Clone, Debug)]
+pub struct FacetSocket {
+    pub root: String,
+    pub stream: String,
+    pub epoch: u64,
+    /// The opening of the facet that holds the socket. An event reaches
+    /// that opening only, never a later one at the same scope.
+    pub opening: u64,
 }
 #[derive(Default)]
 #[doc(hidden)]
@@ -642,14 +673,78 @@ fn unix_ms() -> f64 {
     asyncrt::wall_ms() as f64
 }
 
-pub fn ws_hibernatable(id: u64) -> Option<bool> {
+/// Mark a socket as accepted by the facet `scope`, so its events reach the
+/// facet through `facet.root`. A socket that `scope` did not accept keeps its
+/// own route: a facet can return a socket that another cell accepted.
+pub(crate) fn ws_attach_facet(id: u64, scope: &str, facet: FacetSocket) {
+    if let Some(meta) = ws_registry().lock().unwrap().metadata.get_mut(&id) {
+        if meta.scope == scope {
+            meta.facet = Some(facet);
+        }
+    }
+}
+
+/// The facet route of a socket, when a facet accepted it.
+pub fn ws_facet(id: u64) -> Option<FacetSocket> {
     ws_registry()
         .lock()
         .unwrap()
         .metadata
         .get(&id)
-        .map(|meta| meta.hibernatable)
+        .and_then(|meta| meta.facet.clone())
 }
+
+/// The cell the core holds `target` under, and whether that registration can
+/// hibernate.
+///
+/// A facet's socket registers under its root, as a socket that cannot
+/// hibernate. A root that hibernated would close its facets, and nothing can
+/// restart a facet without the root's code: the class came from the root's
+/// startup callback. The socket therefore keeps the root resident, as a
+/// regular socket does.
+pub fn ws_core_registration(target: &WsTarget) -> (String, bool) {
+    let registry = ws_registry();
+    let registry = registry.lock().unwrap();
+    match registry.metadata.get(&target.id) {
+        Some(WsMeta {
+            facet: Some(facet), ..
+        }) => (facet.root.clone(), false),
+        meta => (
+            target.scope.clone(),
+            meta.is_some_and(|meta| meta.hibernatable),
+        ),
+    }
+}
+
+/// Remove the registration of a socket that the facet `scope` accepted for a
+/// response that never left. No socket task exists for it, so nothing else
+/// would remove it.
+pub(crate) fn ws_release_unanswered(id: u64, scope: &str) {
+    let accepted = ws_registry()
+        .lock()
+        .unwrap()
+        .metadata
+        .get(&id)
+        .is_some_and(|meta| meta.scope == scope);
+    if accepted {
+        ws_unregister(id);
+    }
+}
+
+/// Register a socket that a facet accepted, through a cfg-gated execution
+/// backend that has no facet call to record it.
+#[cfg(celld_internal_tests)]
+#[doc(hidden)]
+pub fn ws_register_facet_for_test(
+    id: u64,
+    scope: &str,
+    facet: FacetSocket,
+    tx: tokio::sync::mpsc::UnboundedSender<WsOut>,
+) {
+    ws_register_hibernatable_for_test(id, scope, tx);
+    ws_attach_facet(id, scope, facet);
+}
+
 pub fn ws_next_id() -> u64 {
     asyncrt::services()
         .websockets()
@@ -679,10 +774,15 @@ pub(crate) fn ws_register_hibernatable_for_test(
             attachment: None,
             pending: Vec::new(),
             auto_response_at: None,
+            facet: None,
+            claimed: true,
         },
     );
 }
-pub fn ws_register_outbound(id: u64, scope: &str) {
+/// Register an outbound socket of `scope`. A socket that a facet opened
+/// takes its facet record in the same insertion, so no event, close, or
+/// `ws_close_facet` can find the entry without it.
+pub fn ws_register_outbound(id: u64, scope: &str, facet: Option<FacetSocket>) {
     let inserted = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -694,6 +794,8 @@ pub fn ws_register_outbound(id: u64, scope: &str) {
                 attachment: None,
                 pending: Vec::new(),
                 auto_response_at: None,
+                facet,
+                claimed: true,
             });
             true
         } else {
@@ -708,6 +810,136 @@ pub fn ws_unregister(id: u64) {
     let meta = ws_registry().lock().unwrap().unregister(id);
     if let Some(meta) = meta.filter(|meta| !meta.hibernatable) {
         decrement_regular_ws(&meta.scope);
+    }
+}
+
+/// What a guest object may do with the host's hibernation registry. The
+/// registry stays the host's: a guest holds a pair id only it has seen until
+/// `ws_accept_guest` gives the socket its registry id, and every later call
+/// names that id and is checked against the issuing object's own scope.
+fn guest_socket<'a>(registry: &'a mut WsRegistry, scope: &str, id: u64) -> Result<&'a mut WsMeta> {
+    registry
+        .metadata
+        .get_mut(&id)
+        .filter(|meta| meta.hibernatable && meta.scope == scope)
+        .ok_or_else(|| anyhow!("WebSocket {id} is not a hibernatable socket of this object"))
+}
+
+/// `acceptWebSocket` for a guest object. `accepted` is the registry id of a
+/// socket this object already accepted (the tags then change, as in the
+/// original); otherwise the socket is new and gets a fresh registry id.
+pub fn ws_accept_guest(scope: &str, accepted: Option<u64>, tags: Vec<String>) -> Result<u64> {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    if let Some(id) = accepted {
+        guest_socket(&mut registry, scope, id)?.tags = tags;
+        return Ok(id);
+    }
+    let id = ws_next_id();
+    registry.metadata.insert(
+        id,
+        WsMeta {
+            scope: scope.to_string(),
+            hibernatable: true,
+            tags,
+            attachment: None,
+            pending: Vec::new(),
+            auto_response_at: None,
+            facet: None,
+            claimed: false,
+        },
+    );
+    Ok(id)
+}
+
+/// `getWebSockets(tag)` for a guest object: its hibernatable sockets, oldest
+/// id first so a rebuilt list is stable across calls.
+pub fn ws_guest_sockets(
+    scope: &str,
+    tag: Option<&str>,
+) -> Vec<(u64, Vec<String>, Option<Vec<u8>>)> {
+    let registry = ws_registry();
+    let registry = registry.lock().unwrap();
+    let mut rows: Vec<_> = registry
+        .metadata
+        .iter()
+        .filter(|(_, meta)| {
+            meta.hibernatable
+                && meta.scope == scope
+                && tag.is_none_or(|tag| meta.tags.iter().any(|candidate| candidate == tag))
+        })
+        .map(|(id, meta)| (*id, meta.tags.clone(), meta.attachment.clone()))
+        .collect();
+    rows.sort_by_key(|(id, ..)| *id);
+    rows
+}
+
+pub fn ws_guest_attachment(scope: &str, id: u64, attachment: Vec<u8>) -> Result<()> {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    guest_socket(&mut registry, scope, id)?.attachment = Some(attachment);
+    Ok(())
+}
+
+pub fn ws_guest_auto_response_timestamp(scope: &str, id: u64) -> Result<Option<f64>> {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    Ok(guest_socket(&mut registry, scope, id)?.auto_response_at)
+}
+
+/// `setWebSocketAutoResponse`/`getWebSocketAutoResponse` for a cell scope. The
+/// pair is the shell's, so a matched message never wakes the guest.
+pub fn ws_auto_response_pair(scope: &str) -> Option<(String, String)> {
+    ws_auto_responses().lock().unwrap().get(scope).cloned()
+}
+
+pub fn ws_auto_response_install(scope: &str, pair: Option<(String, String)>) {
+    let pairs = ws_auto_responses();
+    let mut pairs = pairs.lock().unwrap();
+    match pair {
+        Some(pair) => pairs.insert(scope.to_string(), pair),
+        None => pairs.remove(scope),
+    };
+}
+
+/// The object that owns a registered socket, for the host to check a frame or
+/// an upgrade against before anything leaves the node.
+pub fn ws_scope_of(id: u64) -> Option<String> {
+    ws_registry()
+        .lock()
+        .unwrap()
+        .metadata
+        .get(&id)
+        .map(|meta| meta.scope.clone())
+}
+
+/// Hand a guest object's accepted socket to the one upgrade that carries it.
+/// Returns its scope. A socket another upgrade already took, or one that is
+/// gone, is refused, so a handler cannot give one client's socket to another.
+pub fn ws_claim_guest(id: u64) -> Result<String> {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    let meta = registry
+        .metadata
+        .get_mut(&id)
+        .filter(|meta| meta.hibernatable && !meta.claimed)
+        .ok_or_else(|| anyhow!("WebSocket {id} is not an unclaimed upgrade"))?;
+    meta.claimed = true;
+    Ok(meta.scope.clone())
+}
+
+/// Drop sockets an event accepted that no upgrade ever claimed.
+pub fn ws_release_unclaimed(scope: &str, ids: &[u64]) {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    for id in ids {
+        if registry
+            .metadata
+            .get(id)
+            .is_some_and(|meta| !meta.claimed && meta.scope == scope)
+        {
+            registry.unregister(*id);
+        }
     }
 }
 
@@ -1207,19 +1439,57 @@ pub fn ws_close(id: u64, code: u16, reason: &str) {
 /// Break a cell's sockets: the output gate could not prove a write durable, so
 /// close every socket the cell owns rather than let a client keep a connection
 /// whose acknowledged effects may not have persisted (a reset DO).
+///
+/// The sockets of the cell's facets close too. A facet's writes trail the
+/// root cell's gate, and the facet does not outlive its root.
 pub fn ws_close_scope(scope: &str, code: u16, reason: &str) {
+    let mut scopes = vec![scope.to_string()];
+    {
+        let registry = ws_registry();
+        let mut registry = registry.lock().unwrap();
+        let ids: Vec<u64> = registry
+            .metadata
+            .iter()
+            .filter(|(_, meta)| {
+                let facet_of_scope = meta.facet.as_ref().is_some_and(|facet| facet.root == scope);
+                if facet_of_scope && !scopes.contains(&meta.scope) {
+                    scopes.push(meta.scope.clone());
+                }
+                meta.scope == scope || facet_of_scope
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            registry.emit(id, WsOut::Close(code, reason.to_string()));
+        }
+    }
     // A reset cell is a new actor; workerd's hibernation manager dies with
     // the old one and takes the auto-response pair with it.
+    let pairs = ws_auto_responses();
+    let mut pairs = pairs.lock().unwrap();
+    for scope in &scopes {
+        pairs.remove(scope);
+    }
+}
+
+/// Close the sockets of a facet that stopped: an abort, a delete, or its
+/// root's give-back.
+///
+/// No later event can reach the facet, and a facet restarted under the same
+/// name is a new actor that never accepted these sockets. Leaving them open
+/// would accept frames that no handler can receive. 1001 is the code for an
+/// endpoint that is going away.
+pub(crate) fn ws_close_facet(scope: &str, reason: &str) {
     ws_auto_responses().lock().unwrap().remove(scope);
     let registry = ws_registry();
     let mut registry = registry.lock().unwrap();
     let ids: Vec<u64> = registry
         .metadata
         .iter()
-        .filter(|(_, meta)| meta.scope == scope)
+        .filter(|(_, meta)| meta.scope == scope && meta.facet.is_some())
         .map(|(id, _)| *id)
         .collect();
     for id in ids {
-        registry.emit(id, WsOut::Close(code, reason.to_string()));
+        registry.emit(id, WsOut::Close(1001, reason.to_string()));
     }
 }

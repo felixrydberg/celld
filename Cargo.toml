@@ -2,7 +2,7 @@
 # decisions; `crates/celld` is only an effect executor and adapter host.
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/celld", "crates/logic", "crates/ltx", "crates/applications"]
 
 # Size-tuned: fat LTO prunes unused dependency code, panic=abort drops
 # unwind tables. opt-level "s" (not "z") — measure RPS before trading further.
@@ -44,6 +44,7 @@ base64 = "0.22"
 bytes = "1"
 celld-logic = { path = "crates/logic" }
 celld-ltx = { path = "crates/ltx" }
+celld-applications = { path = "crates/applications" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 encoding_rs = "0.8"

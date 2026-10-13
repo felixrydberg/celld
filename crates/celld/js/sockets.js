@@ -56,8 +56,26 @@
     return value;
   };
 
+  // The socket ops: the node's own, or a container's brokered through the
+  // host (an application guest has no network, and no address of its own).
+  const hostOps = {
+    read: (id) => __tcp_read(id),
+    write: (id, bytes) => __tcp_write(id, bytes),
+    shutdown: (id) => __tcp_shutdown(id),
+    close: (id) => __tcp_close(id),
+    starttls: (request) => __tcp_starttls(request),
+  };
+  const containerOps = {
+    read: (id) => __container_tcp_read(id),
+    write: (id, bytes) => __container_tcp_write(id, bytes),
+    shutdown: (id) => __container_tcp_shutdown(id),
+    close: (id) => __container_tcp_close(id),
+    starttls: (request) => __container_tcp_starttls(request),
+  };
+
   class Socket {
-    constructor(opening, secureTransport, allowHalfOpen, startTlsInfo) {
+    constructor(opening, secureTransport, allowHalfOpen, startTlsInfo, ops = hostOps) {
+      this._ops = ops;
       this._secureTransport = secureTransport;
       this._allowHalfOpen = allowHalfOpen;
       this._startTlsInfo = startTlsInfo; // null once used or unusable
@@ -94,7 +112,7 @@
             controller.close();
             return;
           }
-          const bytes = await __tcp_read(socket._id);
+          const bytes = await socket._ops.read(socket._id);
           if (socket._closing || socket._detached) {
             controller.close();
             return;
@@ -119,11 +137,11 @@
             : ArrayBuffer.isView(chunk)
               ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
               : new Uint8Array(chunk);
-          await __tcp_write(socket._id, bytes);
+          await socket._ops.write(socket._id, bytes);
         },
         async close() {
           await socket._opened;
-          if (!socket._detached) await __tcp_shutdown(socket._id);
+          if (!socket._detached) await socket._ops.shutdown(socket._id);
         },
         abort() {},
       });
@@ -153,7 +171,7 @@
     _finishClose() {
       if (this._closing) return;
       this._closing = true;
-      if (this._id !== null) __tcp_close(this._id);
+      if (this._id !== null) this._ops.close(this._id);
       this._resolveClosed(undefined);
     }
 
@@ -172,7 +190,7 @@
       try {
         await this._readable.cancel();
       } catch { /* reader may hold the lock; the close below still wins */ }
-      __tcp_close(this._id);
+      this._ops.close(this._id);
       this._resolveClosed(undefined);
       return this._closed;
     }
@@ -197,7 +215,7 @@
       this._startTlsInfo = null;
       this._detached = true;
       const upgrading = this._opened.then(async () => {
-        const raw = await __tcp_starttls(JSON.stringify({
+        const raw = await this._ops.starttls(JSON.stringify({
           id: this._id,
           host: String(options?.expectedServerHostname ?? info.hostname),
         }));
@@ -206,24 +224,28 @@
         const parsed = JSON.parse(raw);
         return { id: parsed.id };
       });
-      return new Socket(upgrading, "on", this._allowHalfOpen, null);
+      return new Socket(upgrading, "on", this._allowHalfOpen, null, this._ops);
     }
   }
 
-  const connect = (address, options = undefined) => {
+  // `container` is `{scope, port}` for a guest's container port: the host dials.
+  const connect = (address, options = undefined, container = undefined) => {
     const { hostname, port } = parseAddress(address);
     const secureTransport = parseSecureTransport(options);
     const allowHalfOpen = !!(options && options.allowHalfOpen);
-    const opening = __tcp_connect(JSON.stringify({
-      hostname,
-      port,
-      secure: secureTransport === "on",
-    })).then((raw) => JSON.parse(raw));
+    const opening = (container
+      ? __container_connect(container.scope, container.port)
+      : __tcp_connect(JSON.stringify({
+        hostname,
+        port,
+        secure: secureTransport === "on",
+      }))).then((raw) => JSON.parse(raw));
     return new Socket(
       opening,
       secureTransport,
       allowHalfOpen,
       secureTransport === "starttls" ? { hostname } : null,
+      container ? containerOps : hostOps,
     );
   };
 

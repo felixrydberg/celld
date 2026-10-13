@@ -810,6 +810,38 @@ pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String
     }
 }
 
+/// Register each sibling data module under its name and `./name` as a stub
+/// whose default export is its content as an `ArrayBuffer`, the shape workerd
+/// gives a `Data` module import. Like a wasm stub it takes its value from a
+/// table of `__celld` once, on evaluation.
+pub(super) fn register_data_modules(scope: &mut v8::PinScope, modules: &[(String, ModuleSource)]) {
+    let mut table = None;
+    for (name, source) in modules {
+        let ModuleSource::Data(bytes) = source else {
+            continue;
+        };
+        let table = *table.get_or_insert_with(|| {
+            let internals = internals(scope);
+            let table = v8::Object::new(scope);
+            let table_key = v8::String::new(scope, "__dataModules").unwrap();
+            internals.set(scope, table_key.into(), table.into());
+            table
+        });
+        let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
+        let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+        let key = v8::String::new(scope, name).unwrap();
+        table.set(scope, key.into(), buffer.into());
+        let quoted = serde_json::to_string(name).unwrap();
+        let mut source = internals_import();
+        source.push_str(&format!(
+            "const m = __celld.__dataModules[{quoted}];
+             delete __celld.__dataModules[{quoted}];
+             export default m;"
+        ));
+        register_sibling_module(scope, name, &source, true);
+    }
+}
+
 /// Register a loaded worker's sibling JS modules (Worker Loader multi-module
 /// bundles), in addition to the builtins `register_stubs` already added for the
 /// main module. Each module is registered under its own name and `./name` so
