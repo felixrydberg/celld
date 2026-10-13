@@ -263,8 +263,9 @@ All requests require one `Authorization: Bearer TOKEN` header. `BASE` is
 | `PUT BASE/limits` | `{"revision":{"token":"..."},"limits":{"size_class":"basic","invocation_timeout_ms":3000}}` |
 | `DELETE BASE/limits` | `{"revision":{"token":"..."}}`; reset application limits |
 
-Ordinary JSON bodies are capped at 1 MiB; eight concurrent management requests
-bound artifact buffering. Application writes require their own exact observed revision and
+Ordinary JSON bodies are capped at 1 MiB; at most eight management requests run
+at once, each bounded by a request timeout (300 seconds), so a stalled client
+cannot hold a slot indefinitely. Application writes require their own exact observed revision and
 use provider CAS. `409` means re-read and review the intended edit; the CLI never
 retries blindly. An uncertain provider result is reconciled only by exact-content
 readback. Manifests are immutable by application/deployment id and artifacts by

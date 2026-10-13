@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
@@ -123,7 +124,15 @@ struct ApiState {
     // ponytail: eight concurrent management bodies bound upload memory to
     // 512 MiB; stream artifacts to disk if larger bundles become necessary.
     requests: Semaphore,
+    /// How long one request may hold its permit, including body extraction.
+    request_timeout: Duration,
 }
+
+/// How long one management request may hold its `requests` permit. This is a
+/// management API on a trusted network, not the public listener, so it is
+/// generous: it bounds a stalled or hostile client without refusing a slow
+/// large upload. The 64 MiB artifact ceiling is the largest legitimate body.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 type ApiError = (StatusCode, String);
 type ApiResult<T> = Result<T, ApiError>;
@@ -228,7 +237,14 @@ async fn authenticate(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     request.extensions_mut().insert(permission);
-    next.run(request).await
+    // The permit is held across body extraction and the handler. A client can
+    // send a request head and never send the body, so without a deadline eight
+    // such requests hold every permit forever and every other route, including
+    // GET, answers 503. Bound each hold; the permit drops with the future.
+    match crate::asyncrt::timeout(state.request_timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
 }
 
 /// Runs before JSON/Bytes extraction. A caller cannot spend another application's
@@ -629,10 +645,22 @@ async fn upload(
     Ok(StatusCode::CREATED)
 }
 
+/// The management router with the shipped permit deadline. Callers that need a
+/// short deadline (tests) use an explicit `router_with` so the bound is
+/// exercised without waiting for the real one.
 pub fn router(
     store: ApplicationStore,
     authorization: Authorization,
     platform_domain: String,
+) -> anyhow::Result<Router> {
+    router_with(store, authorization, platform_domain, REQUEST_TIMEOUT)
+}
+
+pub(crate) fn router_with(
+    store: ApplicationStore,
+    authorization: Authorization,
+    platform_domain: String,
+    request_timeout: Duration,
 ) -> anyhow::Result<Router> {
     authorization.validate()?;
     ensure!(
@@ -644,6 +672,7 @@ pub fn router(
         authorization,
         platform_domain,
         requests: Semaphore::new(8),
+        request_timeout,
     });
     let applications = Router::new()
         .route("/v1/applications/:app", get(inspect).post(create))

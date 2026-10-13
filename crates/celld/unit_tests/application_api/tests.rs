@@ -36,6 +36,103 @@ async fn headers_only(address: std::net::SocketAddr, token: Option<&str>, path: 
     String::from_utf8_lossy(&reply[..count]).into_owned()
 }
 
+/// A request head with a declared body that never arrives, left open. Eight of
+/// these used to hold every management permit forever.
+async fn stall(address: std::net::SocketAddr, token: &str, path: &str) -> tokio::net::TcpStream {
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    socket
+        .write_all(
+            format!(
+                "PUT {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 67108864\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    socket
+}
+
+/// Eight stalled authenticated writes must not take the whole API down: the
+/// permit's hold is bounded, so a later GET succeeds once the deadline fires,
+/// and the in-flight bound stays at eight rather than growing.
+async fn check_stalled_permits_are_released(api: &str, address: std::net::SocketAddr, token: &str) {
+    let path = "/v1/applications/one/artifacts/";
+    let mut stalled = Vec::new();
+    for _ in 0..8 {
+        // The write above returns once the head is queued, so each socket holds
+        // a permit by the time the next one is opened.
+        stalled.push(stall(address, token, path).await);
+    }
+    // Waits for their deadlines to fire. The test deadline is deliberately
+    // longer than the router's, so a failure here means the permits never came
+    // back rather than that the test was impatient.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut reply = [0u8; 256];
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stalled requests never released their permits: {api}{path}"
+        );
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(
+                format!(
+                    "GET /v1/applications/one HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        if let Ok(Ok(count)) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::io::AsyncReadExt::read(&mut socket, &mut reply),
+        )
+        .await
+        {
+            if count > 0 && reply.starts_with(b"HTTP/1.1 ") {
+                assert!(
+                    !String::from_utf8_lossy(&reply[..count]).starts_with("HTTP/1.1 503"),
+                    "a GET was refused while the permits drained"
+                );
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Dropping the clients must not be needed for the events to settle.
+    drop(stalled);
+}
+
+/// Eight stalled authenticated writes must not take the whole API down. The
+/// permit's hold is bounded, so a GET succeeds once the deadlines fire, and the
+/// in-flight bound stays at eight. A short deadline keeps the test honest about
+/// real time; the shipped one is `REQUEST_TIMEOUT`.
+#[tokio::test]
+async fn stalled_management_requests_release_their_permits() {
+    let directory = tempfile::tempdir().unwrap();
+    let bucket = crate::bucket::Bucket::open_dev(&directory.path().join("permits.sqlite")).unwrap();
+    let operator = "o".repeat(40);
+    let auth = Authorization {
+        credentials: vec![credential(&operator, Permission::Operator {})],
+    };
+    // A short deadline: the shipped `REQUEST_TIMEOUT` would make this test wait
+    // five minutes. The bound being tested is the same either way.
+    let app = router_with(
+        ApplicationStore::new(bucket),
+        auth,
+        "apps.test".into(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    check_stalled_permits_are_released(&format!("http://{address}"), address, &operator).await;
+    server.abort();
+}
+
 async fn cli(
     api: &str,
     token: &str,
