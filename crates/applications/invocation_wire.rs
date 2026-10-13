@@ -327,8 +327,16 @@ impl SocketFrame {
             Self::Binary { data } => {
                 ensure!(data.len() <= MAX_BODY_BYTES, "WebSocket message exceeds limit")
             }
-            Self::Close { reason, .. } => {
-                ensure!(reason.len() <= 123, "WebSocket close reason exceeds limit")
+            Self::Close { code, reason } => {
+                ensure!(reason.len() <= 123, "WebSocket close reason exceeds limit");
+                // The host writes this code straight onto the wire
+                // (`WsOut::Close` -> `fastwebsockets::Frame::close`, which does
+                // not check it). RFC 6455 reserves 1004, and 1005/1006/1015 are
+                // local-reporting only, so a guest must not name one.
+                ensure!(
+                    celld_logic::schedule::websocket_close_code_is_allowed(*code),
+                    "WebSocket close code cannot appear on the wire"
+                )
             }
         }
         Ok(())

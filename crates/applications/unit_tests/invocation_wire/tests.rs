@@ -1106,6 +1106,39 @@ fn socket_frames_events_and_upgrades_are_scoped_and_bounded() {
         fetch: None,
     };
     assert!(long_reason.encode().is_err());
+    // A close code the endpoint may not put on the wire is refused in both
+    // directions: 1004 is reserved, and 1005/1006/1015 are local reporting only.
+    for code in [1004, 1005, 1006, 1015, 0, 2999, 5000] {
+        let refused = GuestControl::SocketFrame {
+            version: VERSION,
+            invocation: "a".repeat(64),
+            ws: 9,
+            frame: SocketFrame::Close {
+                code,
+                reason: String::new(),
+            },
+            fetch: None,
+        };
+        assert!(refused.validate().is_err(), "encode accepted close code {code}");
+        let bytes = serde_json::to_vec(&refused).unwrap();
+        assert!(
+            GuestControl::decode(&bytes).is_err(),
+            "decode accepted close code {code}"
+        );
+    }
+    for code in [1000, 1001, 1002, 1003, 1014, 3000, 4999] {
+        let allowed = GuestControl::SocketFrame {
+            version: VERSION,
+            invocation: "a".repeat(64),
+            ws: 9,
+            frame: SocketFrame::Close {
+                code,
+                reason: String::new(),
+            },
+            fetch: None,
+        };
+        assert!(allowed.validate().is_ok(), "refused permitted close code {code}");
+    }
     let mut forged = serde_json::to_value(GuestControl::SocketFrame {
         version: VERSION,
         invocation: "a".repeat(64),
