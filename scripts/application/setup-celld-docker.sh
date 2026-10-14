@@ -7,9 +7,14 @@ set -eu
 # 1. Docker's official apt repository (Ubuntu noble).
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-fingerprint=$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc | awk -F: '$1 == "fpr" { print $10; exit }')
-[ "$fingerprint" = 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 ] || {
-    echo "Unexpected Docker APT key fingerprint: $fingerprint" >&2
+key_info=$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc)
+key_summary=$(printf '%s\n' "$key_info" | awk -F: '
+    $1 == "pub" { count++ }
+    $1 == "fpr" && fingerprint == "" { fingerprint = $10 }
+    END { printf "%d:%s", count, fingerprint }
+')
+[ "$key_summary" = 1:9DC858229FC7DD38854AE2D88D81803C0EBFCD88 ] || {
+    echo "Unexpected Docker APT key count or fingerprint" >&2
     exit 1
 }
 chmod a+r /etc/apt/keyrings/docker.asc
