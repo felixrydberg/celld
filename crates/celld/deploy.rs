@@ -233,24 +233,6 @@ pub enum VarOverrides {
     DotEnv(BTreeMap<String, String>),
 }
 
-/// Local Worker variables, tagged with the kind of file that supplied them.
-/// The kind decides what an entry that cannot become a var binding does, so
-/// it travels with the entries instead of beside them.
-#[derive(Default)]
-pub enum VarOverrides {
-    #[default]
-    None,
-    /// `.dev.vars` exists only for the Worker, so an entry that cannot become
-    /// a binding is a mistake, and it fails the build.
-    DevVars(BTreeMap<String, String>),
-    /// `.env` and `.env.local` also serve other tools, such as a bundler or an
-    /// ORM. An entry with a name that is not a valid binding, or a name that
-    /// another binding of the config uses, is skipped with a warning. Failing
-    /// instead stops a `celld dev` that `wrangler dev` runs, and the only
-    /// workaround is an empty `.dev.vars`.
-    DotEnv(BTreeMap<String, String>),
-}
-
 pub fn print_help() {
     let text = "celld deploy — build a Worker with esbuild and write it to the fleet bucket\n\n\
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\

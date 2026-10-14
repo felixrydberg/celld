@@ -297,7 +297,7 @@ pub(crate) fn print_help() -> anyhow::Result<()> {
 USAGE:
   celld --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
-  celld application-api --auth-file FILE --bucket NAME [--listen IP:PORT]
+  celld application-api --auth-file FILE --platform-domain DOMAIN --bucket NAME [--listen IP:PORT]
   celld application --help
   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]

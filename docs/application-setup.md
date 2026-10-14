@@ -391,8 +391,10 @@ registered per application, so the same names in two applications never alias.
 | Dynamic Worker loaders (`worker_loader`) | resource binding | `"worker_loaders":[{"binding":"LOADER"}]` (binding name only). Experimental: see limits. |
 
 A Container resource's `configuration` is the only source of its image and
-privileged settings: `{"image":"celld-image:<64 hex>","instance_type":"basic"
-(optional; `lite`, `dev`, `basic`, `standard`, `standard-1` to `standard-4`),"max_instances":N (optional),"runtime":"runsc" (optional)}`. The image
+privileged settings: `{"image":"celld-image:<64 hex>","instance_type":"basic","max_instances":N,"runtime":"runsc"}`.
+`instance_type`, `max_instances` and `runtime` are optional. Allowed
+`instance_type` values are `lite`, `dev`, `basic`, `standard` and
+`standard-1` through `standard-4`. The image
 must already exist in the fleet bucket at `deploy/images/<key>.tar`, as saved by
 the original `celld deploy` of a container class (see
 [services/containers.md](services/containers.md)); there is no management or CLI

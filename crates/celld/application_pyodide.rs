@@ -203,11 +203,14 @@ async fn snapshot(
             Ok(body)
         }
         Err(error) => {
-            let exit = exit.context(crate::application_vm::ReapUnproved)?;
+            let exit = match exit.context(crate::application_vm::ReapUnproved) {
+                Ok(exit) => exit,
+                Err(reap_error) => return Err(reap_error.context(error)),
+            };
             Err(error.context(format!(
-            "Pyodide snapshot builder failed: {}",
-            exit.console)
-        ))
+                "Pyodide snapshot builder failed: {}",
+                exit.console
+            )))
         }
     }
 }

@@ -274,11 +274,19 @@ pub async fn dispatch_call_attempt(
                 // The scoped guest event admits and gates itself. This lookup
                 // only found the object local again.
                 drop(app.activity(request, call.scope.clone()));
+                let body = match body {
+                    RequestBody::Bytes(body) => body.to_vec(),
+                    RequestBody::Stream(_) => {
+                        return CallAttempt::Local(Err(anyhow::anyhow!(
+                            "streamed request bodies are unsupported for guest objects"
+                        )))
+                    }
+                };
                 let wire = celld_applications::invocation_wire::HttpRequest {
                     method,
                     url,
                     headers,
-                    body: body.bytes().to_vec(),
+                    body,
                 };
                 return CallAttempt::Local(
                     serve_guest_object(app, &call.scope, name, guest, wire)

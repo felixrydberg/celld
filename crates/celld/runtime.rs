@@ -1453,7 +1453,19 @@ impl RuntimeManager {
     /// eviction can race, and the eviction's stop did this work.
     pub async fn swap_out_cell(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
         #[cfg(unix)]
-        self.retire_guest_objects(cell, epoch).await?;
+        if let Err(error) = self.retire_guest_objects(cell, epoch).await {
+            if let Some(handle) = self
+                .cells
+                .lock()
+                .expect("cell registry poisoned")
+                .published
+                .get(cell)
+                .filter(|handle| handle.epoch == epoch)
+            {
+                handle.requests.retiring.store(false, Ordering::Release);
+            }
+            return Err(error);
+        }
         // The isolates to release, taken by reference rather than by handle.
         // A release that fails can leave this cell's database open in that
         // realm, and the handle owns both the residency that keeps the realm

@@ -2470,7 +2470,7 @@ class ContainerPort {
         continue;
       }
       headers.delete("host");
-      headers.delete("authorization");
+      for (const name of __CROSS_ORIGIN_SENSITIVE_HEADERS) headers.delete(name);
       return fetch(next.toString(), {
         method, headers, body: bodiless(method) ? undefined : body, redirect: "follow",
       });
