@@ -547,3 +547,107 @@ pub(crate) async fn check_application_broker() {
         "native application R2: original conditional/ranged streaming reads, metadata/checksums, streamed multipart write, out-of-order multipart/resume/complete/abort, cursored list and delete; same-name cross-application scopes, same-bucket cross-owner and legacy handle mutations refused"
     );
 }
+
+/// `__r2_head` is swapped for its guest version when a guest isolate is
+/// installed (js/guest_ops.rs `override_ops`), and for nothing else. No egress
+/// broker exists in-process, so the guest side stops at the broker's refusal;
+/// the host half is `broker_operation`, which is compared with the native op.
+#[cfg(unix)]
+pub(crate) async fn check_guest_head_override() {
+    use crate::bucket::Bucket;
+    use crate::js::guest_storage::{tests::evaluate_in, FETCH_OUTSIDE_EVENT};
+    use celld_applications::resource_wire::R2Operation as R;
+    static DIRECTORY: OnceLock<tempfile::TempDir> = OnceLock::new();
+    Engine::init();
+    let directory = DIRECTORY.get_or_init(|| tempfile::tempdir().unwrap());
+    set_r2_store(Bucket::open_dev(&directory.path().join("r2-head.sqlite")).unwrap());
+    let put = R::Put {
+        key: "record".into(),
+        options: r#"{"http":{"contentType":"text/plain"}}"#.into(),
+    };
+    broker_operation("headcheck".into(), "headcheck".into(), put, b"hello".to_vec())
+        .await
+        .unwrap();
+    let load = |guest: bool| {
+        let config = Arc::new(WorkerConfig::new(WorkerConfigOptions {
+            src: "export default { fetch() { return new Response('x'); } };".into(),
+            script_name: "head-override".into(),
+            do_classes: vec![],
+            bindings: vec![],
+            r2_bindings: vec![],
+            d1_bindings: vec![],
+            kv_bindings: vec![],
+            queue_bindings: vec![],
+            queue_consumers: vec![],
+            workflow_bindings: vec![],
+            vars: vec![],
+            node: "check".into(),
+            modules: vec![],
+            compat: Default::default(),
+        }));
+        if guest {
+            Worker::load_guest_config(config)
+        } else {
+            Worker::load_config(config)
+        }
+        .unwrap()
+    };
+    // Call `op` with `origin` as the continuation and `driver` running the
+    // checkpoint; return the one operation it enqueued and who owns it.
+    let call = |worker: &Worker, origin: &Arc<IoContext>, driver: &Arc<IoContext>, op: &str| {
+        let source = format!("__celld.{op}; return true;");
+        evaluate_in(worker, origin, driver, &source).unwrap();
+        let mut spawned = asyncrt::drain_spawns();
+        assert_eq!(spawned.len(), 1, "{op}");
+        let (_, future, _, owner) = spawned.remove(0);
+        (future, owner)
+    };
+    let hit = "__r2_head('headcheck', 'record')";
+    let miss = "__r2_head('headcheck', 'absent')";
+    let get = "__r2_get('headcheck', 'record', '{}')";
+
+    let native = load(false);
+    let (a, b) = (
+        IoContext::tracked(&native.runtime_state),
+        IoContext::tracked(&native.runtime_state),
+    );
+    let broker = |key: &str| {
+        let key = key.to_owned();
+        async move {
+            let head = R::Head { key };
+            let response = broker_operation("headcheck".into(), "headcheck".into(), head, vec![]);
+            serde_json::from_slice::<serde_json::Value>(&response.await.unwrap().body).unwrap()
+        }
+    };
+    for (op, key) in [(hit, "record"), (miss, "absent")] {
+        let (future, owner) = call(&native, &a, &b, op);
+        assert_eq!(owner, a.continuation_id(), "native {op} owner");
+        let Ok(asyncrt::OpOut::Str(json)) = future.await else {
+            panic!("native {op} did not resolve");
+        };
+        let native_json = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        assert_eq!(native_json, broker(key).await, "native and brokered {op}");
+    }
+    assert!(call(&native, &a, &b, get).0.await.is_ok());
+
+    // A guest isolate never reads the store, though the object is right there
+    // under the very name it passes: it asks the broker, and none exists here.
+    let guest = load(true);
+    let (a, b) = (
+        IoContext::tracked(&guest.runtime_state),
+        IoContext::tracked(&guest.runtime_state),
+    );
+    for op in [hit, miss, get] {
+        let (future, owner) = call(&guest, &a, &b, op);
+        // Attributed to the continuation, not the event running the checkpoint.
+        assert_eq!(owner, a.continuation_id(), "guest {op} owner");
+        assert_ne!(owner, b.continuation_id(), "guest {op} owner");
+        match future.await {
+            Err(error) => assert_eq!(error, FETCH_OUTSIDE_EVENT, "guest {op}"),
+            Ok(_) => panic!("guest {op} read the store"),
+        }
+    }
+    eprintln!(
+        "guest R2 head override: installed in a guest isolate only, attributed to its own continuation under a foreign checkpoint, never reads the store; native head/get unchanged and equal to the broker's head"
+    );
+}

@@ -12,8 +12,42 @@
 //! (the native body is not shared, so an install-time override fits);
 //! `Inline` is a guest branch interleaved with shared or lifecycle code.
 //! "Explicit deny" in a reason means the op already refuses in a guest today.
-// Step 3 consumes `CLASS`; until then only the tests read it.
+// Only the tests read `CLASS`.
 #![cfg_attr(not(test), allow(dead_code))]
+
+use super::*;
+
+/// Replace whole-op swaps with their guest versions, by `OP_NAMES` position:
+/// names, parameter lists and the bootstrap code cache are untouched, only
+/// the function values change. The test is the process or the isolate being a
+/// guest at install time. A loaded worker flipped later by `own_guest_facet`
+/// gets no override; none of these ops is reachable from one, since it has no
+/// binding to call them with (`check_original_guest_loader` pins that).
+/// Each override runs inside `attributed_op`, so spawn attribution is shared.
+/// Drop an `install!` line to roll one back.
+pub(super) fn override_ops<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    functions: &mut [v8::Local<'s, v8::Function>],
+) {
+    if !(guest_storage::enabled(scope) || guest_activity::enabled()) {
+        return;
+    }
+    macro_rules! install {
+        ($name:literal => $op:path) => {{
+            fn attributed<'s>(
+                scope: &mut v8::PinScope<'s, '_>,
+                args: v8::FunctionCallbackArguments<'s>,
+                rv: v8::ReturnValue<'s, v8::Value>,
+            ) {
+                attributed_op(scope, args, rv, $name, $op)
+            }
+            let at = OP_NAMES.iter().position(|name| *name == $name);
+            functions[at.expect("overridden op is in OP_NAMES")] =
+                v8::Function::new(scope, attributed).unwrap();
+        }};
+    }
+    install!("__r2_head" => r2_ops::guest_head);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Class {
@@ -161,7 +195,7 @@ pub(super) const CLASS: &[(&str, Class, &str)] = &[
     ("__sc_decode", Pure, "V8 structured clone from bytes"),
     ("__structured_clone", Pure, "in-isolate structured clone"),
     ("__op_fetch", Brokered, "guest_storage::fetch; EgressPolicy::Deny is skipped in a guest"),
-    ("__r2_head", Brokered, "guest_return to the host R2 broker"),
+    ("__r2_head", Brokered, "install-time override (override_ops): guest_return to the host R2 broker"),
     ("__r2_get", Brokered, "guest_return to the host R2 broker"),
     ("__r2_put", Brokered, "guest_return to the host R2 broker"),
     ("__r2_put_begin", Brokered, "guest_return to the host R2 broker"),

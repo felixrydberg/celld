@@ -6874,24 +6874,39 @@ macro_rules! ops {
                     args: v8::FunctionCallbackArguments<'s>,
                     rv: v8::ReturnValue<'s, v8::Value>,
                 ) {
-                    #[cfg(celld_internal_tests)]
-                    let mut rv = rv;
-                    #[cfg(celld_internal_tests)]
-                    if call_op_patch(scope, $name, &args, &mut rv) {
-                        return;
-                    }
-                    let before = asyncrt::spawn_count();
-                    $op(scope, args, rv);
-                    if asyncrt::spawn_count() != before {
-                        if let Some(owner) = operation_continuation_id(scope) {
-                            asyncrt::attribute_spawns(before, owner);
-                        }
-                    }
+                    attributed_op(scope, args, rv, $name, $op)
                 }
                 functions.push(v8::Function::new(scope, attributed).unwrap());
             })*
         }
     };
+}
+
+/// The body of every op callback, guest overrides (`guest_ops`) included.
+fn attributed_op<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s, v8::Value>,
+    #[cfg_attr(not(celld_internal_tests), allow(unused_variables))] name: &'static str,
+    op: impl FnOnce(
+        &mut v8::PinScope<'s, '_>,
+        v8::FunctionCallbackArguments<'s>,
+        v8::ReturnValue<'s, v8::Value>,
+    ),
+) {
+    #[cfg(celld_internal_tests)]
+    let mut rv = rv;
+    #[cfg(celld_internal_tests)]
+    if call_op_patch(scope, name, &args, &mut rv) {
+        return;
+    }
+    let before = asyncrt::spawn_count();
+    op(scope, args, rv);
+    if asyncrt::spawn_count() != before {
+        if let Some(owner) = operation_continuation_id(scope) {
+            asyncrt::attribute_spawns(before, owner);
+        }
+    }
 }
 
 /// The parameters every internal script is compiled with: the internals
@@ -6950,6 +6965,7 @@ fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> InternalArguments<'s> {
     let internals = v8::Object::new(scope);
     let mut functions = Vec::new();
     install_op_functions(scope, &mut functions);
+    guest_ops::override_ops(scope, &mut functions);
     #[cfg(celld_internal_tests)]
     install_test_op_functions(scope, &mut functions);
     let mut functions = functions.into_iter();

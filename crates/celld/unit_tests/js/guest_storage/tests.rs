@@ -193,7 +193,7 @@ fn evaluate(worker: &Worker, context: &Arc<IoContext>, source: &str) -> Result<S
 
 /// Run with CPED naming `origin` while `driver` owns the checkpoint, as a
 /// foreign continuation does.
-fn evaluate_in(
+pub(crate) fn evaluate_in(
     worker: &Worker,
     origin: &Arc<IoContext>,
     driver: &Arc<IoContext>,
@@ -1686,6 +1686,7 @@ export class Counter {
     anonymous.dispose();
     out.disposed = await fail(() => text(anonymous));
     out.egress = await text(L.load(main('export default { async fetch() { try { await fetch("http://example.invalid/"); return new Response("reached"); } catch (e) { return new Response(String(e.message)); } } }')));
+    out.isolated = await text(L.load(main('export default { fetch(req, env) { return new Response(JSON.stringify([Object.keys(env), typeof __r2_head])); } }')));
     out.nullOutbound = await text(L.load({ ...main(plain), globalOutbound: null }));
     out.outbound = await fail(() => text(L.load({ ...main(plain), globalOutbound: S })));
     out.envService = await fail(() => text(L.load({ ...main(plain), env: { service: S } })));
@@ -1746,6 +1747,10 @@ export default { fetch() { return new Response('guest'); } };
         said("egress").contains("not permitted to access the internet"),
         "{out}"
     );
+    // A loaded worker has no bucket and no op names: the install-time guest
+    // overrides (js/guest_ops.rs) skip it, because own_guest_facet flips it
+    // after install, and nothing in it can call `__r2_head`.
+    assert_eq!(said("isolated"), r#"[[],"undefined"]"#, "{out}");
     assert_eq!(said("nullOutbound"), "plain", "{out}");
     for key in ["outbound", "envService", "tails"] {
         assert!(

@@ -17,6 +17,19 @@ pub(super) fn guest_binding(
     Ok(binding.to_rust_string_lossy(scope))
 }
 
+/// `__r2_head` in a guest isolate, installed over the native op by
+/// `guest_ops::override_ops`. The host broker answers.
+pub(crate) fn guest_head(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let bucket_name = args.get(0).to_rust_string_lossy(scope);
+    let key = args.get(1).to_rust_string_lossy(scope);
+    let operation = celld_applications::resource_wire::R2Operation::Head { key };
+    guest_return(scope, &mut rv, Ok(bucket_name), operation, Vec::new());
+}
+
 pub(super) fn guest_return(
     scope: &mut v8::PinScope,
     rv: &mut v8::ReturnValue<v8::Value>,

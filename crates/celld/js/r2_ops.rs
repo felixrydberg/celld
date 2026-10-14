@@ -66,12 +66,6 @@ pub(super) fn op_r2_head(
 ) {
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let key = args.get(1).to_rust_string_lossy(scope);
-    if guest_storage::enabled(scope) {
-        let binding = Ok(bucket_name);
-        let operation = celld_applications::resource_wire::R2Operation::Head { key };
-        let body = Vec::new();
-        return guest_return(scope, &mut rv, binding, operation, body);
-    }
     let id = asyncrt::enqueue(async move {
         let meta = head(&bucket_name, &key).await?;
         Ok(match meta {
