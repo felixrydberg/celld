@@ -794,7 +794,7 @@ async fn application_management_authorization_publication_and_cli() {
     #[cfg(target_os = "linux")]
     crate::application_javascript_guest::tests::check_queue_event().await;
     #[cfg(target_os = "linux")]
-    crate::js::r2_ops::check_application_broker().await;
+    crate::js::r2_ops::tests::check_application_broker().await;
     #[cfg(target_os = "linux")]
     crate::application_storage::tests::check_javascript_vm().await;
     #[cfg(target_os = "linux")]
