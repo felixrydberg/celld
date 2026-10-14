@@ -8,7 +8,6 @@
 //! semantics live in that module and the serialization format lives here,
 //! because it is what JS can see.
 use super::*;
-#[cfg(unix)]
 use celld_applications::storage_wire as wire;
 
 mod guest;
@@ -151,7 +150,6 @@ pub(super) fn actor_runtime_state(scope: &mut v8::PinScope) -> Arc<ActorRuntimeS
 }
 
 fn queue_serialized_puts(scope: &mut v8::PinScope, cell: String, entries: Vec<(String, Vec<u8>)>) {
-    #[cfg(unix)]
     match guest_storage::channel(scope, &cell) {
         Ok(Some(channel)) => {
             if let Err(error) = guest_storage::queue(&channel, entries) {
@@ -232,7 +230,6 @@ pub(super) fn op_storage_flush_pending_puts(
 }
 
 fn flush_pending_puts(scope: &mut v8::PinScope, cell: &str) -> Result<(), String> {
-    #[cfg(unix)]
     if let Some(channel) = guest_storage::channel(scope, cell)? {
         return guest_storage::flush(scope, &channel);
     }
@@ -374,7 +371,6 @@ pub(super) fn op_storage_cancel_pending_puts(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
-    #[cfg(unix)]
     match guest_storage::channel(scope, &cell) {
         Ok(Some(channel)) => {
             guest_storage::cancel(&channel);
@@ -544,9 +540,7 @@ pub(super) fn op_sql_cursor_start(
             };
             let cursor_id = match cursor {
                 SqlCursorId::Native(cursor) => v8::Number::new(scope, cursor as f64).into(),
-                #[cfg(unix)]
                 SqlCursorId::Guest(Some(cursor)) => v8::String::new(scope, &cursor).unwrap().into(),
-                #[cfg(unix)]
                 SqlCursorId::Guest(None) => v8::Number::new(scope, 0.0).into(),
             };
             set(scope, "cursorId", cursor_id);
@@ -591,7 +585,6 @@ pub(super) fn op_sql_cursor_next(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    #[cfg(unix)]
     if guest_storage::enabled(scope) {
         let result = (|| {
             let channel = guest_storage::current_channel(scope)?;
@@ -684,7 +677,6 @@ pub(super) fn op_sql_cursor_close(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    #[cfg(unix)]
     if guest_storage::enabled(scope) {
         let result = (|| {
             let channel = guest_storage::current_channel(scope)?;
@@ -806,7 +798,6 @@ pub(super) fn op_storage_transaction_control(
     // Clearing the cell queue on rollback would also discard parent writes;
     // flushing after rollback would commit the canceled writes outside it.
     let result = flush_pending_puts(scope, &cell).and_then(|()| {
-        #[cfg(unix)]
         if let Some(channel) = guest_storage::channel(scope, &cell)? {
             guest_storage::transaction_control(scope, &channel, &action, nested, &savepoint)?;
             // Trusted host output sampling handles committed alarm changes.
@@ -841,7 +832,6 @@ pub(super) fn op_storage_delete(
     let s = args.get(0).to_rust_string_lossy(scope);
     let k = args.get(1).to_rust_string_lossy(scope);
     let result = (|| {
-        #[cfg(unix)]
         if let Some(channel) = guest_storage::channel(scope, &s)? {
             return match guest_storage::call(
                 scope,
@@ -907,7 +897,6 @@ pub(super) fn op_storage_list(
         }
     };
     let result = (|| {
-        #[cfg(unix)]
         if let Some(channel) = guest_storage::channel(scope, &cell)? {
             return guest_storage::entries(
                 scope,
@@ -965,7 +954,6 @@ pub(super) fn op_storage_sync_list_start(
             return;
         }
     };
-    #[cfg(unix)]
     match guest_storage::channel(scope, &cell).and_then(|channel| {
         channel
             .map(|channel| {
@@ -1016,7 +1004,6 @@ pub(super) fn op_storage_sync_list_next(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let result = (|| {
-        #[cfg(unix)]
         if guest_storage::enabled(scope) {
             if !args.get(0).is_string() {
                 return Err("sync KV cursor was invalidated".to_string());
@@ -1412,7 +1399,6 @@ pub(super) fn op_storage_delete_all(
     let cell = args.get(0).to_rust_string_lossy(scope);
     let delete_alarm = args.get(1).boolean_value(scope);
     let result = (|| {
-        #[cfg(unix)]
         if let Some(channel) = guest_storage::channel(scope, &cell)? {
             return guest_storage::unit(
                 scope,

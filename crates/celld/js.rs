@@ -27,9 +27,7 @@ use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 pub(crate) mod guest_activity;
 pub(crate) mod guest_host;
 pub(crate) use guest_host::*;
-#[cfg(unix)]
 pub(crate) mod guest_storage;
-#[cfg(unix)]
 use guest_storage::{guest_facet_open, guest_facet_slot, GuestFacet};
 mod guest_ops;
 pub(crate) mod input_gate_lifecycle;
@@ -2497,13 +2495,11 @@ struct ActorRuntimeState {
     /// Weak references record every continuation context without extending
     /// an event's lifetime merely to flush its output.
     ws_capture_touched: Mutex<Vec<Weak<IoContext>>>,
-    #[cfg(unix)]
     guest_storage_enabled: AtomicBool,
     /// `EgressPolicy::Deny` has two meanings. Set only on a root guest, built
     /// with no network device: its fetch goes to the trusted host broker. On any
     /// other isolate, including a loaded child later promoted by
     /// `own_guest_facet`, Deny is the capability denial of `globalOutbound: null`.
-    #[cfg(unix)]
     host_brokers_egress: bool,
     egress: EgressPolicy,
     resource_limits: Option<ResourceLimits>,
@@ -3400,7 +3396,6 @@ impl InFlight {
         tc: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
     ) {
-        #[cfg(unix)]
         // HTTP decoding runs user getters. Lifecycle acknowledgements have
         // no response payload and may settle under cleanup-only admission.
         if matches!(self.reply.as_ref(), Some(Answer::Fetch(_))) && self.context.has_guest_storage()
@@ -3887,7 +3882,6 @@ impl InFlight {
     /// Whether this event holds a cell's input gate now, or is queued to
     /// take one.
     fn engages_gate(&self) -> bool {
-        #[cfg(unix)]
         if self
             .context
             .guest_storage
@@ -3904,7 +3898,6 @@ impl InFlight {
     /// queue count from a future that was never adopted must not keep the
     /// event from retiring.
     fn holds_gate(&self) -> bool {
-        #[cfg(unix)]
         if self
             .context
             .guest_storage
@@ -6169,9 +6162,7 @@ impl Worker {
             promises: std::sync::Mutex::new(PromiseMap::new()),
             // Before module evaluation: guest code must never fall through
             // to native storage or direct egress while no event is attached.
-            #[cfg(unix)]
             guest_storage_enabled: AtomicBool::new(guest),
-            #[cfg(unix)]
             host_brokers_egress: guest,
             egress: if guest {
                 EgressPolicy::Deny
@@ -6690,7 +6681,6 @@ impl Worker {
         let Some(inner) = self.inner.as_mut() else {
             return (None, Vec::new());
         };
-        #[cfg(unix)]
         if inner
             .runtime_state
             .guest_storage_enabled
@@ -7491,7 +7481,7 @@ fn op_queue_policy(
         match serde_json::from_str(&args.get(0).to_rust_string_lossy(scope)) {
             Ok(request) => request,
             Err(error) => {
-                return loader_throw(scope, &format!("invalid Queue policy input: {error}"));
+                return loader_throw(scope, &format!("invalid Queue policy input: {error}"))
             }
         };
     #[cfg(celld_internal_tests)]
@@ -7548,7 +7538,6 @@ fn op_svc_rpc(
         }
     };
     let props = view_bytes(args.get(4)).unwrap_or_default();
-    #[cfg(unix)]
     if guest_storage::enabled(scope) {
         // A property read (`get`) passes no signal list.
         let signals = if args.get(5).is_null_or_undefined() {
@@ -7669,7 +7658,7 @@ fn op_svc_call_impl(
                     &format!(
                         "service binding: the request headers are not a name/value list: {error}"
                     ),
-                );
+                )
             }
         };
     let mut body_guard = match body.stream_id() {
@@ -7700,7 +7689,6 @@ fn op_svc_call_impl(
     } else {
         (None, None, None)
     };
-    #[cfg(unix)]
     if guest_storage::enabled(scope) {
         let invocation = celld_applications::invocation_wire::ServiceInvocation {
             entrypoint: entrypoint.as_ref().map(|value| value.name.clone()),
@@ -7932,13 +7920,7 @@ fn admit_loaded_worker(
 }
 
 fn in_guest(scope: &mut v8::PinScope) -> bool {
-    #[cfg(unix)]
-    return guest_storage::enabled(scope);
-    #[cfg(not(unix))]
-    {
-        let _ = scope;
-        false
-    }
+    guest_storage::enabled(scope)
 }
 
 fn loader_throw(scope: &mut v8::PinScope, message: &str) {
@@ -8200,7 +8182,7 @@ fn op_loader_load(
                 return loader_throw(
                     scope,
                     &format!("worker loader: malformed globalOutbound route: {error}"),
-                );
+                )
             }
         };
         let props = match view_bytes(outbound_props) {
@@ -8209,7 +8191,7 @@ fn op_loader_load(
                 return loader_throw(
                     scope,
                     "worker loader: globalOutbound props are not a typed array",
-                );
+                )
             }
         };
         let entrypoint = match route.entrypoint {
@@ -8219,7 +8201,7 @@ fn op_loader_load(
                 return loader_throw(
                     scope,
                     "worker loader: globalOutbound props require an entrypoint",
-                );
+                )
             }
         };
         EgressPolicy::Broker(OutboundBroker {
@@ -8351,7 +8333,7 @@ fn op_loader_fetch(
                     &format!(
                         "worker loader: the request headers are not a name/value list: {error}"
                     ),
-                );
+                )
             }
         };
     let want_tail_report = args.get(9).boolean_value(scope);
@@ -8956,7 +8938,6 @@ fn op_facet_rpc(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    #[cfg(unix)]
     if in_guest(scope) {
         let call = match guest_facet_open(scope, &args) {
             Ok(call) => call,
@@ -9010,7 +8991,7 @@ fn op_facet_rpc(
             return loader_throw(
                 scope,
                 "facets are available only inside a Durable Object event",
-            );
+            )
         }
         Err(error) => return loader_throw(scope, &error.to_string()),
     };
@@ -9107,7 +9088,6 @@ fn op_facet_fetch(
         },
         None => RequestBodyGuard::of(&body),
     };
-    #[cfg(unix)]
     if in_guest(scope) {
         let facet =
             match guest_storage::facet_open(scope, &parent_scope, &class_name, &owner, &name) {
@@ -9161,7 +9141,7 @@ fn op_facet_fetch(
             return loader_throw(
                 scope,
                 "facets are available only inside a Durable Object event",
-            );
+            )
         }
         Err(error) => return loader_throw(scope, &error.to_string()),
     };
@@ -9237,7 +9217,6 @@ fn op_facet_abort(
     let name = args.get(4).to_rust_string_lossy(scope);
     // A guest closes the host's facet sessions and cell. A released object's
     // lifecycle channel refuses that, and its sessions are already retired.
-    #[cfg(unix)]
     if in_guest(scope) {
         guest_storage::facet_abort(scope, &parent_scope, &class_name, &owner, &name);
     }
@@ -9304,7 +9283,6 @@ fn op_facet_delete(
 ) {
     let parent_scope = args.get(0).to_rust_string_lossy(scope);
     let name = args.get(1).to_rust_string_lossy(scope);
-    #[cfg(unix)]
     if in_guest(scope) {
         if let Err(error) = guest_storage::facet_delete(scope, &parent_scope, &name) {
             loader_throw(scope, &format!("delete facet storage: {error}"));
@@ -9317,7 +9295,7 @@ fn op_facet_delete(
             return loader_throw(
                 scope,
                 "facets are available only inside a Durable Object event",
-            );
+            )
         }
         Err(error) => return loader_throw(scope, &error.to_string()),
     };
@@ -9407,11 +9385,10 @@ fn op_do_call_impl(
                     &format!(
                         "durable object: the request headers are not a name/value list: {error}"
                     ),
-                );
+                )
             }
         };
     // A guest reaches objects only through the trusted host's namespace grants.
-    #[cfg(unix)]
     if guest_storage::enabled(scope) {
         let RequestBody::Bytes(body) = body else {
             return loader_throw(
@@ -9645,7 +9622,6 @@ fn op_rpc_call(
     let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
     let method = args.get(2).to_rust_string_lossy(scope);
     let args = view_bytes(args.get(3)).unwrap_or_default();
-    #[cfg(unix)]
     if guest_storage::enabled(scope) {
         // The request line is a placeholder: the host dispatches on the RPC
         // method, never on a URL.
@@ -9696,16 +9672,10 @@ fn op_fetch(
     }
     let egress = actor_runtime_state(scope).egress.clone();
     // A guest has no network device: the trusted host brokers its fetch.
-    #[cfg(unix)]
     let guest = guest_storage::enabled(scope);
-    #[cfg(not(unix))]
-    let guest = false;
     // A loaded worker with globalOutbound: null has no ambient egress: it must
     // reach the world through `env` capabilities. Message matches workerd.
-    #[cfg(unix)]
     let brokered = actor_runtime_state(scope).host_brokers_egress;
-    #[cfg(not(unix))]
-    let brokered = false;
     if egress == EgressPolicy::Deny && !brokered {
         return loader_throw(
             scope,
@@ -9745,7 +9715,7 @@ fn op_fetch(
             return loader_throw(
                 scope,
                 &format!("fetch: the request headers are not a name/value list: {error}"),
-            );
+            )
         }
     };
     let redirect = args.get(4).to_rust_string_lossy(scope);
@@ -9767,7 +9737,6 @@ fn op_fetch(
         "follow" | "manual" | "error" => {}
         other => return loader_throw(scope, &format!("fetch: unknown redirect mode {other}")),
     }
-    #[cfg(unix)]
     if guest {
         drop(body_guard);
         match guest_storage::fetch(scope, method, url, headers, body, redirect) {
@@ -10020,7 +9989,7 @@ fn op_asset_fetch(
                 return loader_throw(
                     scope,
                     &format!("assets: the request headers are not a name/value list: {error}"),
-                );
+                )
             }
         };
     if guest_storage::enabled(scope) {
@@ -10337,7 +10306,6 @@ fn op_gate_acquire(
     // The harness installs the driver before acquisition. A missing driver
     // is rejected above instead of transferring a stale block to its origin.
     let owner = owner_context.continuation_id();
-    #[cfg(unix)]
     if guest_storage::enabled(scope) {
         match guest_storage::critical_start(scope, &cell, event, &context, &owner_context) {
             Ok(()) => {
@@ -10439,7 +10407,7 @@ fn op_gate_acquire(
                         // fresh gate.
                         Ok(Err(failure)) => return Err(failure),
                         Err(_) => {
-                            return Err("cell stopped while waiting for its input gate".to_string());
+                            return Err("cell stopped while waiting for its input gate".to_string())
                         }
                     }
                     let Some(context) = context.upgrade() else {
@@ -10488,7 +10456,6 @@ fn op_gate_wait(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
-    #[cfg(unix)]
     if guest_storage::enabled(scope) {
         rv.set(rejected_promise(
             scope,
@@ -10504,7 +10471,7 @@ fn op_gate_wait(
                     Ok(Ok(())) => {}
                     Ok(Err(failure)) => return Err(failure),
                     Err(_) => {
-                        return Err("cell stopped while waiting for its input gate".to_string());
+                        return Err("cell stopped while waiting for its input gate".to_string())
                     }
                 },
             }
@@ -10544,7 +10511,6 @@ fn op_gate_release(
     let Some(context) = context else {
         return;
     };
-    #[cfg(unix)]
     if guest_storage::enabled(scope) {
         if let Err(error) =
             guest_storage::critical_finish(scope, &cell, event, &context, outcome.is_err())
@@ -10595,9 +10561,7 @@ fn register_actor_name(
     let Some(name) = name else {
         return Ok(());
     };
-    #[cfg(unix)]
     let guest_channel = guest_storage::channel(scope, actor_scope).map_err(anyhow::Error::msg)?;
-    #[cfg(unix)]
     if let Some(channel) = &guest_channel {
         let host_name = guest_storage::actor_name(scope, channel).map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
@@ -10625,10 +10589,7 @@ fn register_actor_name(
     // namespace and the name, and persisted the name it checked above. One
     // guest worker can serve several resources, so its per-class key cannot
     // re-derive that scope; the original isolate still derives and persists.
-    #[cfg(unix)]
     let host_verified = guest_channel.is_some();
-    #[cfg(not(unix))]
-    let host_verified = false;
     // The trusted application pool takes the name from its host, which derived
     // the scope from the resource; persist it, but there is nothing to re-derive.
     let verified_key = v8::String::new(scope, "hostVerifiedNames").unwrap();
@@ -10785,7 +10746,6 @@ fn op_actor_abort(
     let reason = args.get(1).to_rust_string_lossy(scope);
     // The trusted host must latch the abort before the guest stops: it keeps
     // native holds and retires the VM instead of trusting guest termination.
-    #[cfg(unix)]
     if let Ok(Some(channel)) = guest_storage::channel(scope, &cell) {
         guest_storage::cancel(&channel);
         let reason: String = reason.chars().take(1024).collect();
@@ -11745,7 +11705,6 @@ impl RequestVfs {
 pub struct IoContext {
     #[cfg(target_os = "linux")]
     application_scope: OnceLock<Arc<crate::application_vm::ScopeMetadata>>,
-    #[cfg(unix)]
     guest_storage: OnceLock<Arc<guest_storage::Channel>>,
     /// A process-wide identity captured by V8 with each promise reaction.
     /// The process-wide cell-gate map also uses it, so another isolate must
@@ -12021,7 +11980,6 @@ impl IoContext {
             application_scope: OnceLock::new(),
             continuation: None,
             event_driver: AtomicBool::new(false),
-            #[cfg(unix)]
             guest_storage: OnceLock::new(),
             call_chains: Mutex::new(CallChains::default()),
             events: Mutex::new(IoEventState::default()),
@@ -12058,7 +12016,6 @@ impl IoContext {
             application_scope: OnceLock::new(),
             continuation: Some((id, Arc::downgrade(runtime_state))),
             event_driver: AtomicBool::new(false),
-            #[cfg(unix)]
             guest_storage: OnceLock::new(),
             call_chains: Mutex::new(CallChains::default()),
             events: Mutex::new(IoEventState::default()),
@@ -12952,7 +12909,6 @@ fn op_alarm_set(
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
     let at = args.get(1).number_value(scope).unwrap_or(0.0) as i64;
-    #[cfg(unix)]
     match guest_storage::channel(scope, &s) {
         Ok(Some(channel)) => {
             if let Err(error) = guest_storage::unit(
@@ -13041,7 +12997,6 @@ fn op_alarm_get(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
-    #[cfg(unix)]
     match guest_storage::channel(scope, &s) {
         Ok(Some(channel)) => {
             match guest_storage::alarm(scope, &channel) {
@@ -13068,7 +13023,6 @@ fn op_alarm_delete(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
-    #[cfg(unix)]
     match guest_storage::channel(scope, &s) {
         Ok(Some(channel)) => {
             if let Err(error) = guest_storage::unit(

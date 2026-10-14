@@ -2,6 +2,11 @@
 
 use super::*;
 
+// Not equivalent to native: the broker proves the calling event's output
+// (`output().prove`) before every brokered op, reads (head/get/list) included,
+// while native reads wait on no egress gate. Stricter, so safe, but a guest
+// read can wait on or fail that proof where a native one cannot.
+
 // Original JS upload closures retain their binding alias. The broker still
 // authorizes every opaque upload id against its host-derived bucket; the guest
 // needs no permanent upload-id registry.
