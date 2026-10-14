@@ -14,6 +14,9 @@ use std::sync::{
 };
 use subtle::ConstantTimeEq;
 
+#[path = "application_storage/facet_lifetime.rs"]
+mod facet_lifetime;
+
 const MAX_CURSORS: usize = 128;
 const MAX_TRANSACTIONS: usize = 128;
 const MAX_CRITICAL_SECTIONS: usize = 64;
@@ -61,10 +64,10 @@ pub struct StorageSession {
     /// A facet event session names the live root it lives in; every operation
     /// checks it, so a facet of a retired root can never act on a successor.
     parent: Option<ParentLink>,
-    /// Facet event sessions by grant, and the native facet cells this session
-    /// opened. Both end with this session; the guest supplies neither scope.
+    /// Facet event sessions by grant, and the native facet connections this
+    /// session uses. Both end with this session; the guest supplies neither scope.
     facets: HashMap<String, StorageSession>,
-    facet_cells: Vec<String>,
+    facet_cells: Vec<facet_lifetime::Lease>,
     /// For a facet event session, its facet's names from the root down; its
     /// replication stream derives from them and the root.
     facet_names: Vec<String>,
@@ -1371,16 +1374,17 @@ impl StorageSession {
             .any(|(held, child)| held == grant || child.has_facet(grant))
     }
 
-    /// Revoke every facet event session and close the native facet cells this
-    /// session opened. The facets' files and replication streams belong to the
-    /// root and outlive this session.
+    /// Revoke every facet event session and release this session's connection
+    /// leases. The facets' files and replication streams belong to the root.
     fn retire_facets(&mut self, cells: &Cells) {
         for (_, mut child) in std::mem::take(&mut self.facets) {
             let _ = child.revoke(cells);
         }
         let _installed = cells.install();
-        for scope in self.facet_cells.drain(..) {
-            storage::close(&scope);
+        for lease in self.facet_cells.drain(..) {
+            if facet_lifetime::release(&lease) {
+                storage::close(&lease.scope);
+            }
         }
     }
 
@@ -1617,18 +1621,20 @@ impl StorageSession {
             _ => anyhow::bail!("the facet's stream was not opened"),
         };
         if storage::activation_epoch(&facet).is_some_and(|epoch| epoch != parent.epoch) {
+            facet_lifetime::invalidate(&self.root_link().residency, &facet);
             storage::close(&facet);
         }
         if storage::activation_epoch(&facet).is_none() {
             // ponytail: no sqlite-vec for facets until compatibility reaches them.
             storage::open_embedded(&facet, &parent, &name, &path, restored, false)?;
-            self.facet_cells.push(facet.clone());
         } else {
             storage::refresh_embedded_root(&facet, &parent);
         }
         let mut child = StorageSession::new(cells, facet.clone(), parent.epoch)?;
         child.parent = Some(self.root_link());
         child.facet_names = names;
+        let lease = facet_lifetime::retain(&self.root_link().residency, &facet);
+        self.facet_cells.push(lease);
         let grant = child.grant.clone();
         self.facets.insert(grant.clone(), child);
         Ok(Value::Facet {
@@ -1674,10 +1680,13 @@ impl StorageSession {
     /// Revoke the events of the facets `doomed` and close their cells.
     fn close_facets(&mut self, cells: &Cells, doomed: &[String]) {
         self.revoke_facet_events(cells, doomed);
+        let root = self.root_link();
         for scope in doomed {
+            facet_lifetime::invalidate(&root.residency, scope);
             storage::close(scope);
         }
-        self.facet_cells.retain(|held| !doomed.contains(held));
+        self.facet_cells
+            .retain(|lease| !doomed.contains(&lease.scope));
     }
 
     fn revoke_facet_events(&mut self, cells: &Cells, doomed: &[String]) {

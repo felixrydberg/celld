@@ -780,7 +780,7 @@ fn http_boundary_retains_bytes_and_rejects_guest_authority() {
         GuestControl::decode(&control.encode().unwrap()).unwrap(),
         control
     );
-    let mut injected = serde_json::to_value(control).unwrap();
+    let mut injected = serde_json::to_value(&control).unwrap();
     injected["response"]["proof"] = serde_json::json!(true);
     assert!(GuestControl::decode(&serde_json::to_vec(&injected).unwrap()).is_err());
     // Drop the unknown field before testing the `event` tag: `HttpReply` carries

@@ -497,5 +497,8 @@ pub fn route_label(hostname: &str, domain: &str) -> Option<String> {
     }
     .to_ascii_lowercase();
     let label = hostname.strip_suffix(domain)?.strip_suffix('.')?;
+    if label.is_empty() || label.contains('.') {
+        return None;
+    }
     Some(label.to_owned())
 }
