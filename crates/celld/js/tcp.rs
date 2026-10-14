@@ -50,8 +50,83 @@ fn next_id() -> u64 {
 /// Drop one socket's registry entry, which closes the connection. The
 /// request context calls this for every socket the event opened, so an
 /// abandoned socket cannot outlive its event. Idempotent.
-pub(super) fn free(id: u64) {
+pub(crate) fn free(id: u64) {
     registry().lock().unwrap().remove(&id);
+}
+
+/// A connected stream under a fresh id, for a caller that owns its lifetime.
+pub(crate) fn adopt(stream: tokio::net::TcpStream) -> u64 {
+    let id = next_id();
+    insert(id, Box::new(stream));
+    id
+}
+
+/// An id for a socket `upgrade` is about to create.
+pub(crate) fn allocate() -> u64 {
+    next_id()
+}
+
+/// The host halves of the socket ops. Each looks its socket up when called, so
+/// an op keeps the socket it was issued against even if the id is freed.
+pub(crate) fn read_chunk(id: u64) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send {
+    let half = registry().lock().unwrap().get(&id).map(|s| s.read.clone());
+    async move {
+        let half = half.ok_or("socket is closed")?;
+        let mut guard = half.lock().await;
+        let read = guard.as_mut().ok_or("socket is closed")?;
+        let mut buffer = vec![0u8; 16 * 1024];
+        let n = read
+            .read(&mut buffer)
+            .await
+            .map_err(|error| format!("read failed: {error}"))?;
+        buffer.truncate(n);
+        Ok(buffer)
+    }
+}
+
+pub(crate) fn write_all(
+    id: u64,
+    bytes: impl AsRef<[u8]> + Send + 'static,
+) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
+    async move {
+        let half = half.ok_or("socket is closed")?;
+        let mut guard = half.lock().await;
+        let write = guard.as_mut().ok_or("socket is closed")?;
+        write
+            .write_all(bytes.as_ref())
+            .await
+            .map_err(|error| format!("write failed: {error}"))?;
+        write
+            .flush()
+            .await
+            .map_err(|error| format!("flush failed: {error}"))
+    }
+}
+
+pub(crate) fn shutdown_write(id: u64) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
+    async move {
+        let half = half.ok_or("socket is closed")?;
+        let mut guard = half.lock().await;
+        let write = guard.as_mut().ok_or("socket is closed")?;
+        write
+            .shutdown()
+            .await
+            .map_err(|error| format!("shutdown failed: {error}"))
+    }
+}
+
+/// Consume the plaintext socket `id` into the TLS socket `new_id`; every later
+/// operation on `id` fails.
+pub(crate) async fn upgrade(id: u64, new_id: u64, host: String) -> Result<(), String> {
+    let taken = registry().lock().unwrap().remove(&id);
+    let socket = taken.ok_or("socket is closed")?;
+    let read = socket.read.lock().await.take().ok_or("socket is closed")?;
+    let write = socket.write.lock().await.take().ok_or("socket is closed")?;
+    let stream = read.unsplit(write);
+    insert(new_id, handshake(stream, host).await?);
+    Ok(())
 }
 
 fn insert(id: u64, stream: Duplex) {
@@ -197,19 +272,7 @@ pub(super) fn op_tcp_read(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    let half = registry().lock().unwrap().get(&id).map(|s| s.read.clone());
-    let async_id = asyncrt::enqueue(async move {
-        let half = half.ok_or("socket is closed")?;
-        let mut guard = half.lock().await;
-        let read = guard.as_mut().ok_or("socket is closed")?;
-        let mut buffer = vec![0u8; 16 * 1024];
-        let n = read
-            .read(&mut buffer)
-            .await
-            .map_err(|error| format!("read failed: {error}"))?;
-        buffer.truncate(n);
-        Ok::<Vec<u8>, String>(buffer)
-    });
+    let async_id = asyncrt::enqueue(read_chunk(id));
     rv.set(promise_for(scope, async_id));
 }
 
@@ -222,21 +285,11 @@ pub(super) fn op_tcp_write(
     let Some(bytes) = view_bytes(args.get(1)) else {
         return loader_throw(scope, "socket write needs bytes");
     };
-    let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
+    let write = write_all(id, bytes);
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
-        let half = half.ok_or("socket is closed")?;
-        let mut guard = half.lock().await;
-        let write = guard.as_mut().ok_or("socket is closed")?;
-        write
-            .write_all(&bytes)
-            .await
-            .map_err(|error| format!("write failed: {error}"))?;
-        write
-            .flush()
-            .await
-            .map_err(|error| format!("flush failed: {error}"))?;
+        write.await?;
         Ok::<String, String>(String::new())
     });
     rv.set(promise_for(scope, async_id));
@@ -248,17 +301,11 @@ pub(super) fn op_tcp_shutdown(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
+    let shutdown = shutdown_write(id);
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
-        let half = half.ok_or("socket is closed")?;
-        let mut guard = half.lock().await;
-        let write = guard.as_mut().ok_or("socket is closed")?;
-        write
-            .shutdown()
-            .await
-            .map_err(|error| format!("shutdown failed: {error}"))?;
+        shutdown.await?;
         Ok::<String, String>(String::new())
     });
     rv.set(promise_for(scope, async_id));
@@ -297,13 +344,7 @@ pub(super) fn op_tcp_starttls(
         // The plaintext socket remains registered while the gate waits so the
         // event cleanup can close it. Consume it only when the TLS handshake can
         // start, and make every later operation on the old id fail.
-        let taken = registry().lock().unwrap().remove(&request.id);
-        let socket = taken.ok_or("socket is closed")?;
-        let read = socket.read.lock().await.take().ok_or("socket is closed")?;
-        let write = socket.write.lock().await.take().ok_or("socket is closed")?;
-        let stream = read.unsplit(write);
-        let stream = handshake(stream, request.host).await?;
-        insert(new_id, stream);
+        upgrade(request.id, new_id, request.host).await?;
         Ok::<String, String>(serde_json::json!({ "id": new_id }).to_string())
     });
     rv.set(promise_for(scope, async_id));

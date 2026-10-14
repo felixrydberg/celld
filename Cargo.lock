@@ -295,6 +295,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cbc",
+ "celld-applications",
  "celld-logic",
  "celld-ltx",
  "chrono",
@@ -356,6 +357,22 @@ dependencies = [
  "v8",
  "webpki-roots",
  "x25519-dalek",
+]
+
+[[package]]
+name = "celld-applications"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "celld-logic",
+ "getrandom 0.3.4",
+ "hex",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]
@@ -1213,6 +1230,12 @@ checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
 ]
+
+[[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hkdf"
@@ -3399,6 +3422,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "slab",

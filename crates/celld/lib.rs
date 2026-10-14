@@ -1,6 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
+// Owned guest drivers compose routing, native turns and proof futures.
+#![recursion_limit = "256"]
 
 //! Effect adapters for the clean-sheet core.
 //!
@@ -13,6 +15,26 @@ mod tokio_select;
 pub use tokio_select::__asyncrt_select_support;
 
 pub mod actor;
+pub mod application_api;
+pub mod application_cli;
+pub(crate) mod application_container;
+pub(crate) mod application_guest;
+#[cfg(unix)]
+pub(crate) mod application_guest_transport;
+#[cfg(target_os = "linux")]
+pub(crate) mod application_image;
+#[cfg(target_os = "linux")]
+pub mod application_javascript_guest;
+#[cfg(target_os = "linux")]
+pub(crate) mod application_pyodide;
+pub mod application_storage;
+#[cfg(target_os = "linux")]
+pub mod application_template;
+#[cfg(target_os = "linux")]
+pub mod application_template_agent;
+#[cfg(target_os = "linux")]
+pub mod application_vm;
+pub mod applications;
 #[cfg(all(test, celld_internal_tests))]
 mod conformance_core_loop_tests {
     include!(env!("CELLD_CONFORMANCE_CORE_LOOP_TESTS"));

@@ -76,6 +76,29 @@ async fn dispatch_ws_message(
             return Ok(());
         }
     }
+    // An application object's guest runs the event and releases its own
+    // frames, each proved under that event's output gate.
+    #[cfg(target_os = "linux")]
+    let application_dispatcher = match celld::application_vm::hosted() {
+        Some(applications) if applications.owns_socket_scope(scope).await? => Some(applications),
+        _ => None,
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(applications) = application_dispatcher {
+        let (event, body) = match data {
+            celld::js::WsIn::Text(text) => (
+                celld_applications::invocation_wire::SocketEvent::Text,
+                text.into_bytes(),
+            ),
+            celld::js::WsIn::Binary(bytes) => (
+                celld_applications::invocation_wire::SocketEvent::Binary,
+                bytes,
+            ),
+        };
+        return applications
+            .dispatch_socket(app, scope, ws_id, event, body)
+            .await;
+    }
     let Routed { request, route } = app
         .websocket_request(socket.cell().to_string(), ws_id)
         .await
@@ -194,6 +217,27 @@ async fn dispatch_ws_closed(
     was_clean: bool,
 ) -> anyhow::Result<()> {
     let scope = socket.scope();
+    #[cfg(target_os = "linux")]
+    let application_dispatcher = match celld::application_vm::hosted() {
+        Some(applications) if applications.owns_socket_scope(scope).await? => Some(applications),
+        _ => None,
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(applications) = application_dispatcher {
+        return applications
+            .dispatch_socket(
+                app,
+                scope,
+                ws_id,
+                celld_applications::invocation_wire::SocketEvent::Close {
+                    code,
+                    reason,
+                    was_clean,
+                },
+                Vec::new(),
+            )
+            .await;
+    }
     let Routed { request, route } = app
         .websocket_request(socket.cell().to_string(), ws_id)
         .await
@@ -343,6 +387,12 @@ impl PendingWebSocket {
     fn new(websocket: HttpResponseWebSocket) -> anyhow::Result<Self> {
         Ok(match websocket {
             HttpResponseWebSocket::Worker(worker) => Self::Worker(worker),
+            // The upgrade consumes the claimed socket; the connection owns it now.
+            // A peer owner's parked 101 splices exactly as a legacy tunnel does.
+            #[cfg(unix)]
+            HttpResponseWebSocket::Guest(socket) => {
+                return Self::new(HttpResponseWebSocket::Cell(socket.into_target()));
+            }
             HttpResponseWebSocket::Cell(target) => match target.tunnel {
                 Some(parked) => Self::Tunnel {
                     target,
@@ -750,6 +800,19 @@ struct PumpClose {
     initiator: CloseInitiator,
 }
 
+/// What the application-route check decided for an upgrade.
+///
+/// `Withdrawn` is a separate case from `Unclaimed` on purpose. A platform host
+/// that names no live route answers 404 and must never reach the legacy Worker,
+/// while `Unclaimed` is the only state that falls through to it.
+#[derive(Default)]
+enum ApplicationUpgrade {
+    #[default]
+    Unclaimed,
+    Withdrawn,
+    Dispatched(anyhow::Result<HttpResponse>),
+}
+
 async fn write_ws_out<S>(ws: &SocketWriter<S>, out: celld::js::WsOut) -> bool
 where
     S: tokio::io::AsyncWrite + Unpin,
@@ -1089,10 +1152,34 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
     };
     let body_read_us = body_started.elapsed().as_micros() as u64;
     let worker_started = Instant::now();
-    let mut worker_response = match runtime
-        .fetch_worker_pool(url, method, body.into(), headers, cancellation)
-        .await
-    {
+    let fetched = match application_upgrade(&app, &url, &method, &headers, &body).await {
+        ApplicationUpgrade::Unclaimed => {
+            runtime
+                .fetch_worker_pool(url, method, body.into(), headers, cancellation)
+                .await
+        }
+        ApplicationUpgrade::Withdrawn => {
+            // A platform host whose route is gone or inactive answers 404, the
+            // same as the plain HTTP path (main.rs). Falling through to the
+            // legacy Worker here would break the stronger promise.
+            emit_websocket_connection_timing(
+                runtime,
+                request_id,
+                started,
+                body_read_us,
+                worker_started.elapsed().as_micros() as u64,
+                WebSocketConnectionOutcome {
+                    outcome: "rejected",
+                    route: "",
+                    scope: "",
+                    status: StatusCode::NOT_FOUND.as_u16(),
+                },
+            );
+            return response(StatusCode::NOT_FOUND, "application route not found");
+        }
+        ApplicationUpgrade::Dispatched(fetched) => fetched,
+    };
+    let mut worker_response = match fetched {
         Ok(response) => response,
         Err(error) => {
             emit_websocket_connection_timing(
@@ -1225,6 +1312,52 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
         );
     }
     upgrade_response.map(|body| body.map_err(|never| match never {}).boxed_unsync())
+}
+
+/// A committed application route claims the upgrade before any Worker does:
+/// its handler runs in a VM, and the 101 it returns carries a hibernatable
+/// socket the host registry already owns. `Unclaimed` when no route claims the
+/// URL; `Withdrawn` when a platform host names no live route.
+#[cfg(target_os = "linux")]
+async fn application_upgrade(
+    app: &AppHandle,
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> ApplicationUpgrade {
+    let Some(applications) =
+        celld::application_vm::hosted().filter(|applications| applications.claims(url))
+    else {
+        return ApplicationUpgrade::Unclaimed;
+    };
+    let request = celld_applications::invocation_wire::HttpRequest {
+        method: method.to_string(),
+        url: url.to_string(),
+        headers: headers.to_vec(),
+        body: body.to_vec(),
+    };
+    match applications
+        .dispatch(app, celld::js::handler_budget(), request, None)
+        .await
+    {
+        Ok(Some(response)) => ApplicationUpgrade::Dispatched(Ok(response)),
+        // The Host is under the platform domain, so no route here is a 404
+        // route concern, not a Worker concern.
+        Ok(None) => ApplicationUpgrade::Withdrawn,
+        Err(error) => ApplicationUpgrade::Dispatched(Err(error)),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn application_upgrade(
+    _app: &AppHandle,
+    _url: &str,
+    _method: &str,
+    _headers: &[(String, String)],
+    _body: &[u8],
+) -> ApplicationUpgrade {
+    ApplicationUpgrade::Unclaimed
 }
 
 /// Finish the client upgrade through the same owned response value that

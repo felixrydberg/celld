@@ -234,6 +234,22 @@ pub struct CellContainer {
 }
 
 impl CellContainer {
+    pub(crate) fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pending(scope: &str, spec: Arc<ContainerSpec>) -> Arc<Self> {
+        Arc::new(Self {
+            scope: scope.into(),
+            name: format!("test-{scope}"),
+            spec,
+            state: Mutex::new(CellState::default()),
+            processes: Mutex::new(Vec::new()),
+            exit: watch::channel(None).0,
+        })
+    }
+
     pub fn running(&self) -> bool {
         self.state.lock().unwrap().running
     }
@@ -283,6 +299,24 @@ impl CellContainer {
     pub fn current_run(&self) -> u64 {
         self.state.lock().unwrap().run
     }
+
+    /// One of this container's own exec processes. The ids are global, so a
+    /// caller's id proves nothing until the owning container lists it.
+    pub(crate) fn process(&self, id: u64) -> Option<Arc<ExecProcess>> {
+        let listed = self.processes.lock().unwrap().contains(&id);
+        listed.then(|| process(id)).flatten()
+    }
+
+    /// Settle a synchronously opened run which never reached the engine.
+    pub(crate) fn cancel_pending_run(&self, run: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.run == run && matches!(state.address, Address::None) {
+            state.running = false;
+            drop(state);
+            self.exit
+                .send_replace(Some((run, Err("container start cancelled".into()))));
+        }
+    }
 }
 
 pub struct ContainerEngine {
@@ -331,6 +365,18 @@ static CONFIG: RwLock<Option<Config>> = RwLock::new(None);
 static SPECS: RwLock<Vec<Arc<ContainerSpec>>> = RwLock::new(Vec::new());
 /// The deployment's `celld-fence` image; see `Manifest::fence_image`.
 static FENCE_IMAGE: RwLock<Option<String>> = RwLock::new(None);
+/// The application platform's fence image, from trusted node configuration.
+/// A generation swap replaces `FENCE_IMAGE` but never this.
+static APP_FENCE: RwLock<Option<String>> = RwLock::new(None);
+
+pub fn install_application_fence(image: Option<String>) {
+    *APP_FENCE.write().unwrap() = image;
+}
+
+fn fence_image() -> Option<String> {
+    let deployment = FENCE_IMAGE.read().unwrap().clone();
+    deployment.or_else(|| APP_FENCE.read().unwrap().clone())
+}
 /// The engine, connected on first use. A node whose deployment declares no
 /// container class never opens the socket.
 static ENGINE: tokio::sync::OnceCell<Arc<ContainerEngine>> = tokio::sync::OnceCell::const_new();
@@ -683,7 +729,7 @@ impl ContainerEngine {
         if *fenced {
             return Ok(());
         }
-        let image = FENCE_IMAGE.read().unwrap().clone().ok_or_else(|| {
+        let image = fence_image().ok_or_else(|| {
             anyhow!(
                 "this deployment has no fence image; deploy it again with this celld, which \
                  saves the celld-fence image beside the container images"
@@ -787,8 +833,37 @@ impl ContainerEngine {
     /// class with a spec; the object's `running` reads the answer.
     pub async fn attach(&self, scope: &str, class: &str) -> anyhow::Result<Arc<CellContainer>> {
         let spec = spec(class).ok_or_else(|| anyhow!("class {class} has no container"))?;
+        self.attach_spec(scope, spec, false).await
+    }
+
+    /// Application callers pin the registered resource's immutable spec; it
+    /// never enters the legacy process-global class table.
+    pub(crate) async fn attach_with_spec(
+        &self,
+        scope: &str,
+        spec: Arc<ContainerSpec>,
+    ) -> anyhow::Result<Arc<CellContainer>> {
+        self.attach_spec(scope, spec, true).await
+    }
+
+    async fn attach_spec(
+        &self,
+        scope: &str,
+        spec: Arc<ContainerSpec>,
+        immutable: bool,
+    ) -> anyhow::Result<Arc<CellContainer>> {
         let cell = {
             let mut cells = self.cells.lock().unwrap();
+            let mut settled = false;
+            if let Some(cell) = cells.get(scope).filter(|_| immutable) {
+                anyhow::ensure!(
+                    *cell.spec == *spec,
+                    "container resource specification changed"
+                );
+                // A known cell with no armed eviction is authoritative; an
+                // inspect would erase a start still in flight.
+                settled = cell.state.lock().unwrap().sweeper.is_none();
+            }
             let cell = cells.entry(scope.to_string()).or_insert_with(|| {
                 Arc::new(CellContainer {
                     scope: scope.to_string(),
@@ -801,6 +876,9 @@ impl ContainerEngine {
             });
             // A returning cell cancels the destroy its eviction armed.
             cell.state.lock().unwrap().sweeper = None;
+            if settled {
+                return Ok(cell.clone());
+            }
             cell.clone()
         };
         let running = self.inspect_running(&cell).await?;
@@ -1329,6 +1407,7 @@ impl ContainerEngine {
             }
             asyncrt::sleep(Duration::from_millis(50)).await;
         }
+        let pid = container_pid(pid);
         let (read, write) = tokio::io::split(stream);
         let (stdout_tx, stdout_rx) = mpsc::channel(16);
         let (stderr_tx, stderr_rx) = mpsc::channel(16);
@@ -1540,6 +1619,21 @@ async fn demux(
     }
 }
 
+/// The daemon reports an exec's pid in the host's namespace, but `kill` runs
+/// inside the container, so a signal addressed to that pid reaches nothing.
+/// On a Linux host the kernel lists the nested pids; the innermost is the
+/// container's. Where `/proc` cannot say (a daemon in a VM), keep the report.
+#[allow(clippy::disallowed_methods)] // `/proc` describes host processes, not node storage.
+fn container_pid(host: i64) -> i64 {
+    std::fs::read_to_string(format!("/proc/{host}/status"))
+        .ok()
+        .and_then(|status| {
+            let line = status.lines().find_map(|line| line.strip_prefix("NSpid:"))?;
+            line.split_whitespace().last()?.parse().ok()
+        })
+        .unwrap_or(host)
+}
+
 fn address_of(info: &Value) -> Address {
     if cfg!(target_os = "linux") {
         let ip = info
@@ -1585,4 +1679,62 @@ fn container_name(node: &str, scope: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(format!("{node}\n{scope}").as_bytes());
     format!("celld-{:x}", digest)[..30].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(image: &str) -> Arc<ContainerSpec> {
+        Arc::new(ContainerSpec {
+            class_name: "applications/v1/tenants/t/apps/a/resources/containers/box/".into(),
+            image: image.into(),
+            instance_type: None,
+            max_instances: None,
+            runtime: None,
+        })
+    }
+
+    #[test]
+    fn application_fence_survives_a_generation_swap() {
+        install_application_fence(Some(format!("celld-image:{}", "a".repeat(64))));
+        install_specs(Vec::new(), None);
+        assert!(APP_FENCE.read().unwrap().is_some());
+        install_application_fence(None);
+    }
+
+    /// No daemon is reachable here: a known cell is answered without one, an
+    /// unknown cell needs one, and a pinned spec never changes.
+    #[tokio::test]
+    async fn application_attach_is_immutable_and_skips_inspect() {
+        let engine = ContainerEngine {
+            runtime: None,
+            dns: Vec::new(),
+            resolv_conf: None,
+            docker: Docker::new("/nonexistent/celld-docker.sock"),
+            node: "test".into(),
+            bucket: None,
+            images: Mutex::new(HashMap::new()),
+            cells: Mutex::new(HashMap::new()),
+            networks: tokio::sync::Mutex::new(None),
+            fenced: tokio::sync::Mutex::new(false),
+        };
+        let pinned = spec("celld-image:one");
+        let cell = CellContainer::test_pending("Box:one", pinned.clone());
+        let run = cell.begin_run();
+        engine.cells.lock().unwrap().insert("Box:one".into(), cell.clone());
+        let attached = engine
+            .attach_with_spec("Box:one", pinned.clone())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&attached, &cell));
+        assert!(cell.running() && cell.current_run() == run, "attach erased a pending start");
+        let changed = engine
+            .attach_with_spec("Box:one", spec("celld-image:two"))
+            .await
+            .err()
+            .expect("a changed spec attached");
+        assert!(format!("{changed:#}").contains("specification changed"));
+        assert!(engine.attach_with_spec("Box:other", pinned).await.is_err());
+    }
 }

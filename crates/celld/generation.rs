@@ -603,7 +603,8 @@ impl Generation {
             }
         }
         let stateless = service_pools[&primary_script].clone();
-        let cell_isolates: HashMap<String, Arc<crate::pool::Pool>> = cell_configs
+        #[allow(unused_mut)]
+        let mut cell_isolates: HashMap<String, Arc<crate::pool::Pool>> = cell_configs
             .values()
             .map(|config| {
                 (
@@ -612,6 +613,26 @@ impl Generation {
                 )
             })
             .collect();
+        // These hosts contain no application code, bindings or exports. Keep
+        // them in the generation's pools so the ordinary heap accounting,
+        // maintenance and retirement also cover guest storage residencies.
+        #[cfg(target_os = "linux")]
+        for sqlite_vec in [false, true] {
+            cell_isolates.insert(
+                crate::runtime::application_storage_pool_key(sqlite_vec).into(),
+                crate::runtime::cell_pool(crate::runtime::application_storage_config(
+                    id, &node, sqlite_vec,
+                )),
+            );
+        }
+        // Only the original trusted KV, Queue and Cron harness executes here.
+        // User handlers stay in their VMs; this pool has no application source
+        // or bindings.
+        #[cfg(target_os = "linux")]
+        cell_isolates.insert(
+            " application-kv".into(),
+            crate::runtime::cell_pool(crate::runtime::application_kv_config(id, &node)),
+        );
         Ok(Generation {
             id,
             version,

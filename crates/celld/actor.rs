@@ -960,6 +960,21 @@ impl ActivityGuard {
         self.cancellation.clone()
     }
 
+    /// A buffered result becoming available is not proof that the ingress
+    /// writer sent headers. Only that writer updates response delivery flags.
+    pub(crate) fn set_phase_only(&self, phase: &'static str) {
+        if let Some(pin) = self
+            .drain_pins
+            .0
+            .lock()
+            .unwrap()
+            .pins
+            .get_mut(&self.request)
+        {
+            pin.phase = phase;
+        }
+    }
+
     pub fn gate_started(&self, durable_txid: u64) {
         self.drain_pins.gate_started(self.request, durable_txid);
     }
@@ -1555,6 +1570,22 @@ impl AppHandle {
         }
     }
 
+    /// Route and pin the cell for an effect whose sample precedes routing.
+    /// Both the original JS shell and guest broker use this path. A moved
+    /// cell or changed sample epoch cannot acknowledge a predecessor write.
+    pub async fn gate_cell_output(
+        &self,
+        cell: String,
+        ticket: GateTicket,
+    ) -> Result<(), RequestError> {
+        let routed = self.gate_request(cell.clone()).await?;
+        let _activity = self.activity(routed.request, cell);
+        if routed.route != Route::Local {
+            return Err(RequestError::NodeFenced);
+        }
+        self.gate_output(routed.request, ticket).await
+    }
+
     async fn gate_output_path(&self, request: u64, ticket: GateTicket) -> OutputGateOutcome {
         let started_mono_ms = crate::asyncrt::mono_ms();
         let (reply, receive) = oneshot::channel();
@@ -1784,6 +1815,20 @@ impl AppHandle {
         })
     }
 
+    /// A call made by work admitted before the gate closed (a `waitUntil`'s
+    /// storage write): admitted while that work is still in flight, so the
+    /// drain waiting for it can finish it. An idle draining node admits none.
+    pub fn admit_continuation(&self) -> Option<PublicRequestGuard> {
+        self.admit_public().or_else(|| {
+            self.public_in_flight
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n > 0).then_some(n + 1))
+                .ok()?;
+            Some(PublicRequestGuard {
+                in_flight: self.public_in_flight.clone(),
+            })
+        })
+    }
+
     pub fn public_in_flight(&self) -> usize {
         self.public_in_flight.load(Ordering::SeqCst)
     }
@@ -1812,7 +1857,7 @@ impl AppHandle {
         receive.await.ok()
     }
 
-    async fn resident_epoch(&self, cell: String) -> Option<u64> {
+    pub(crate) async fn resident_epoch(&self, cell: String) -> Option<u64> {
         let (reply, receive) = oneshot::channel();
         self.tx.send(Message::ResidentEpoch { cell, reply }).ok()?;
         receive.await.ok().flatten()

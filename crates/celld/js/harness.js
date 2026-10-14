@@ -719,7 +719,7 @@ const __fetchWebSocketUpgrade = __celld.__fetchWebSocketUpgrade =
   const id = __ws_alloc();
   const socket = __makeSocket(id);
   socket._outbound = true;
-  socket._polled = !scope;
+  socket._polled = !scope || __ws_guest();
   socket.url = req.url;
   socket.readyState = WebSocket.READY_STATE_CONNECTING;
   __sockets.set(id, socket);
@@ -1086,13 +1086,14 @@ const __r2PutStream = async (bucketName, key, stream, options) => {
         value instanceof Uint8Array
           ? value
           : new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
+        bucketName,
       );
     }
   } catch (error) {
-    await __r2_put_end(id, true);
+    await __r2_put_end(id, true, bucketName);
     throw error;
   }
-  return JSON.parse(await __r2_put_end(id, false));
+  return JSON.parse(await __r2_put_end(id, false, bucketName));
 };
 // One open multipart upload. `id` resolves to the host's upload id, so
 // `resumeMultipartUpload` can hand back a handle without awaiting -- as R2
@@ -1108,7 +1109,7 @@ const __r2Multipart = (binding, bucketName, key, id) => ({
     }
     const body = await __r2Value(binding, value);
     const bytes = body instanceof Uint8Array ? body : await __r2Drain(body);
-    const r = JSON.parse(await __r2_mp_part(await id.host, partNumber | 0, bytes));
+    const r = JSON.parse(await __r2_mp_part(await id.host, partNumber | 0, bytes, bucketName));
     // The object store owns the part list this completion acts on, so it
     // never hands back a part etag to name one with.
     return { partNumber: r.partNumber, etag: "" };
@@ -1116,11 +1117,11 @@ const __r2Multipart = (binding, bucketName, key, id) => ({
   async complete(parts) {
     const numbers = (parts ?? []).map((part) => part.partNumber | 0);
     return __r2Object(JSON.parse(
-      await __r2_mp_complete(await id.host, JSON.stringify(numbers)),
+      await __r2_mp_complete(await id.host, JSON.stringify(numbers), bucketName),
     ));
   },
   async abort() {
-    await __r2_mp_abort(await id.host);
+    await __r2_mp_abort(await id.host, bucketName);
   },
 });
 __celld.__makeR2Bucket = (binding, bucketName) => ({
@@ -1293,7 +1294,9 @@ class SqlCursor {
     this.rowsWritten = Number(res.rowsWritten || 0);
     this.reusedCachedQueryForTest = Boolean(res.reusedCachedQuery);
     this._deferredError = null;
-    this._cursorId = Number(res.cursorId || 0);
+    // Guests keep the host's opaque handle; native mode retains numeric IDs.
+    this._cursorId = typeof res.cursorId === "string"
+      ? res.cursorId : Number(res.cursorId || 0);
     this._prefetched = res.row;
     this.rowsRead = this._prefetched === null ? 0 : 1;
     this._finalizerToken = null;
@@ -1963,7 +1966,9 @@ class DurableObjectStorage {
         try {
           const savepoint = this._transactionStart();
           control = this._newTransactionControl(savepoint);
-          return { value: await this._runTransactionWith(f, savepoint, control) };
+          const callback = this._runTransactionWith(f, savepoint, control);
+          __guest_cleanup_track(callback);
+          return { value: await callback };
         } catch (error) {
           return { error };
         }
@@ -2387,9 +2392,25 @@ const __bytesOf = (chunk) => {
 // The Fetcher `getTcpPort()` returns: `fetch()` speaks HTTP to the port over
 // the node's route to the container, and `connect()` is the raw socket.
 class ContainerPort {
-  constructor(scope, port) {
+  constructor(scope, port, guest) {
     this._scope = scope;
     this._port = port;
+    this._guest = guest;
+  }
+  // A guest asks the host for the container; the host owns the address, so
+  // the request goes through a brokered op and never a name the guest chose.
+  async _guestFetch(method, url, headers, body) {
+    const raw = JSON.parse(await __container_port_fetch(
+      this._scope, this._port, method, url.toString(),
+      JSON.stringify(Array.from(headers)), body));
+    const response = new Response(
+      raw.streamId !== undefined
+        ? new CelldHttpBodyStream(raw.streamId)
+        : raw.body !== undefined ? raw.body : Uint8Array.from(raw.bodyBytes || []),
+      { status: raw.status, headers: raw.headers },
+    );
+    response.url = url.toString();
+    return response;
   }
   async fetch(input, init) {
     const request = new Request(input, init);
@@ -2401,10 +2422,13 @@ class ContainerPort {
       );
     if (url.protocol !== "http:") throw new TypeError(`Fetch API cannot load: ${url}`);
     const authority = url.host;
-    url.host = __container_address(this._scope, this._port);
+    if (!this._guest) {
+      url.host = __container_address(this._scope, this._port);
+    }
     const forwarded = new Request(url.toString(), request);
     forwarded.headers.set("host", authority);
     try {
+      if (this._guest) return await this._guestFollow(request, forwarded);
       return await fetch(forwarded);
     } catch (error) {
       // A refused or reset connection is the port not listening yet, which
@@ -2419,12 +2443,49 @@ class ContainerPort {
       throw error;
     }
   }
+  // The host returns redirects unfollowed. One inside the container goes back
+  // through its port; any other leaves through the guest's own egress.
+  async _guestFollow(request, forwarded) {
+    let method = forwarded.method;
+    let url = new URL(forwarded.url);
+    const headers = new Headers(forwarded.headers);
+    const bodiless = (name) => name === "GET" || name === "HEAD";
+    let body = bodiless(method) ? new Uint8Array(0) : new Uint8Array(await forwarded.arrayBuffer());
+    const origin = url.host;
+    for (let hops = 0; ; hops++) {
+      const response = await this._guestFetch(method, url, headers, body);
+      const location = response.headers.get("location");
+      if (request.redirect === "manual" || !location ||
+          ![301, 302, 303, 307, 308].includes(response.status)) return response;
+      if (request.redirect === "error")
+        throw new TypeError("redirect forbidden by fetch redirect mode");
+      if (hops >= 20) throw new TypeError("too many redirects");
+      const next = new URL(location, url);
+      if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === "POST")) {
+        method = "GET";
+        body = new Uint8Array(0);
+      }
+      if (next.host === origin) {
+        url = next;
+        continue;
+      }
+      headers.delete("host");
+      for (const name of __CROSS_ORIGIN_SENSITIVE_HEADERS) headers.delete(name);
+      return fetch(next.toString(), {
+        method, headers, body: bodiless(method) ? undefined : body, redirect: "follow",
+      });
+    }
+  }
   connect(address, options) {
     if (options?.secureTransport === "on")
       throw new Error(
         "Connencting to a container using TLS is not currently supported. It is " +
         "unnecessary anyway, as the connection is already secure by default.",
       );
+    if (this._guest)
+      return __celld.__cfSockets.connect(`container.invalid:${this._port}`, options, {
+        scope: this._scope, port: this._port,
+      });
     return __celld.__cfSockets.connect(
       __container_address(this._scope, this._port), options);
   }
@@ -2432,6 +2493,8 @@ class ContainerPort {
 class Container {
   constructor(scope) {
     this._scope = scope;
+    // An application guest's class maps to its host-pinned binding alias.
+    this._guest = typeof __cell.containers[scope.slice(0, scope.indexOf(":"))] === "string";
     this._destroyReason = undefined;
   }
   // The host's answer, not a JavaScript flag: a monitor() promise can be
@@ -2499,7 +2562,7 @@ class Container {
   getTcpPort(port) {
     if (!(Number.isInteger(port) && port > 0 && port < 65536))
       throw new TypeError(`Invalid port number: ${port}`);
-    return new ContainerPort(this._scope, port);
+    return new ContainerPort(this._scope, port, this._guest);
   }
   setInactivityTimeout(durationMs) {
     if (!(durationMs > 0))
@@ -2744,7 +2807,9 @@ class DurableObjectState {
         );
       }
     });
-    return Promise.race([Promise.resolve(result), timeout]).then(
+    const callback = Promise.resolve(result);
+    __guest_cleanup_track(callback);
+    return Promise.race([callback, timeout]).then(
       (value) => {
         settled = true;
         __timer_cancel(timerId);
@@ -2811,12 +2876,23 @@ class DurableObjectState {
       throw new Error(
         "the isolate is near its V8 heap limit, so it refused a " +
         "WebSocket (see CELLD_V8_HEAP_LIMIT_MB)");
+    ws._tags = Array.from(tags, String);
+    // In an application guest the host owns the socket and answers with its
+    // registry id; every later frame, listing and event names that id.
+    const hostId = __ws_accept(
+      ws._id, this._scope, JSON.stringify(ws._tags), ws._hostOwned === true);
+    if (typeof hostId === "number") {
+      ws._id = hostId;
+      ws._hostOwned = true;
+      if (ws._peer) {
+        ws._peer._id = hostId;
+        ws._peer._hostOwned = true;
+      }
+    }
     ws._target = { id: ws._id, scope: this._scope };
     if (ws._peer) ws._peer._target = ws._target;
     ws._hibernatable = true;
     if (ws._peer) ws._peer._hibernatable = true;
-    ws._tags = Array.from(tags, String);
-    __ws_accept(ws._id, this._scope, JSON.stringify(ws._tags));
     __sockets.set(ws._id, ws);
   }
   _socket(id) {
@@ -3960,7 +4036,7 @@ const __actorBreak = (scope, reason) => {
 // Storage is not here -- `stop_cell` closes it host-side -- and sockets
 // live in the host registry, so a hibernated cell keeps them.
 const __cellRelease = (scope) => {
-  __cell.instances[scope]?.ctx?.facets?._release();
+  const cleanup = __cell.instances[scope]?.ctx?.facets?._release();
   delete __cell.instances[scope];
   delete __cell.idNames[scope];
   delete __cell.facetConfigs[scope];
@@ -3983,6 +4059,7 @@ const __cellRelease = (scope) => {
     // isolate, which is the state this function drops.
     __ctxAbort(entry.ctx, new __ActorAbort(__releasedStubError()));
   }
+  return cleanup;
 };
 const __releasedStubError = () => new Error(
   "The Durable Object that returned this RPC stub no longer runs on " +
@@ -4199,7 +4276,7 @@ const __rpcSignalRefresh = () => {
 // it. Passing an existing stub transfers its reference: the
 // sender's handle is disposed (dup() first to keep one) and the
 // receiver adopts it. Returns null when nothing was liftable.
-const __stubLift = (value, allowCapabilities = true, originals) => {
+const __stubLift = (value, allowCapabilities = true, originals, signals) => {
   let lifted = false;
   // Capabilities (stubs, disposers) root the callee context;
   // by-value host types do not -- they pick the 0x02 envelope.
@@ -4311,7 +4388,17 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       caps = true;
       marker = __liftStream(v);
     } else if (v instanceof AbortSignal) {
+      // `signals`: an array collects ids for the host relay (service RPC
+      // arguments); `false` is a brokered call that cannot relay at all.
+      if (!v.aborted && __rpc_signal_guest() &&
+          (signals === false || (!allowCapabilities && signals === undefined)))
+        throw new DOMException(
+          'Live AbortSignal is not supported here across application VMs: ' +
+          'only service-binding RPC arguments relay a live signal.',
+          'DataCloneError');
       marker = __liftSignal(v);
+      if (Array.isArray(signals) && !v.aborted)
+        signals.push(marker["__celld$sig"]);
     }
     if (marker !== undefined) {
       lifted = true;
@@ -4726,13 +4813,15 @@ const __entrypointSession = (name, local, script, makeInst, propsSc) => ({
         await __svc_rpc(
           script, name, JSON.stringify(path), null, propsSc)))(),
   call: (path, args) => (async () => {
-    const argsSc = __rpcOut(args, local);
+    const signals = [];
+    const argsSc = __rpcOut(args, local, local ? undefined : signals);
     if (local)
       return __rpcDes(await __entrypointOp(
         name, path, argsSc, true, makeInst));
     return __rpcDes(
       await __svc_rpc(
-        script, name, JSON.stringify(path), argsSc, propsSc));
+        script, name, JSON.stringify(path), argsSc, propsSc,
+        JSON.stringify(signals)));
   })(),
 });
 // Workerd's JsRpcPromise/JsRpcProperty: awaitable, callable, and
@@ -4997,14 +5086,15 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
 // Serialize one payload. `lift` marks a same-isolate transport,
 // where stub-able values may cross as markers; elsewhere they stay
 // a DataCloneError, exactly as before stubs existed.
-const __rpcOut = (value, lift) => {
+const __rpcOut = (value, lift, signals) => {
   const projected = __rpcProject(value);
   try {
     return __sc_encode(projected.tree);
   } catch (error) {
     // A cross-isolate call lifts only a live signal. A same-isolate call can
     // also transfer the existing host values and JS capability handles.
-    const lifted = __stubLift(projected.tree, lift, projected.originals);
+    const lifted = __stubLift(
+      projected.tree, lift, projected.originals, signals);
     if (lifted === null) throw __dataCloneError(error);
     try {
       return __tagged(
@@ -5113,8 +5203,7 @@ const __fetcherHelper = (fetch, prop) => {
     __fetcherStatus(await fetch(url, { method: "DELETE" }), "DELETE");
   };
 };
-function makeNamespace(className) {
-  const namespaceKey = __cell.namespaceKeys[className];
+function makeNamespace(className, namespaceKey = __cell.namespaceKeys[className]) {
   if (typeof namespaceKey !== "string")
     throw new Error("no Durable Object namespace key for " + className);
   return new DurableObjectNamespace(className, namespaceKey);
@@ -5274,7 +5363,7 @@ class DurableObjectNamespace {
       // loud foreign stubs.
       return async (...args) => invoke(
         async () => __rpcDes(await __rpc_call(
-          scope, dispatchName ?? null, prop, __rpcOut(args, true),
+          scope, dispatchName ?? null, prop, __rpcOut(args, true, false),
         )),
       );
     }});
@@ -5343,6 +5432,7 @@ __celld.__makeIncomingRequest = (
   headersJson, undefined, true);
 const __dispatchTo = __celld.__dispatchTo = async (
   scope, url, method, body, headersJson, requestId = null, bodyStreamId = null,
+  retainSignal = false,
 ) => {
   // A routed body that must not be collected crosses as a host stream id; the
   // handler here reads it in parts. A held body arrives as its bytes.
@@ -5368,6 +5458,7 @@ const __dispatchTo = __celld.__dispatchTo = async (
           true,
         )));
     })();
+    __guest_cleanup_track(dispatch);
     // The caller's abandonment reaches the target through
     // __do_call_cancel/__abortIncomingRequest, which aborts the fresh incoming
     // signal made above; the host dispatcher passes no caller signal here.
@@ -5391,7 +5482,7 @@ const __dispatchTo = __celld.__dispatchTo = async (
     }
     return response;
   } finally {
-    if (requestId !== null)
+    if (requestId !== null && !retainSignal)
       __incomingRequestSignals.delete(String(requestId));
     __endActorEvent(actorEvent);
   }
@@ -5534,8 +5625,32 @@ const __dispatchEntrypointMethodInCurrentEvent = async (name, method, arg) => {
     throw __noHandler(name, method);
   return await __ctxRun(undefined, () => inst[method](arg));
 };
+// The host's scheduled event for an application cron, under the reserved
+// entrypoint name ".scheduled" (no class can have it). It is the original
+// Fetcher.scheduled() semantics, so a guest reaching it runs only its own handler.
+const __dispatchScheduledEvent = async (request) => {
+  const { scheduledTime, cron } = await request.json();
+  let noRetry = false;
+  const controller = { scheduledTime, cron, noRetry() { noRetry = true; } };
+  const ctx = __beginEvent();
+  let result;
+  try {
+    if (typeof __cell.selfScheduled !== "function")
+      throw new Error("Handler does not export a scheduled() function.");
+    await __cell.selfScheduled(controller, __cell.env, ctx);
+    result = { outcome: "ok" };
+  } catch (error) {
+    result = { outcome: "exception", error: String(error?.message ?? error) };
+  } finally {
+    // The event is not done while its waitUntil work is pending.
+    const drain = __endEvent();
+    if (drain !== null) await drain;
+  }
+  return Response.json({ ...result, noRetry });
+};
 const __dispatchEntrypointFetch = __celld.__dispatchEntrypointFetch =
   (name, request, propsSc = null) =>
+  name === ".scheduled" ? __dispatchScheduledEvent(request) :
   __dispatchEntrypointMethod(
     name, "fetch", request,
     propsSc === null || propsSc.length === 0
@@ -5870,6 +5985,12 @@ __celld.__fireAlarm = async (scope, scheduledTime, retryCount) => {
 // The schedule itself is never stored here. `__cell.crons` comes from the
 // deployment the cell is running under, so changing a cron expression takes
 // effect on the next activation and needs no migration of an armed alarm.
+// An application's cron cell takes its schedule from the host catalog, keyed by
+// the running event's own cell; any other cell from its deployment (`null`).
+const __hostedCrons = () => {
+  const hosted = __cron_schedule();
+  return hosted === undefined ? null : JSON.parse(hosted);
+};
 class CelldCronSchedule {
   constructor(state) {
     this._state = state;
@@ -5902,7 +6023,8 @@ class CelldCronSchedule {
     return new Response(null, { status: 204 });
   }
   async alarm(info) {
-    const crons = __cell.crons || [];
+    const hosted = __hostedCrons();
+    const crons = hosted ?? (__cell.crons || []);
     // A retry wake carries the backoff instant as its deadline, so what to run
     // and what time to report both come from the record the failure left. Only
     // a deadline that is not a retry is an occurrence to match against.
@@ -5929,10 +6051,20 @@ class CelldCronSchedule {
       };
       const ctx = __beginEvent();
       try {
-        if (typeof __cell.selfScheduled !== "function")
-          throw new Error(
-            "a cron trigger needs the Worker to export a `scheduled` handler");
-        await __cell.selfScheduled(controller, __cell.env, ctx);
+        if (hosted !== null) {
+          // An application's handler runs in its own VM, which the host picks
+          // from its catalog; the retry and arm logic below is unchanged.
+          const result = JSON.parse(
+            await __cron_dispatch(controller.cron, controller.scheduledTime));
+          noRetry = result.noRetry === true;
+          if (result.outcome !== "ok")
+            throw new Error(result.error ?? "scheduled handler failed");
+        } else {
+          if (typeof __cell.selfScheduled !== "function")
+            throw new Error(
+              "a cron trigger needs the Worker to export a `scheduled` handler");
+          await __cell.selfScheduled(controller, __cell.env, ctx);
+        }
       } catch (error) {
         // Swallowed on purpose: this handler owns the re-arm below, so
         // throwing would hand the deadline to the generic alarm retry and
@@ -5955,7 +6087,7 @@ class CelldCronSchedule {
   // arming, `failed` holds the expressions of it still owed, and `retried`
   // says the deadline just handled was a backoff rather than an occurrence.
   async _arm(occurrence, failed, retried) {
-    const crons = __cell.crons || [];
+    const crons = __hostedCrons() ?? (__cell.crons || []);
     // The count is failures within one occurrence, so a fresh occurrence
     // starts at one however the last one ended. Carrying it across would
     // spend `alarm_retry`'s ceiling once and leave every later occurrence
@@ -6036,8 +6168,8 @@ const {
 
 __runtimeClass("__KvNamespace", __KvNamespaceCell);
 
-const __makeKvNamespace = __celld.__makeKvNamespace = (id, cellName) =>
-  new __KvNamespace(() => __cell.makeNamespace("__KvNamespace"), cellName);
+const __makeKvNamespace = __celld.__makeKvNamespace = (id, cellName, namespaceKey) =>
+  new __KvNamespace(() => __cell.makeNamespace("__KvNamespace", namespaceKey), cellName);
 
 // ---- Queues --------------------------------------------------------------
 // A Queue is one runtime-supplied Durable Object. The producer binding writes
@@ -6205,6 +6337,16 @@ class __QueueCell {
     this.queue = ctx.id.name;
     this._ready = false;
     this._producerGroup = null;
+  }
+
+  // The original deployment catalog first. An application's queue cell is not in
+  // it; the host answers for the cell of the running event, never for a name
+  // this code supplies.
+  _consumer() {
+    const original = __cell.queueConsumers?.[this.queue];
+    if (original !== undefined) return original;
+    const hosted = __queue_consumer();
+    return hosted === undefined ? undefined : JSON.parse(hosted);
   }
 
   _open() {
@@ -6518,7 +6660,7 @@ class __QueueCell {
 
   async _rearm(now = Date.now(), waitForWake = false) {
     const sql = this._open();
-    const consumer = __cell.queueConsumers?.[this.queue];
+    const consumer = this._consumer();
     const paused = this._paused();
     const active = sql.exec(
       `SELECT COUNT(DISTINCT lease_id) AS count
@@ -7070,8 +7212,10 @@ class __QueueCell {
       if (group === undefined) groups.set(row.dlq_target, group = []);
       group.push(row);
     }
+    // An application's dead-letter queue lives under its own resource's key.
+    const targetKey = this._consumer()?.deadLetterNamespaceKey;
     for (const [targetName, rows] of groups) {
-      const target = __cell.makeNamespace("__Queue").getByName(targetName);
+      const target = __cell.makeNamespace("__Queue", targetKey).getByName(targetName);
       await target.__queueDlqAcceptBatch({
         transfers: rows.map((row) => ({
           transferId: row.dlq_transfer_id,
@@ -7122,7 +7266,7 @@ class __QueueCell {
     const swept = this._sweep(now);
     const consumer = this._paused()
       ? undefined
-      : __cell.queueConsumers?.[this.queue];
+      : this._consumer();
     // Install every lease that the configured concurrency admits before the
     // first consumer can settle. One lease per alarm serialized full batches
     // because the next alarm depended on a later scheduler turn, so a queue
@@ -7197,7 +7341,7 @@ class __QueueCell {
   async _settle(body) {
     const rows = this._matchingLease(body);
     if (rows === null) return false;
-    const consumer = __cell.queueConsumers?.[this.queue];
+    const consumer = this._consumer();
     if (consumer === undefined) return false;
     const explicitAcks = new Set(body.explicitAcks ?? []);
     const retryMessages = new Map(
@@ -7514,16 +7658,18 @@ class __QueueCell {
 __runtimeClass("__Queue", __QueueCell);
 
 class Queue {
-  constructor(queue, cellName, deliveryDelay) {
+  // `namespaceKey` is the host's, for an application's resource-scoped queue.
+  constructor(queue, cellName, deliveryDelay, namespaceKey) {
     Object.defineProperties(this, {
       _queue: { value: queue },
       _cellName: { value: cellName },
       _deliveryDelay: { value: deliveryDelay },
+      _namespaceKey: { value: namespaceKey },
     });
   }
 
   get _stub() {
-    return __cell.makeNamespace("__Queue").getByName(this._cellName);
+    return __cell.makeNamespace("__Queue", this._namespaceKey).getByName(this._cellName);
   }
 
   async _send(entries) {
@@ -7579,8 +7725,8 @@ class Queue {
   }
 }
 
-__celld.__makeQueue = (queue, cellName, deliveryDelay) =>
-  new Queue(queue, cellName, deliveryDelay);
+__celld.__makeQueue = (queue, cellName, deliveryDelay, namespaceKey) =>
+  new Queue(queue, cellName, deliveryDelay, namespaceKey);
 
 // ---- D1 -----------------------------------------------------------------
 // A D1 database is a cell of a runtime-supplied Durable Object class, so it
@@ -7863,13 +8009,16 @@ class D1DatabaseSession {
 
 // Named so SDKs that sniff a binding by `constructor.name` recognise it.
 class D1Database {
-  constructor(databaseName) {
+  // `namespaceKey` is the host's, for an application's resource-scoped database.
+  constructor(databaseName, namespaceKey) {
     Object.defineProperty(this, "_databaseName", { value: databaseName });
+    Object.defineProperty(this, "_namespaceKey", { value: namespaceKey });
   }
   // Resolved per call rather than cached: a cell can move between calls, and
   // `getByName` is the same cost the Durable Object path already pays.
   get _stub() {
-    return __cell.makeNamespace("__D1Database").getByName(this._databaseName);
+    return __cell.makeNamespace("__D1Database", this._namespaceKey)
+      .getByName(this._databaseName);
   }
   async _query(statements) {
     try {
@@ -7918,7 +8067,7 @@ class D1Database {
 }
 
 const __makeD1Database = __celld.__makeD1Database =
-  (databaseName) => new D1Database(databaseName);
+  (databaseName, namespaceKey) => new D1Database(databaseName, namespaceKey);
 // ---- Workflows ----------------------------------------------------------
 // A workflow instance is one cell of the runtime-supplied `__Workflow` class,
 // named `<workflow_name>/<instance_id>` through getByName, so it inherits
@@ -9352,8 +9501,10 @@ const __wfCreateOptions = (options, what, validateParams = true) => {
 
 // Named so SDKs that sniff a binding by `constructor.name` recognise it.
 class WorkflowInstance {
-  constructor(workflowName, id) {
+  constructor(workflowName, id, namespaceClass, namespaceKey) {
     Object.defineProperty(this, "_workflowName", { value: workflowName });
+    Object.defineProperty(this, "_namespaceClass", { value: namespaceClass });
+    Object.defineProperty(this, "_namespaceKey", { value: namespaceKey });
     this.id = id;
   }
   // Resolved per call rather than cached: a cell can move between calls.
@@ -9362,7 +9513,7 @@ class WorkflowInstance {
     // a workflow instance is: two co-hosted scripts must not share one entry
     // in the deployment's flat class registry. `__cell.script` is injected
     // before any binding runs, so this resolves at call time.
-    return __cell.makeNamespace("__Workflow." + __cell.script)
+    return __cell.makeNamespace(this._namespaceClass || "__Workflow." + __cell.script, this._namespaceKey)
       .getByName(this._workflowName + "/" + this.id);
   }
   async status() {
@@ -9404,12 +9555,14 @@ class WorkflowInstance {
 }
 
 class Workflow {
-  constructor(workflowName) {
+  constructor(workflowName, namespaceClass, namespaceKey) {
     Object.defineProperty(this, "_workflowName", { value: workflowName });
+    Object.defineProperty(this, "_namespaceClass", { value: namespaceClass });
+    Object.defineProperty(this, "_namespaceKey", { value: namespaceKey });
   }
   async _create(options, skipExisting) {
     const { id, params, retention, locationHint } = options;
-    const instance = new WorkflowInstance(this._workflowName, id);
+    const instance = new WorkflowInstance(this._workflowName, id, this._namespaceClass, this._namespaceKey);
     const result = await instance._stub.__wfCreate({
       workflowName: this._workflowName,
       instanceId: id,
@@ -9467,7 +9620,7 @@ class Workflow {
     if (!__wfValidInstanceId(id)) {
       throw __wfError(`invalid instance id ${JSON.stringify(id)}`);
     }
-    const instance = new WorkflowInstance(this._workflowName, id);
+    const instance = new WorkflowInstance(this._workflowName, id, this._namespaceClass, this._namespaceKey);
     // The cell exists on first address like any cell, but get() must not
     // mint an instance for a typo: an id with no ledger rejects here.
     await instance._stub.__wfStatus();
@@ -9489,7 +9642,7 @@ class Workflow {
     }
     const uniqueIds = [...new Set(instanceIds)];
     const settled = await Promise.allSettled(uniqueIds.map(async (id) => {
-      const instance = new WorkflowInstance(this._workflowName, id);
+      const instance = new WorkflowInstance(this._workflowName, id, this._namespaceClass, this._namespaceKey);
       await instance.delete();
     }));
     const results = new Map(uniqueIds.map((id, index) => [id, settled[index]]));
@@ -9515,7 +9668,7 @@ class Workflow {
 }
 
 const __makeWorkflow = __celld.__makeWorkflow =
-  (workflowName) => new Workflow(workflowName);
+  (workflowName, namespaceClass, namespaceKey) => new Workflow(workflowName, namespaceClass, namespaceKey);
 // `cloudflare:workers` module surface. The DO base class sets ctx/env the
 // way `class X extends DurableObject` expects; env aliases the cell env.
 const __cf = __celld.__cf = {
@@ -10435,7 +10588,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
       // and it lives and dies with the request, which is the lifetime
       // Cloudflare gives one too.
       const scope = __currentActorScope();
-      this._polled = !scope;
+      this._polled = !scope || __ws_guest();
       const requested = typeof protocols === "string"
         ? [protocols]
         : Array.from(protocols, String);
@@ -10705,6 +10858,7 @@ const __socketFromRow = __celld.__socketFromRow = (row) => {
   }
   ws._tags = row.tags || [];
   ws._hibernatable = true;
+  ws._hostOwned = true;
   if (row.attachment != null) {
     try {
       ws._attachment = __sc_decode(new Uint8Array(row.attachment));
@@ -11389,6 +11543,19 @@ const __bridgeResponseStream = (body, requestControllers) => {
       .then((status) => status === "cancelled"
         ? { consumerClosed: true }
         : new Promise(() => {}));
+    // A cancelled request also ends its body. Guest cleanup retires the
+    // operation behind `consumerClosed`; the abort needs no operation, so the
+    // producer is still cancelled and this pump joins the event's cleanup.
+    const requestAborted = new Promise((resolve) => {
+      for (const controller of requestControllers || []) {
+        if (controller.signal.aborted) resolve({ consumerClosed: true });
+        else controller.signal.addEventListener(
+          "abort",
+          () => resolve({ consumerClosed: true }),
+          { once: true },
+        );
+      }
+    });
     const cancelProducer = async () => {
       const reason = new Error("The client has disconnected");
       for (const controller of requestControllers || []) {
@@ -11404,6 +11571,7 @@ const __bridgeResponseStream = (body, requestControllers) => {
         const result = await Promise.race([
           reader.read().then((read) => ({ read })),
           consumerClosed,
+          requestAborted,
         ]);
         if (result.consumerClosed) {
           await cancelProducer();

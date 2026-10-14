@@ -6,7 +6,7 @@
 //! path.
 use crate::asyncrt;
 use crate::engine_api::WsTarget;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -204,10 +204,10 @@ pub(crate) const WS_PULL_QUEUE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Tags for the byte frame `__ws_next` resolves with. A tagged buffer keeps a
 /// binary message on its fast path instead of base64 through a JSON envelope.
-const WS_PULL_TAG_TEXT: u8 = 0;
-const WS_PULL_TAG_BINARY: u8 = 1;
+pub(crate) const WS_PULL_TAG_TEXT: u8 = 0;
+pub(crate) const WS_PULL_TAG_BINARY: u8 = 1;
 const WS_PULL_TAG_OPEN: u8 = 2;
-const WS_PULL_TAG_CLOSE: u8 = 3;
+pub(crate) const WS_PULL_TAG_CLOSE: u8 = 3;
 
 impl WsPull {
     pub(crate) fn encode(self) -> Vec<u8> {
@@ -511,6 +511,9 @@ pub struct WsMeta {
     /// facet accepted, dialed, or bound. `None` for a socket of an ordinary
     /// cell. `scope` then names the facet.
     pub facet: Option<FacetSocket>,
+    /// False only for a guest object's accepted socket whose upgrade response
+    /// no client has consumed yet. The host hands it out once.
+    pub claimed: bool,
 }
 
 /// Where the events of a facet's socket go, and what proves their output.
@@ -772,6 +775,7 @@ pub(crate) fn ws_register_hibernatable_for_test(
             pending: Vec::new(),
             auto_response_at: None,
             facet: None,
+            claimed: true,
         },
     );
 }
@@ -791,6 +795,7 @@ pub fn ws_register_outbound(id: u64, scope: &str, facet: Option<FacetSocket>) {
                 pending: Vec::new(),
                 auto_response_at: None,
                 facet,
+                claimed: true,
             });
             true
         } else {
@@ -805,6 +810,136 @@ pub fn ws_unregister(id: u64) {
     let meta = ws_registry().lock().unwrap().unregister(id);
     if let Some(meta) = meta.filter(|meta| !meta.hibernatable) {
         decrement_regular_ws(&meta.scope);
+    }
+}
+
+/// What a guest object may do with the host's hibernation registry. The
+/// registry stays the host's: a guest holds a pair id only it has seen until
+/// `ws_accept_guest` gives the socket its registry id, and every later call
+/// names that id and is checked against the issuing object's own scope.
+fn guest_socket<'a>(registry: &'a mut WsRegistry, scope: &str, id: u64) -> Result<&'a mut WsMeta> {
+    registry
+        .metadata
+        .get_mut(&id)
+        .filter(|meta| meta.hibernatable && meta.scope == scope)
+        .ok_or_else(|| anyhow!("WebSocket {id} is not a hibernatable socket of this object"))
+}
+
+/// `acceptWebSocket` for a guest object. `accepted` is the registry id of a
+/// socket this object already accepted (the tags then change, as in the
+/// original); otherwise the socket is new and gets a fresh registry id.
+pub fn ws_accept_guest(scope: &str, accepted: Option<u64>, tags: Vec<String>) -> Result<u64> {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    if let Some(id) = accepted {
+        guest_socket(&mut registry, scope, id)?.tags = tags;
+        return Ok(id);
+    }
+    let id = ws_next_id();
+    registry.metadata.insert(
+        id,
+        WsMeta {
+            scope: scope.to_string(),
+            hibernatable: true,
+            tags,
+            attachment: None,
+            pending: Vec::new(),
+            auto_response_at: None,
+            facet: None,
+            claimed: false,
+        },
+    );
+    Ok(id)
+}
+
+/// `getWebSockets(tag)` for a guest object: its hibernatable sockets, oldest
+/// id first so a rebuilt list is stable across calls.
+pub fn ws_guest_sockets(
+    scope: &str,
+    tag: Option<&str>,
+) -> Vec<(u64, Vec<String>, Option<Vec<u8>>)> {
+    let registry = ws_registry();
+    let registry = registry.lock().unwrap();
+    let mut rows: Vec<_> = registry
+        .metadata
+        .iter()
+        .filter(|(_, meta)| {
+            meta.hibernatable
+                && meta.scope == scope
+                && tag.is_none_or(|tag| meta.tags.iter().any(|candidate| candidate == tag))
+        })
+        .map(|(id, meta)| (*id, meta.tags.clone(), meta.attachment.clone()))
+        .collect();
+    rows.sort_by_key(|(id, ..)| *id);
+    rows
+}
+
+pub fn ws_guest_attachment(scope: &str, id: u64, attachment: Vec<u8>) -> Result<()> {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    guest_socket(&mut registry, scope, id)?.attachment = Some(attachment);
+    Ok(())
+}
+
+pub fn ws_guest_auto_response_timestamp(scope: &str, id: u64) -> Result<Option<f64>> {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    Ok(guest_socket(&mut registry, scope, id)?.auto_response_at)
+}
+
+/// `setWebSocketAutoResponse`/`getWebSocketAutoResponse` for a cell scope. The
+/// pair is the shell's, so a matched message never wakes the guest.
+pub fn ws_auto_response_pair(scope: &str) -> Option<(String, String)> {
+    ws_auto_responses().lock().unwrap().get(scope).cloned()
+}
+
+pub fn ws_auto_response_install(scope: &str, pair: Option<(String, String)>) {
+    let pairs = ws_auto_responses();
+    let mut pairs = pairs.lock().unwrap();
+    match pair {
+        Some(pair) => pairs.insert(scope.to_string(), pair),
+        None => pairs.remove(scope),
+    };
+}
+
+/// The object that owns a registered socket, for the host to check a frame or
+/// an upgrade against before anything leaves the node.
+pub fn ws_scope_of(id: u64) -> Option<String> {
+    ws_registry()
+        .lock()
+        .unwrap()
+        .metadata
+        .get(&id)
+        .map(|meta| meta.scope.clone())
+}
+
+/// Hand a guest object's accepted socket to the one upgrade that carries it.
+/// Returns its scope. A socket another upgrade already took, or one that is
+/// gone, is refused, so a handler cannot give one client's socket to another.
+pub fn ws_claim_guest(id: u64) -> Result<String> {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    let meta = registry
+        .metadata
+        .get_mut(&id)
+        .filter(|meta| meta.hibernatable && !meta.claimed)
+        .ok_or_else(|| anyhow!("WebSocket {id} is not an unclaimed upgrade"))?;
+    meta.claimed = true;
+    Ok(meta.scope.clone())
+}
+
+/// Drop sockets an event accepted that no upgrade ever claimed.
+pub fn ws_release_unclaimed(scope: &str, ids: &[u64]) {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    for id in ids {
+        if registry
+            .metadata
+            .get(id)
+            .is_some_and(|meta| !meta.claimed && meta.scope == scope)
+        {
+            registry.unregister(*id);
+        }
     }
 }
 

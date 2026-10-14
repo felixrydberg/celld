@@ -8,6 +8,195 @@
 //! semantics live in that module and the serialization format lives here,
 //! because it is what JS can see.
 use super::*;
+#[cfg(unix)]
+use celld_applications::storage_wire as wire;
+
+pub(super) fn refuse_unbridged_guest_op(scope: &mut v8::PinScope, name: &str) -> bool {
+    #[cfg(unix)]
+    if guest_storage::enabled(scope) {
+        loader_throw(scope, &format!("guest {name} bridge is not available"));
+        return true;
+    }
+    false
+}
+
+enum SqlCursorId {
+    Native(u64),
+    #[cfg(unix)]
+    Guest(Option<String>),
+}
+
+type SqlStart = (
+    SqlCursorId,
+    Vec<String>,
+    Option<Vec<storage::SqlValue>>,
+    u64,
+    bool,
+);
+
+fn start_sql(
+    scope: &mut v8::PinScope,
+    cell: &str,
+    query: &str,
+    bindings: &[rusqlite::types::Value],
+) -> Result<SqlStart, String> {
+    #[cfg(unix)]
+    if let Some(channel) = guest_storage::channel(scope, cell)? {
+        let bindings = bindings
+            .iter()
+            .map(|value| match value {
+                rusqlite::types::Value::Null => wire::SqlValue::Null {},
+                rusqlite::types::Value::Integer(value) => wire::SqlValue::Integer { value: *value },
+                rusqlite::types::Value::Real(value) => wire::SqlValue::Real {
+                    bits: value.to_bits(),
+                },
+                rusqlite::types::Value::Text(value) => wire::SqlValue::Text {
+                    value: value.clone(),
+                },
+                rusqlite::types::Value::Blob(value) => wire::SqlValue::Blob {
+                    value: value.clone(),
+                },
+            })
+            .collect();
+        return match guest_storage::call(
+            scope,
+            &channel,
+            wire::Operation::SqlStart {
+                query: query.to_owned(),
+                bindings,
+            },
+        )? {
+            wire::Value::Cursor {
+                cursor,
+                columns,
+                row,
+                rows_written,
+                reused_cached_query,
+            } if cursor
+                .as_ref()
+                .is_none_or(|cursor| wire::valid_handle(cursor)) =>
+            {
+                Ok((
+                    SqlCursorId::Guest(cursor),
+                    columns,
+                    row.map(guest_storage::sql_row),
+                    rows_written,
+                    reused_cached_query,
+                ))
+            }
+            _ => Err(guest_storage::unexpected(scope, &channel, "SQL cursor")),
+        };
+    }
+    storage::sql_cursor_start_values(cell, query, bindings).map(
+        |(id, columns, row, written, reused)| {
+            (SqlCursorId::Native(id), columns, row, written, reused)
+        },
+    )
+}
+
+fn ingest_sql(
+    scope: &mut v8::PinScope,
+    cell: &str,
+    input: &str,
+) -> Result<(String, u64, u64), String> {
+    #[cfg(unix)]
+    if let Some(channel) = guest_storage::channel(scope, cell)? {
+        return match guest_storage::call(
+            scope,
+            &channel,
+            wire::Operation::SqlIngest {
+                input: input.to_owned(),
+            },
+        )? {
+            wire::Value::Ingest {
+                remainder,
+                rows_written,
+                statement_count,
+            } => Ok((remainder, rows_written, statement_count)),
+            _ => Err(guest_storage::unexpected(scope, &channel, "SQL ingest")),
+        };
+    }
+    storage::sql_ingest(cell, input)
+}
+
+fn database_size(scope: &mut v8::PinScope, cell: &str) -> Result<u64, String> {
+    #[cfg(unix)]
+    if let Some(channel) = guest_storage::channel(scope, cell)? {
+        return match guest_storage::call(scope, &channel, wire::Operation::SqlSize {})? {
+            wire::Value::Size { bytes } => Ok(bytes),
+            _ => Err(guest_storage::unexpected(scope, &channel, "database size")),
+        };
+    }
+    storage::sql_database_size(cell)
+}
+
+fn delete_keys(scope: &mut v8::PinScope, cell: &str, keys: &[String]) -> Result<u64, String> {
+    #[cfg(unix)]
+    if let Some(channel) = guest_storage::channel(scope, cell)? {
+        return match guest_storage::call(
+            scope,
+            &channel,
+            wire::Operation::Delete {
+                keys: keys.to_vec(),
+            },
+        )? {
+            wire::Value::Count { count } => Ok(count),
+            _ => Err(guest_storage::unexpected(scope, &channel, "delete")),
+        };
+    }
+    storage::delete_many(cell, keys)
+        .map(|count| count as u64)
+        .map_err(|error| error.to_string())
+}
+
+fn get_value(
+    scope: &mut v8::PinScope,
+    cell: &str,
+    key: &str,
+) -> Result<Option<storage::StoredValue>, String> {
+    #[cfg(unix)]
+    if let Some(channel) = guest_storage::channel(scope, cell)? {
+        return guest_storage::get(scope, &channel, vec![key.to_owned()]).map(|entries| {
+            entries
+                .into_iter()
+                .find(|(returned, _)| returned == key)
+                .map(|(_, value)| value)
+        });
+    }
+    storage::get_stored(cell, key).map_err(|error| error.to_string())
+}
+
+fn get_values(
+    scope: &mut v8::PinScope,
+    cell: &str,
+    keys: &[String],
+) -> Result<Vec<(String, storage::StoredValue)>, String> {
+    #[cfg(unix)]
+    if let Some(channel) = guest_storage::channel(scope, cell)? {
+        return guest_storage::get(scope, &channel, keys.to_vec());
+    }
+    storage::get_many_stored(cell, keys).map_err(|error| error.to_string())
+}
+
+fn put_values(
+    scope: &mut v8::PinScope,
+    cell: &str,
+    entries: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(channel) = guest_storage::channel(scope, cell)? {
+        return guest_storage::put(scope, &channel, entries);
+    }
+    storage::put_many_serialized(cell, entries).map_err(|error| error.to_string())
+}
+
+fn put_value(scope: &mut v8::PinScope, cell: &str, key: &str, value: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(channel) = guest_storage::channel(scope, cell)? {
+        return guest_storage::put(scope, &channel, &[(key.to_owned(), value.to_vec())]);
+    }
+    storage::put_serialized(cell, key, value).map_err(|error| error.to_string())
+}
 
 pub(super) fn op_storage_get(
     scope: &mut v8::PinScope,
@@ -16,7 +205,7 @@ pub(super) fn op_storage_get(
 ) {
     let scope_s = args.get(0).to_rust_string_lossy(scope);
     let key = args.get(1).to_rust_string_lossy(scope);
-    match storage::get_stored(&scope_s, &key) {
+    match get_value(scope, &scope_s, &key) {
         Ok(Some(value)) => {
             if let Some((value, _)) = deserialize_stored(scope, value, args.get(2)) {
                 rv.set(value);
@@ -39,7 +228,7 @@ pub(super) fn op_storage_get_many(
             return;
         }
     };
-    match storage::get_many_stored(&cell, &keys) {
+    match get_values(scope, &cell, &keys) {
         Ok(entries) => {
             let sentinel = args.get(2);
             if let Some((map, tagged)) = storage_entries_map(scope, entries, sentinel) {
@@ -63,7 +252,7 @@ pub(super) fn op_storage_put(
     let Some(value) = serialize_storage_value(scope, args.get(2)) else {
         return;
     };
-    if let Err(error) = storage::put_serialized(&s, &k, &value) {
+    if let Err(error) = put_value(scope, &s, &k, &value) {
         throw_storage_error(scope, "put", error);
     }
 }
@@ -97,7 +286,7 @@ pub(super) fn op_storage_put_many(
         };
         serialized.push((key.to_rust_string_lossy(scope), value));
     }
-    if let Err(error) = storage::put_many_serialized(&cell, &serialized) {
+    if let Err(error) = put_values(scope, &cell, &serialized) {
         throw_storage_error(scope, "put", error);
     }
 }
@@ -117,7 +306,7 @@ pub(super) fn op_storage_put_serialized(
         throw_storage_error(scope, "put", "serialized row must be bytes");
         return;
     };
-    if let Err(error) = storage::put_serialized(&cell, &key, &bytes) {
+    if let Err(error) = put_value(scope, &cell, &key, &bytes) {
         throw_storage_error(scope, "put", error);
     }
 }
@@ -146,6 +335,20 @@ pub(super) fn actor_runtime_state(scope: &mut v8::PinScope) -> Arc<ActorRuntimeS
 }
 
 fn queue_serialized_puts(scope: &mut v8::PinScope, cell: String, entries: Vec<(String, Vec<u8>)>) {
+    #[cfg(unix)]
+    match guest_storage::channel(scope, &cell) {
+        Ok(Some(channel)) => {
+            if let Err(error) = guest_storage::queue(&channel, entries) {
+                throw_storage_error(scope, "put", error);
+            }
+            return;
+        }
+        Err(error) => {
+            throw_storage_error(scope, "put", error);
+            return;
+        }
+        Ok(None) => {}
+    }
     actor_runtime_state(scope)
         .pending_puts
         .lock()
@@ -213,6 +416,10 @@ pub(super) fn op_storage_flush_pending_puts(
 }
 
 fn flush_pending_puts(scope: &mut v8::PinScope, cell: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(channel) = guest_storage::channel(scope, cell)? {
+        return guest_storage::flush(scope, &channel);
+    }
     let entries = actor_runtime_state(scope)
         .pending_puts
         .lock()
@@ -222,7 +429,7 @@ fn flush_pending_puts(scope: &mut v8::PinScope, cell: &str) -> Result<(), String
     if entries.is_empty() {
         return Ok(());
     }
-    storage::put_many_serialized(cell, &entries).map_err(|error| error.to_string())
+    put_values(scope, cell, &entries)
 }
 
 /// `storage.sync()`: resolve once every write the cell committed before the
@@ -252,6 +459,9 @@ pub(super) fn op_storage_sync(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    if refuse_unbridged_guest_op(scope, "storage.sync") {
+        return;
+    }
     let cell = args.get(0).to_rust_string_lossy(scope);
     // A promise about durability fails closed. Without a gate channel no
     // ticket can be answered, and without a running cell event nothing says
@@ -348,6 +558,18 @@ pub(super) fn op_storage_cancel_pending_puts(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    #[cfg(unix)]
+    match guest_storage::channel(scope, &cell) {
+        Ok(Some(channel)) => {
+            guest_storage::cancel(&channel);
+            return;
+        }
+        Err(error) => {
+            throw_storage_error(scope, "put", error);
+            return;
+        }
+        Ok(None) => {}
+    }
     actor_runtime_state(scope)
         .pending_puts
         .lock()
@@ -362,7 +584,7 @@ pub(super) fn op_sql_ingest(
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
     let input = args.get(1).to_rust_string_lossy(scope);
-    let out = match storage::sql_ingest(&cell, &input) {
+    let out = match ingest_sql(scope, &cell, &input) {
         Ok((remainder, rows_written, statement_count)) => serde_json::json!({
             "remainder": remainder,
             "rowsWritten": rows_written,
@@ -481,7 +703,7 @@ pub(super) fn op_sql_cursor_start(
             binds[index] = rusqlite::types::Value::Blob(bytes);
         }
     }
-    let result = storage::sql_cursor_start_values(&cell, &query, &binds);
+    let result = start_sql(scope, &cell, &query, &binds);
     if let Some(timing_started) = timing_started {
         let statement = query
             .split_ascii_whitespace()
@@ -504,7 +726,13 @@ pub(super) fn op_sql_cursor_start(
                 let key = v8::String::new(scope, name).unwrap();
                 result.set(scope, key.into(), value);
             };
-            let cursor_id = v8::Number::new(scope, cursor as f64).into();
+            let cursor_id = match cursor {
+                SqlCursorId::Native(cursor) => v8::Number::new(scope, cursor as f64).into(),
+                #[cfg(unix)]
+                SqlCursorId::Guest(Some(cursor)) => v8::String::new(scope, &cursor).unwrap().into(),
+                #[cfg(unix)]
+                SqlCursorId::Guest(None) => v8::Number::new(scope, 0.0).into(),
+            };
             set(scope, "cursorId", cursor_id);
             let names = v8::Array::new(scope, columns.len() as i32);
             for (index, name) in columns.iter().enumerate() {
@@ -547,6 +775,25 @@ pub(super) fn op_sql_cursor_next(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    #[cfg(unix)]
+    if guest_storage::enabled(scope) {
+        let result = (|| {
+            let channel = guest_storage::current_channel(scope)?;
+            let cursor = args.get(0).to_rust_string_lossy(scope);
+            match guest_storage::call(scope, &channel, wire::Operation::SqlNext { cursor })? {
+                wire::Value::Row { row, rows_written } => {
+                    Ok((row.map(guest_storage::sql_row), rows_written))
+                }
+                _ => Err(guest_storage::unexpected(scope, &channel, "SQL row")),
+            }
+        })();
+        match result {
+            Ok((Some(row), _)) => rv.set(sql_row_to_v8(scope, row).into()),
+            Ok((None, rows_written)) => rv.set(v8::Number::new(scope, rows_written as f64).into()),
+            Err(error) => throw_sql_error(scope, error),
+        }
+        return;
+    }
     let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     match storage::sql_cursor_next(cursor) {
         Ok((Some(row), _)) => rv.set(sql_row_to_v8(scope, row).into()),
@@ -621,6 +868,18 @@ pub(super) fn op_sql_cursor_close(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
+    #[cfg(unix)]
+    if guest_storage::enabled(scope) {
+        let result = (|| {
+            let channel = guest_storage::current_channel(scope)?;
+            let cursor = args.get(0).to_rust_string_lossy(scope);
+            guest_storage::unit(scope, &channel, wire::Operation::SqlClose { cursor })
+        })();
+        if let Err(error) = result {
+            throw_sql_error(scope, error);
+        }
+        return;
+    }
     let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     storage::sql_cursor_close(cursor);
 }
@@ -630,11 +889,72 @@ pub(super) fn op_sql_database_size(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
-    match storage::sql_database_size(&cell) {
+    match database_size(scope, &cell) {
         Ok(bytes) => rv.set(v8::Number::new(scope, bytes as f64).into()),
         Err(error) => throw_storage_error(scope, "sql.databaseSize", error),
     }
 }
+fn d1_reply(scope: &mut v8::PinScope, cell: &str, request: String) -> Result<String, String> {
+    #[cfg(unix)]
+    if let Some(channel) = guest_storage::channel(scope, cell)? {
+        // JSON escaping can grow a byte up to 6x; one D1Run must fit a frame.
+        let mut operation = if request.len() > wire::MAX_MESSAGE_BYTES / 8 {
+            let start = wire::Operation::D1RequestStart {
+                bytes: request.len() as u64,
+            };
+            match guest_storage::call(scope, &channel, start)? {
+                wire::Value::Unit {} => {}
+                _ => {
+                    return Err(guest_storage::unexpected(
+                        scope,
+                        &channel,
+                        "D1 request start",
+                    ))
+                }
+            }
+            let mut offset = 0;
+            while offset < request.len() {
+                let mut end = (offset + celld_applications::invocation_wire::MAX_CHUNK_BYTES)
+                    .min(request.len());
+                while !request.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let chunk = wire::Operation::D1RequestChunk {
+                    data: request[offset..end].to_owned(),
+                };
+                match guest_storage::call(scope, &channel, chunk)? {
+                    wire::Value::Unit {} => {}
+                    _ => {
+                        return Err(guest_storage::unexpected(
+                            scope,
+                            &channel,
+                            "D1 request chunk",
+                        ))
+                    }
+                }
+                offset = end;
+            }
+            wire::Operation::D1RequestEnd {}
+        } else {
+            wire::Operation::D1Run { request }
+        };
+        let mut output = String::new();
+        loop {
+            match guest_storage::call(scope, &channel, operation)? {
+                wire::Value::D1 { reply, complete } => {
+                    output.push_str(&reply);
+                    if complete {
+                        return Ok(output);
+                    }
+                    operation = wire::Operation::D1Next {};
+                }
+                _ => return Err(guest_storage::unexpected(scope, &channel, "D1")),
+            }
+        }
+    }
+    Ok(storage::d1_run_json(cell, &request))
+}
+
 /// `__d1_run(cell, request)` — the D1 adapter's one op. The request and the
 /// reply are the typed structures in `storage::d1_run`; nothing D1 crosses
 /// this boundary through the general SQL ops, so the D1 contract cannot
@@ -646,7 +966,13 @@ pub(super) fn op_d1_run(
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
     let request = args.get(1).to_rust_string_lossy(scope);
-    let out = storage::d1_run_json(&cell, &request);
+    let out = match d1_reply(scope, &cell, request) {
+        Ok(out) => out,
+        Err(error) => {
+            throw_storage_error(scope, "d1", error);
+            return;
+        }
+    };
     rv.set(v8::String::new(scope, &out).unwrap().into());
 }
 #[cfg(celld_internal_tests)]
@@ -723,8 +1049,15 @@ pub(super) fn op_storage_transaction_control(
     // the parent, and before COMMIT/ROLLBACK it belongs to the ending scope.
     // Clearing the cell queue on rollback would also discard parent writes;
     // flushing after rollback would commit the canceled writes outside it.
-    let result = flush_pending_puts(scope, &cell)
-        .and_then(|()| storage::transaction_control(&cell, &action, nested, &savepoint));
+    let result = flush_pending_puts(scope, &cell).and_then(|()| {
+        #[cfg(unix)]
+        if let Some(channel) = guest_storage::channel(scope, &cell)? {
+            guest_storage::transaction_control(scope, &channel, &action, nested, &savepoint)?;
+            // Trusted host output sampling handles committed alarm changes.
+            return Ok(None);
+        }
+        storage::transaction_control(&cell, &action, nested, &savepoint)
+    });
     if let Some(timing_started) = timing_started {
         tracing::debug!(
             target: "queue_timing",
@@ -751,7 +1084,23 @@ pub(super) fn op_storage_delete(
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
     let k = args.get(1).to_rust_string_lossy(scope);
-    match storage::delete(&s, &k) {
+    let result = (|| {
+        #[cfg(unix)]
+        if let Some(channel) = guest_storage::channel(scope, &s)? {
+            return match guest_storage::call(
+                scope,
+                &channel,
+                wire::Operation::Delete {
+                    keys: vec![k.clone()],
+                },
+            )? {
+                wire::Value::Count { count } => Ok(count > 0),
+                _ => Err(guest_storage::unexpected(scope, &channel, "delete")),
+            };
+        }
+        storage::delete(&s, &k).map_err(|error| error.to_string())
+    })();
+    match result {
         Ok(deleted) => rv.set(v8::Boolean::new(scope, deleted).into()),
         Err(error) => throw_storage_error(scope, "delete", error),
     }
@@ -769,7 +1118,7 @@ pub(super) fn op_storage_delete_many(
             return;
         }
     };
-    match storage::delete_many(&cell, &keys) {
+    match delete_keys(scope, &cell, &keys) {
         Ok(deleted) => rv.set(v8::Number::new(scope, deleted as f64).into()),
         Err(error) => throw_storage_error(scope, "delete", error),
     }
@@ -801,15 +1150,36 @@ pub(super) fn op_storage_list(
             return;
         }
     };
-    match storage::list_stored_with_options(
-        &cell,
-        options.start.as_deref(),
-        options.end.as_deref(),
-        options.start_after.as_deref(),
-        options.prefix.as_deref(),
-        options.limit,
-        options.reverse,
-    ) {
+    let result = (|| {
+        #[cfg(unix)]
+        if let Some(channel) = guest_storage::channel(scope, &cell)? {
+            return guest_storage::entries(
+                scope,
+                &channel,
+                wire::Operation::List {
+                    options: wire::ListOptions {
+                        begin: options.start.clone(),
+                        end: options.end.clone(),
+                        start_after: options.start_after.clone(),
+                        prefix: options.prefix.clone(),
+                        limit: options.limit,
+                        reverse: options.reverse,
+                    },
+                },
+            );
+        }
+        storage::list_stored_with_options(
+            &cell,
+            options.start.as_deref(),
+            options.end.as_deref(),
+            options.start_after.as_deref(),
+            options.prefix.as_deref(),
+            options.limit,
+            options.reverse,
+        )
+        .map_err(|error| error.to_string())
+    })();
+    match result {
         Ok(entries) => {
             let sentinel = args.get(2);
             if let Some((map, tagged)) = storage_entries_map(scope, entries, sentinel) {
@@ -839,6 +1209,37 @@ pub(super) fn op_storage_sync_list_start(
             return;
         }
     };
+    #[cfg(unix)]
+    match guest_storage::channel(scope, &cell).and_then(|channel| {
+        channel
+            .map(|channel| {
+                match guest_storage::call(
+                    scope,
+                    &channel,
+                    wire::Operation::SyncListStart {
+                        options: wire::ListOptions {
+                            begin: options.start.clone(),
+                            end: options.end.clone(),
+                            start_after: options.start_after.clone(),
+                            prefix: options.prefix.clone(),
+                            limit: options.limit,
+                            reverse: options.reverse,
+                        },
+                    },
+                )? {
+                    wire::Value::Cursor {
+                        cursor: Some(cursor),
+                        ..
+                    } if wire::valid_handle(&cursor) => Ok(cursor),
+                    _ => Err(guest_storage::unexpected(scope, &channel, "sync KV cursor")),
+                }
+            })
+            .transpose()
+    }) {
+        Ok(Some(cursor)) => return rv.set(v8::String::new(scope, &cursor).unwrap().into()),
+        Ok(None) => {}
+        Err(error) => return throw_storage_error(scope, "kv.list", error),
+    }
     match storage::sync_list_start(
         &cell,
         options.start.as_deref(),
@@ -858,8 +1259,25 @@ pub(super) fn op_storage_sync_list_next(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    match storage::sync_list_next(cursor) {
+    let result = (|| {
+        #[cfg(unix)]
+        if guest_storage::enabled(scope) {
+            if !args.get(0).is_string() {
+                return Err("sync KV cursor was invalidated".to_string());
+            }
+            let channel = guest_storage::current_channel(scope)?;
+            let cursor = args.get(0).to_rust_string_lossy(scope);
+            let mut entries =
+                guest_storage::entries(scope, &channel, wire::Operation::SyncListNext { cursor })?;
+            if entries.len() > 1 {
+                return Err(guest_storage::unexpected(scope, &channel, "sync KV entry"));
+            }
+            return Ok(entries.pop());
+        }
+        let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+        storage::sync_list_next(cursor).map_err(|error| error.to_string())
+    })();
+    match result {
         Ok(Some((key, value))) => {
             let Some((decoded, _)) = deserialize_stored(scope, value, args.get(1)) else {
                 throw_storage_error(
@@ -1237,7 +1655,18 @@ pub(super) fn op_storage_delete_all(
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
     let delete_alarm = args.get(1).boolean_value(scope);
-    if let Err(error) = storage::delete_all_with_alarm(&cell, delete_alarm) {
+    let result = (|| {
+        #[cfg(unix)]
+        if let Some(channel) = guest_storage::channel(scope, &cell)? {
+            return guest_storage::unit(
+                scope,
+                &channel,
+                wire::Operation::DeleteAll { delete_alarm },
+            );
+        }
+        storage::delete_all_with_alarm(&cell, delete_alarm).map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
         let message = v8::String::new(scope, &format!("deleteAll: {error}")).unwrap();
         let exception = v8::Exception::error(scope, message);
         scope.throw_exception(exception);

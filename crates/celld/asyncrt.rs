@@ -195,6 +195,14 @@ pub fn set_host_handle(handle: tokio::runtime::Handle) {
     );
 }
 
+/// Make the running test's runtime the process domain, unless a test already
+/// did. Only the combined application test uses the production facade, and it
+/// keeps every check that needs it in its one live runtime.
+#[cfg(test)]
+pub(crate) fn bind_test_runtime() {
+    let _ = PROCESS_DOMAIN.set(ProductionDomain::new(tokio::runtime::Handle::current()));
+}
+
 /// Return the Tokio handle for the V8 arm.
 pub fn op_handle() -> tokio::runtime::Handle {
     current_domain().owner.handle.clone()

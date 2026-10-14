@@ -602,6 +602,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
 
     let bucket = options.bucket.expect("validated deployment bucket");
     let store = bucket_client(&bucket, options.endpoint.as_deref(), &region)?;
+    deploy::validate_r2_bindings(&store, &built.manifest)?;
     validate_bucket(&store).await?;
     crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();

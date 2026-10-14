@@ -1,0 +1,4 @@
+# Upstream's release toolchain (Dockerfile `RUST_VERSION`); clippy runs its lint gate.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy"]

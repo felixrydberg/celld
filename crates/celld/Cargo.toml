@@ -13,6 +13,10 @@ path = "lib.rs"
 name = "celld"
 path = "main.rs"
 
+[[bin]]
+name = "celld-guest"
+path = "guest_main.rs"
+
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]
@@ -32,6 +36,7 @@ axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
 celld-logic.workspace = true
+celld-applications.workspace = true
 celld-ltx = { workspace = true, features = ["s3"] }
 encoding_rs.workspace = true
 ed25519-dalek.workspace = true
@@ -79,7 +84,7 @@ tikv-jemallocator.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true

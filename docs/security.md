@@ -5,10 +5,23 @@ Only the latest release receives security fixes.
 
 ## Security boundary
 
-One fleet runs one application. celld trusts the application code, the fleet
-nodes, and the operators. Application code can use its configured bindings and
-can consume shared node resources. Do not run code from mutually distrusting
-tenants in one fleet.
+One fleet runs one Worker application by default. celld trusts the application
+code, the fleet nodes, and the operators. Application code can use its
+configured bindings and can consume shared node resources. Do not run code from
+mutually distrusting tenants in one fleet.
+
+A platform fleet serves many applications: a node started with
+`--application-vms` or `--application-domain` discovers the fleet's current
+application records. An application ID is then the authorization boundary. The
+management API carries one credential per application, and an application
+credential manages only the application it names. An application reaches only
+the resources and secrets registered for it, never another application's, and
+never the fleet metadata. Its handlers run in a credential-free microVM with no
+network device and no host mount of application files, reaching the host only
+through brokered calls that carry an opaque grant scoped to one invocation, so a
+compromised or untrusted handler cannot borrow the fleet's credentials or reach
+the network on its own. See [Application management](application-management.md)
+and [Application setup](application-setup.md).
 
 Application code cannot reach the engine's host functions. An internal script
 receives them as function parameters, and `globalThis` carries no
@@ -151,6 +164,14 @@ state, the ownership and node leases, and the shared peer-authentication
 secret. A holder of the bucket credentials controls the fleet. Give each
 credential access to one fleet bucket only, and rotate it after a suspected
 disclosure.
+
+The fleet credential also opens the provider buckets that applications name in
+R2 bindings: celld builds that client from the fleet's own endpoint, region, and
+credential providers. Grant the fleet credential access to those buckets too.
+That access is a deliberate operator decision per application, because an
+application's binding can name any bucket the credential can reach. celld never
+accepts the fleet bucket itself as an R2 binding, so an application cannot read
+the fleet metadata through one.
 
 ## Cell ownership
 

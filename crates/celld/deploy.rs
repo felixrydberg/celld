@@ -36,6 +36,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod python;
+pub(crate) use python::{runtime_files, sentinel_bytes, PYODIDE_VERSION};
 
 /// Config keys we understand. Anything else is an error: refusing is
 /// compat-safe, guessing produces confusing activation failures later.
@@ -209,6 +210,9 @@ pub struct Options {
     /// the bucket. `celld dev` runs its node on the same engine that built
     /// them; a fleet needs the tar.
     pub local_images: bool,
+    /// Build a Python Worker without its interpreter files, which the
+    /// application platform serves from a shared drive (see `python::build`).
+    pub shared_python_runtime: bool,
 }
 
 /// Local Worker variables, tagged with the kind of file that supplied them.
@@ -261,6 +265,7 @@ pub fn options_from_arguments(
         region: None,
         dry_run: false,
         local_images: false,
+        shared_python_runtime: false,
         json: false,
         vars: VarOverrides::None,
     };
@@ -403,7 +408,7 @@ struct ContainerDecl {
     runtime: Option<String>,
 }
 
-struct ProjectAssets {
+pub(crate) struct ProjectAssets {
     directory: PathBuf,
     config: AssetConfig,
     raw_metadata: Value,
@@ -624,7 +629,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .as_deref()
         .map(|entry| {
             if let Some(compat) = &project.python {
-                let (output, descriptor) = python::build(&root, entry, compat)?;
+                let (output, descriptor) = python::build(&root, entry, compat, options.shared_python_runtime)?;
                 project.metadata["python_runtime"] = descriptor;
                 Ok(output)
             } else if project.no_bundle {
@@ -878,7 +883,28 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
     bucket.put(&key, output.stdout).await
 }
 
+/// Refuse fleet-storage bindings before publication or format initialization.
+pub fn validate_r2_bindings(bucket: &Bucket, manifest: &Manifest) -> anyhow::Result<()> {
+    if let Some(bindings) = manifest
+        .raw_metadata
+        .get("bindings")
+        .and_then(Value::as_array)
+    {
+        for binding in bindings {
+            if binding.get("type").and_then(Value::as_str) == Some("r2_bucket") {
+                let name = binding
+                    .get("bucket_name")
+                    .and_then(Value::as_str)
+                    .context("R2 binding has no bucket_name")?;
+                bucket.validate_r2_bucket_name(name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    validate_r2_bindings(bucket, &built.manifest)?;
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
@@ -1810,7 +1836,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             .get("bucket_name")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                anyhow!("r2 binding {binding} has no `bucket_name`; celld uses the name to place the bucket's keys in the fleet bucket")
+                anyhow!("r2 binding {binding} has no `bucket_name`; celld opens the named bucket using the fleet's backend and credentials")
             })?;
         if !valid_resource_name(bucket_name) {
             bail!(
@@ -2292,10 +2318,8 @@ fn optional_queue_u32(value: &Value, field: &str) -> anyhow::Result<Option<u32>>
 
 /// The upstream workflow-name rule (`^[a-zA-Z0-9_][a-zA-Z0-9-_]*$`, at most 64
 /// characters). Instance ids follow the same rule; the harness validates those
-/// because they arrive at run time, not at deploy. An R2 `bucket_name` takes
-/// the same rule for a second reason: the name becomes a key prefix inside the
-/// fleet bucket, and this rule is what keeps it a single path segment, so a
-/// binding cannot address the fleet's own deployment, cell, or lease keys.
+/// because they arrive at run time, not at deploy. R2 `bucket_name` retains
+/// this existing deployment contract, which also accepts bucket UUIDs.
 pub(crate) fn valid_resource_name(name: &str) -> bool {
     name.len() <= 64
         && name
@@ -2410,7 +2434,7 @@ fn read_sqlite_classes(project: &Map<String, Value>) -> anyhow::Result<Vec<Strin
     Ok(result)
 }
 
-fn read_asset_project(
+pub(crate) fn read_asset_project(
     value: &Value,
     root: &Path,
     project: &Map<String, Value>,
@@ -2643,7 +2667,7 @@ fn read_asset_directive(directory: &Path, name: &str) -> anyhow::Result<Option<S
     Ok(Some(contents))
 }
 
-fn build_assets(project: &ProjectAssets) -> anyhow::Result<BuiltAssets> {
+pub(crate) fn build_assets(project: &ProjectAssets) -> anyhow::Result<BuiltAssets> {
     let max_file_bytes = crate::env_vars::max_asset_file_bytes()?;
     let mut files = Vec::new();
     collect_asset_files(&project.directory, "", &mut files)?;

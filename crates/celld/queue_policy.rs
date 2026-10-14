@@ -414,6 +414,37 @@ fn effective_queue_batch_timeout(duration: i64) -> i64 {
     duration
 }
 
+/// One queue's consumer settings in the shape the cell reads them. Absent
+/// settings are omitted, because the harness tests them against `undefined`.
+/// An application's queue also carries the host-resolved dead-letter
+/// namespace key.
+pub(crate) fn queue_consumer_wire(
+    script: &str,
+    consumer: &crate::protocol::QueueConsumerConfig,
+    dead_letter_key: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "script": script,
+        "maxBatchSize": consumer.max_batch_size,
+        "maxBatchTimeoutMs":
+            effective_queue_batch_timeout(i64::from(consumer.max_batch_timeout) * 1000),
+        "maxRetries": consumer.max_retries,
+    });
+    if let Some(queue) = &consumer.dead_letter_queue {
+        value["deadLetterQueue"] = serde_json::json!(queue);
+    }
+    if let Some(key) = dead_letter_key {
+        value["deadLetterNamespaceKey"] = serde_json::json!(key);
+    }
+    if let Some(limit) = consumer.max_concurrency {
+        value["maxConcurrency"] = serde_json::json!(limit);
+    }
+    if let Some(delay) = consumer.retry_delay {
+        value["retryDelaySeconds"] = serde_json::json!(delay);
+    }
+    value
+}
+
 /// The Queue cell's deployment-wide settings, as the cell reads them: the
 /// consumer catalog by queue, the lease duration, and the limits.
 pub(crate) fn consumer_config(config: &crate::js::WorkerConfig) -> Result<serde_json::Value> {
@@ -422,22 +453,7 @@ pub(crate) fn consumer_config(config: &crate::js::WorkerConfig) -> Result<serde_
         .iter()
         .map(|registration| {
             let consumer = &registration.config;
-            let mut value = serde_json::json!({
-                "script": registration.script,
-                "maxBatchSize": consumer.max_batch_size,
-                "maxBatchTimeoutMs":
-                    effective_queue_batch_timeout(i64::from(consumer.max_batch_timeout) * 1000),
-                "maxRetries": consumer.max_retries,
-            });
-            if let Some(queue) = &consumer.dead_letter_queue {
-                value["deadLetterQueue"] = serde_json::json!(queue);
-            }
-            if let Some(limit) = consumer.max_concurrency {
-                value["maxConcurrency"] = serde_json::json!(limit);
-            }
-            if let Some(delay) = consumer.retry_delay {
-                value["retryDelaySeconds"] = serde_json::json!(delay);
-            }
+            let value = queue_consumer_wire(&registration.script, consumer, None);
             (consumer.queue.clone(), value)
         })
         .collect();

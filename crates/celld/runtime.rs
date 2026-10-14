@@ -369,23 +369,33 @@ struct AlarmRequestRegistry {
     completed: VecDeque<(String, celld_logic::OpId)>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum AlarmRequestState {
     PendingAbort,
-    Active(js::RequestId),
+    Active(js::RequestId, tokio_util::sync::CancellationToken, bool),
     Completed,
 }
 
 impl AlarmRequestRegistry {
-    fn begin(&mut self, cell: String, op: celld_logic::OpId, request: js::RequestId) -> bool {
+    fn begin(
+        &mut self,
+        cell: String,
+        op: celld_logic::OpId,
+        request: js::RequestId,
+        guest: bool,
+    ) -> bool {
         let key = (cell, op);
         let cancel = matches!(
             self.states.remove(&key),
             Some(AlarmRequestState::PendingAbort)
         );
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        if cancel {
+            cancelled.cancel();
+        }
         assert!(
             self.states
-                .insert(key, AlarmRequestState::Active(request))
+                .insert(key, AlarmRequestState::Active(request, cancelled, guest))
                 .is_none(),
             "one shell alarm task per core operation"
         );
@@ -396,7 +406,7 @@ impl AlarmRequestRegistry {
         let key = (cell.to_string(), op);
         if matches!(
             self.states.get(&key),
-            Some(AlarmRequestState::Active(active)) if *active == request
+            Some(AlarmRequestState::Active(active, _, _)) if *active == request
         ) {
             self.states
                 .insert(key.clone(), AlarmRequestState::Completed);
@@ -413,10 +423,31 @@ impl AlarmRequestRegistry {
         }
     }
 
+    fn cancellation(
+        &self,
+        cell: &str,
+        op: celld_logic::OpId,
+    ) -> tokio_util::sync::CancellationToken {
+        match self.states.get(&(cell.into(), op)) {
+            Some(AlarmRequestState::Active(_, cancelled, _)) => cancelled.clone(),
+            _ => panic!("alarm cancellation requires an active firing"),
+        }
+    }
+
+    fn guest(&self, cell: &str, op: celld_logic::OpId) -> bool {
+        matches!(
+            self.states.get(&(cell.into(), op)),
+            Some(AlarmRequestState::Active(_, _, true))
+        )
+    }
+
     fn aborting(&mut self, cell: &str, op: celld_logic::OpId) -> Option<js::RequestId> {
         let key = (cell.to_string(), op);
-        match self.states.get(&key).copied() {
-            Some(AlarmRequestState::Active(request)) => Some(request),
+        match self.states.get(&key).cloned() {
+            Some(AlarmRequestState::Active(request, cancelled, _)) => {
+                cancelled.cancel();
+                Some(request)
+            }
             Some(AlarmRequestState::PendingAbort | AlarmRequestState::Completed) => None,
             None => {
                 self.states.insert(key, AlarmRequestState::PendingAbort);
@@ -424,6 +455,27 @@ impl AlarmRequestRegistry {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn alarm_cancellation_registry_pins_exact_firing() {
+    let mut registry = AlarmRequestRegistry::default();
+    assert!(registry.aborting("cell", 1).is_none());
+    assert!(registry.begin("cell".into(), 1, js::next_request_id(), true));
+    assert!(registry.cancellation("cell", 1).is_cancelled());
+    let request = js::next_request_id();
+    assert!(!registry.begin("cell".into(), 2, request, true));
+    let successor = registry.cancellation("cell", 2);
+    registry.aborting("cell", 1);
+    assert!(
+        !successor.is_cancelled(),
+        "predecessor abort cancelled its successor"
+    );
+    assert_eq!(registry.aborting("cell", 2), Some(request));
+    assert!(successor.is_cancelled());
+    registry.finish("cell", 2, request);
+    assert!(registry.aborting("cell", 2).is_none());
 }
 
 struct AlarmRequestGuard {
@@ -511,6 +563,8 @@ impl StatelessVerb {
 }
 
 struct CellHandle {
+    #[cfg(target_os = "linux")]
+    application_scope: Option<Arc<crate::application_vm::ScopeMetadata>>,
     epoch: u64,
     /// The application generation whose isolate holds this cell, reported
     /// when the cell leaves for a swap.
@@ -524,9 +578,15 @@ struct CellHandle {
     /// authorize that old value to delete a later arm's entry.
     alarm: celld_logic::wake::AlarmSnapshot,
     requests: Arc<CellRequestAdmission>,
+    #[cfg(unix)]
+    guests: Vec<crate::application_guest_transport::GuestObject>,
 }
 
 struct CellRequestAdmission {
+    /// A failed guest cleanup must not leave a reusable SQLite residency.
+    /// Proof/eviction still use the original Actor and retain its files.
+    quarantined: AtomicBool,
+    retiring: AtomicBool,
     in_flight: AtomicUsize,
     saturated: AtomicBool,
     limit: usize,
@@ -563,8 +623,17 @@ impl Drop for CellRequestPermit {
 }
 
 struct AdmittedCellRequest {
+    epoch: u64,
     affiliation: crate::pool::Affiliation,
     permit: CellRequestPermit,
+}
+
+/// Host-only admission held for a guest event's entire asynchronous lifetime.
+/// Its original request permit and slot affiliation cannot be reconstructed
+/// from a guest grant, or silently rebound to a replacement at the same epoch.
+pub(crate) struct StorageAdmission {
+    cell: String,
+    admitted: AdmittedCellRequest,
 }
 
 /// How a turn's alarm move reaches the host. `drive_cell` calls it with
@@ -650,6 +719,208 @@ pub(crate) fn cell_pool(config: Arc<WorkerConfig>) -> Arc<crate::pool::Pool> {
         admission_wait(),
         Box::new(move || load_cell_isolate(config.clone())),
     ))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn application_storage_pool_key(sqlite_vec: bool) -> &'static str {
+    // NUL cannot occur in a deployed script name; this is a registry key,
+    // never a filesystem path or a JavaScript module name.
+    if sqlite_vec {
+        "\0application-storage-vec"
+    } else {
+        "\0application-storage"
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn application_storage_config(
+    generation: GenerationId,
+    node: &str,
+    sqlite_vec: bool,
+) -> Arc<WorkerConfig> {
+    let mut options = application_host_options(node.into());
+    options.src =
+        "export default { fetch() { throw new Error('storage host has no handler'); } };".into();
+    options.script_name = "celld-application-storage".into();
+    options.compat.sqlite_vec = sqlite_vec;
+    // Only catalog-authenticated scopes enter this inert pool. Their native
+    // SQLite names were verified by the host; reopening must restore them
+    // without giving the pool any application's namespace keys.
+    Arc::new(
+        WorkerConfig::new(options)
+            .with_generation(generation)
+            .with_host_verified_names(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn application_kv_config(generation: GenerationId, node: &str) -> Arc<WorkerConfig> {
+    let mut options = application_host_options(node.into());
+    options.script_name = "celld-application-kv".into();
+    // Its actor names come from the host's catalog-derived scopes; see
+    // `with_host_verified_names`.
+    Arc::new(
+        WorkerConfig::new(options)
+            .with_generation(generation)
+            .with_host_verified_names(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn application_host_options(node: String) -> js::WorkerConfigOptions {
+    js::WorkerConfigOptions {
+        src: "export default { fetch() { return new Response('Not found', { status: 404 }); } };"
+            .into(),
+        script_name: "celld-application-host".into(),
+        do_classes: vec![],
+        bindings: vec![],
+        r2_bindings: vec![],
+        d1_bindings: vec![],
+        kv_bindings: vec![],
+        queue_bindings: vec![],
+        queue_consumers: vec![],
+        workflow_bindings: vec![],
+        vars: vec![],
+        node,
+        modules: vec![],
+        compat: Default::default(),
+    }
+}
+
+/// A configured standalone application host needs no original Worker
+/// deployment. Its original runtime still owns native storage, replication
+/// and admission; unclaimed ingress reaches only this credential-free 404.
+#[cfg(target_os = "linux")]
+pub fn application_host_graph(node: String) -> crate::generation::DeploymentGraph {
+    let options = application_host_options(node);
+    crate::generation::DeploymentGraph::single(crate::fleet::LoadedDeployment {
+        script_name: options.script_name.clone(),
+        options,
+        version: "application-host".into(),
+        prefix: "application-host".into(),
+        asset_binding: None,
+        loader_bindings: vec![],
+        assets: None,
+        services: vec![],
+        crons: vec![],
+        containers: vec![],
+        fence_image: None,
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) async fn check_application_storage_pool() {
+    let directory = tempfile::tempdir().unwrap();
+    let generation = Generation::build(
+        1,
+        application_host_graph("host".into()),
+        crate::generation::GenerationOptions {
+            node: "host".into(),
+            region: "local".into(),
+        },
+    )
+    .unwrap();
+    assert!(!generation.has_cell_classes());
+    let runtime = RuntimeManager::start(
+        generation,
+        RuntimeOptions {
+            data_dir: directory.path().join("data"),
+            replication: None,
+            wake: None,
+            alarm_observer: Arc::new(|_, _| {}),
+            node: "host".into(),
+            region: "local".into(),
+            bucket: None,
+        },
+    )
+    .unwrap();
+    for (epoch, sqlite_vec) in [(1, false), (2, true)] {
+        let cell = format!("Unexported:{epoch}");
+        runtime
+            .restore_cell(
+                &cell,
+                &celld_logic::RestoreSpec {
+                    epoch,
+                    fresh: true,
+                    took_over: false,
+                    resume_local: false,
+                    prior: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(runtime.start_cell(cell.clone(), epoch, true).await.is_err());
+        // The production caller obtains this authorization only by checking
+        // the exact id against an active, bound application namespace.
+        runtime
+            .start_cell_with_storage(
+                cell.clone(),
+                epoch,
+                true,
+                Some(js::Compat {
+                    sqlite_vec,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(runtime.admit_storage_request(&cell, epoch).is_err());
+        runtime.publish_cell(&cell, epoch).unwrap();
+        assert!(runtime.admit_storage_request(&cell, epoch + 1).is_err());
+        runtime
+            .storage_turn(&cell, epoch, |_| {
+                crate::storage::set_actor_name(&cell, "host-object").unwrap();
+                crate::storage::put_many_json(&cell, &[("host-check".into(), "42".into())])
+                    .unwrap();
+                assert!(crate::storage::get_stored(&cell, "host-check")
+                    .unwrap()
+                    .is_some());
+                assert_eq!(
+                    crate::storage::sql_exec(&cell, "SELECT vec_version()", &[]).is_ok(),
+                    sqlite_vec
+                );
+            })
+            .await
+            .unwrap();
+        runtime
+            .stop_cell(&cell, epoch, StopMode::CloseInPlace)
+            .await
+            .unwrap();
+        assert!(runtime.admit_storage_request(&cell, epoch).is_err());
+        assert!(runtime
+            .start_cell(cell.clone(), epoch + 2, true)
+            .await
+            .is_err());
+        // A fresh host isolate restores the already-authenticated name from
+        // native SQLite without holding an application's namespace keys.
+        let mut reopened =
+            js::Worker::load_config(application_storage_config(1, "host", sqlite_vec)).unwrap();
+        let path = runtime.db_path(&cell, epoch);
+        reopened
+            .own_cell(
+                &cell,
+                Some(CellStorage {
+                    path: path.to_str().unwrap(),
+                    epoch,
+                    replicated_wake: false,
+                    vfs: None,
+                }),
+            )
+            .unwrap();
+        reopened
+            .storage_turn(&cell, epoch, |_| {
+                assert_eq!(
+                    crate::storage::get_actor_name(&cell).unwrap().as_deref(),
+                    Some("host-object")
+                );
+                assert!(crate::storage::get_stored(&cell, "host-check")
+                    .unwrap()
+                    .is_some());
+            })
+            .unwrap();
+    }
+    runtime.generation().reap_cell_pools();
+    eprintln!("application native storage: undeclared Worker classes refused without active namespace authority; an inert host with no class exports used original unpublished/published/epoch-fenced storage admission, matched sqlite_vec flags, and closed on fence; local check, no VM or independent-host evidence");
 }
 
 /// Wait for one cell fetch reply without retaining the internal receiver after
@@ -1181,6 +1452,20 @@ impl RuntimeManager {
     /// hears the stop. A cell already gone is not an error: the swap and an
     /// eviction can race, and the eviction's stop did this work.
     pub async fn swap_out_cell(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        if let Err(error) = self.retire_guest_objects(cell, epoch).await {
+            if let Some(handle) = self
+                .cells
+                .lock()
+                .expect("cell registry poisoned")
+                .published
+                .get(cell)
+                .filter(|handle| handle.epoch == epoch)
+            {
+                handle.requests.retiring.store(false, Ordering::Release);
+            }
+            return Err(error);
+        }
         // The isolates to release, taken by reference rather than by handle.
         // A release that fails can leave this cell's database open in that
         // realm, and the handle owns both the residency that keeps the realm
@@ -1199,15 +1484,29 @@ impl RuntimeManager {
             // Taking the isolate for this turn is the barrier: an event of
             // this cell either finished its turn before it or has not
             // started one, so closing its SQLite cannot land mid-handler.
-            slot.turn(|worker| {
-                #[cfg(debug_assertions)]
-                if let Some(error) = crate::engine_api::injected_swap_release_failure() {
-                    return Err(error);
+            let released = slot
+                .turn(|worker| {
+                    #[cfg(debug_assertions)]
+                    if let Some(error) = crate::engine_api::injected_swap_release_failure() {
+                        return Err(error);
+                    }
+                    worker.own_cell(cell, None)
+                })
+                .await
+                .with_context(|| format!("release {cell} from its isolate for a generation swap"));
+            if let Err(error) = released {
+                if let Some(handle) = self
+                    .cells
+                    .lock()
+                    .expect("cell registry poisoned")
+                    .published
+                    .get(cell)
+                    .filter(|handle| handle.epoch == epoch)
+                {
+                    handle.requests.retiring.store(false, Ordering::Release);
                 }
-                worker.own_cell(cell, None)
-            })
-            .await
-            .with_context(|| format!("release {cell} from its isolate for a generation swap"))?;
+                return Err(error);
+            }
             crate::js::release_root_facets(cell, epoch, crate::js::RootRelease::Swap).await;
             tracing::info!(
                 event = "generation_swap_out",
@@ -1246,15 +1545,80 @@ impl RuntimeManager {
         epoch: u64,
         fresh: bool,
     ) -> anyhow::Result<(celld_logic::isolate::HeapId, GenerationId)> {
+        // An authenticated active application namespace owns its native
+        // storage even when the original Worker exports the same class name.
+        // The host isolate never receives the application's source or secrets.
+        #[cfg(target_os = "linux")]
+        let application_scope = match crate::application_vm::hosted() {
+            Some(dispatcher) => dispatcher.prepare_scope(&cell).await?,
+            None => None,
+        };
+        #[cfg(target_os = "linux")]
+        let application_storage = application_scope.as_ref().map(|metadata| metadata.compat);
+        #[cfg(not(target_os = "linux"))]
+        let application_storage: Option<js::Compat> = None;
+        let started = self
+            .start_cell_with_storage(cell.clone(), epoch, fresh, application_storage)
+            .await?;
+        #[cfg(target_os = "linux")]
+        if let Some(handle) = self
+            .cells
+            .lock()
+            .expect("cell registry poisoned")
+            .starting
+            .get_mut(&cell)
+        {
+            if handle.epoch == epoch {
+                handle.application_scope = application_scope;
+            }
+        }
+        Ok(started)
+    }
+
+    async fn start_cell_with_storage(
+        &self,
+        cell: String,
+        epoch: u64,
+        fresh: bool,
+        application_storage: Option<js::Compat>,
+    ) -> anyhow::Result<(celld_logic::isolate::HeapId, GenerationId)> {
         let db_path = self.db_path(&cell, epoch);
         let class = cell
             .split_once(':')
             .map(|(class, _)| class)
             .ok_or_else(|| anyhow!("cell scope has no class: {cell}"))?;
         let generation = self.generation();
-        let config = generation
-            .cell_config(class)
-            .ok_or_else(|| anyhow!("no Worker exports Durable Object class {class}"))?;
+        let (config, isolates) = match application_storage {
+            #[cfg(target_os = "linux")]
+            Some(_)
+                if class == celld_logic::kv::RESERVED_CLASS
+                    || class == celld_logic::queue::RESERVED_CLASS
+                    || class == celld_logic::cron::RESERVED_CLASS =>
+            {
+                (
+                    application_kv_config(generation.id, &self.node),
+                    generation
+                        .cell_isolates("\0application-kv")
+                        .context("application KV pool is unavailable")?,
+                )
+            }
+            #[cfg(target_os = "linux")]
+            Some(compat) => (
+                application_storage_config(generation.id, &self.node, compat.sqlite_vec),
+                generation
+                    .cell_isolates(application_storage_pool_key(compat.sqlite_vec))
+                    .context("application storage pool is unavailable")?,
+            ),
+            _ => {
+                let config = generation
+                    .cell_config(class)
+                    .ok_or_else(|| anyhow!("no Worker exports Durable Object class {class}"))?;
+                let isolates = generation
+                    .cell_isolates(&config.script_name)
+                    .ok_or_else(|| anyhow!("no cell isolates for script {}", config.script_name))?;
+                (config, isolates)
+            }
+        };
         // The object's `running` is read synchronously, so the engine
         // answers it here, before the object exists. A container a previous
         // activation on this node left running is adopted by name.
@@ -1271,9 +1635,6 @@ impl RuntimeManager {
             fresh,
         };
 
-        let isolates = generation
-            .cell_isolates(&config.script_name)
-            .ok_or_else(|| anyhow!("no cell isolates for script {}", config.script_name))?;
         // Building an isolate compiles the script, so it runs on a blocking
         // thread: the pool builds before taking its lock, but the caller is a
         // tokio worker either way.
@@ -1342,16 +1703,22 @@ impl RuntimeManager {
             cells.starting.insert(
                 cell.clone(),
                 CellHandle {
+                    #[cfg(target_os = "linux")]
+                    application_scope: None,
                     epoch,
                     generation: generation.id,
                     startup_us,
                     residency,
                     alarm,
                     requests: Arc::new(CellRequestAdmission {
+                        quarantined: AtomicBool::new(false),
+                        retiring: AtomicBool::new(false),
                         in_flight: AtomicUsize::new(0),
                         saturated: AtomicBool::new(false),
                         limit: self.max_cell_requests,
                     }),
+                    #[cfg(unix)]
+                    guests: Vec::new(),
                 },
             );
             Ok((placed_in, generation.id))
@@ -1403,6 +1770,8 @@ impl RuntimeManager {
         // No facet opens once the stop begins; the facet loop below stops
         // the streams this answers again, with any that opened before.
         self.facets.stopping(cell, epoch);
+        #[cfg(unix)]
+        self.retire_guest_objects(cell, epoch).await?;
         if let Some(engine) = crate::container::engine_if_ready() {
             // Only an idle eviction keeps the cell on this node, so only it
             // keeps the container: the next activation here reconnects.
@@ -1544,6 +1913,8 @@ impl RuntimeManager {
         request: RuntimeFetch,
         cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> anyhow::Result<HttpResponse> {
+        #[cfg(target_os = "linux")]
+        self.refresh_application_scope(&cell).await?;
         let RuntimeFetch {
             url,
             method,
@@ -1573,6 +1944,7 @@ impl RuntimeManager {
         let AdmittedCellRequest {
             affiliation,
             permit,
+            ..
         } = admitted;
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = CellJob::Fetch {
@@ -1686,12 +2058,23 @@ impl RuntimeManager {
         cell: String,
         scheduled_ms: i64,
     ) -> anyhow::Result<(celld_logic::wake::AlarmSnapshot, bool, Option<u64>)> {
+        #[cfg(target_os = "linux")]
+        self.refresh_application_scope(&cell).await?;
+        #[cfg(target_os = "linux")]
+        let dispatcher = match crate::application_vm::hosted() {
+            Some(host) if host.alarm_target_exists(&cell).await? => Some(host),
+            _ => None,
+        };
+        #[cfg(target_os = "linux")]
+        let guest = dispatcher.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let guest = false;
         let request_id = js::next_request_id();
         let cancel = self
             .alarm_requests
             .lock()
             .expect("alarm registry poisoned")
-            .begin(cell.clone(), op, request_id);
+            .begin(cell.clone(), op, request_id, guest);
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = CellJob::Alarm {
             request_id: Some(request_id),
@@ -1706,6 +2089,25 @@ impl RuntimeManager {
             op,
             request: request_id,
         };
+        #[cfg(target_os = "linux")]
+        if let Some(dispatcher) = dispatcher {
+            let cancelled = self
+                .alarm_requests
+                .lock()
+                .expect("alarm registry poisoned")
+                .cancellation(&cell, op);
+            let runtime = self.clone();
+            let task = tokio::spawn(async move {
+                let _guard = guard;
+                dispatcher
+                    .dispatch_alarm(&runtime, &cell, request_id, scheduled_ms, cancelled)
+                    .await
+            });
+            return task
+                .await
+                .context("application alarm drive panicked")?
+                .and_then(|result| result.context("application alarm target disappeared"));
+        }
         let isolate = self.cell_isolate(&cell)?;
         let alarm_reporter = self.alarm_reporter.clone();
         let drive = crate::asyncrt::spawn(async move {
@@ -1767,13 +2169,14 @@ impl RuntimeManager {
     }
 
     pub fn abort_alarm(&self, cell: &str, op: celld_logic::OpId) {
-        let request = self
-            .alarm_requests
-            .lock()
-            .expect("alarm registry poisoned")
-            .aborting(cell, op);
-        if let Some(request) = request {
-            js::abort_request_for_shutdown(request);
+        let mut registry = self.alarm_requests.lock().expect("alarm registry poisoned");
+        let guest = registry.guest(cell, op);
+        if let Some(request) = registry.aborting(cell, op) {
+            // Guest alarms observe the firing token. Native alarms keep the
+            // original JS shutdown flag; no unused guest JS tombstone leaks.
+            if !guest {
+                js::abort_request_for_shutdown(request);
+            }
         }
     }
 
@@ -2006,8 +2409,23 @@ impl RuntimeManager {
             .expect("cell registry poisoned")
             .published
             .get(cell)
+            .filter(|handle| !handle.requests.quarantined.load(Ordering::Acquire))
+            .filter(|handle| !handle.requests.retiring.load(Ordering::Acquire))
             .map(|handle| handle.residency.slot().affiliate())
             .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn refresh_application_scope(&self, cell: &str) -> anyhow::Result<()> {
+        let Some(host) = crate::application_vm::hosted() else { return Ok(()); };
+        let metadata = host.prepare_scope(cell).await?;
+        let mut cells = self.cells.lock().expect("cell registry poisoned");
+        if let Some(handle) = cells.published.get_mut(cell) {
+            anyhow::ensure!(handle.application_scope.is_some() == metadata.is_some(),
+                "resident application cell classification changed");
+            handle.application_scope = metadata;
+        }
+        Ok(())
     }
 
     /// Reserve one fetch against a published cell and return its isolate
@@ -2020,6 +2438,21 @@ impl RuntimeManager {
             .published
             .get(cell)
             .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))?;
+        #[cfg(target_os = "linux")]
+        if let Some(metadata) = &handle.application_scope {
+            anyhow::ensure!(
+                metadata.scope == cell,
+                "application residency scope changed"
+            );
+        }
+        anyhow::ensure!(
+            !handle.requests.quarantined.load(Ordering::Acquire),
+            "cell runtime is quarantined: {cell}"
+        );
+        anyhow::ensure!(
+            !handle.requests.retiring.load(Ordering::Acquire),
+            "cell runtime is retiring: {cell}"
+        );
         let Some(permit) = handle.requests.acquire() else {
             let in_flight = handle.requests.in_flight.load(Ordering::Acquire);
             if !handle.requests.saturated.swap(true, Ordering::AcqRel) {
@@ -2036,9 +2469,346 @@ impl RuntimeManager {
             return Ok(None);
         };
         Ok(Some(AdmittedCellRequest {
+            epoch: handle.epoch,
             affiliation: handle.residency.slot().affiliate(),
             permit,
         }))
+    }
+
+    /// The caller first routes and pins this cell through the original Actor.
+    /// Reserve against that exact residency; overload is a refusal, not a new
+    /// independently configured guest admission counter.
+    pub(crate) fn admit_storage_request(
+        &self,
+        cell: &str,
+        epoch: u64,
+    ) -> anyhow::Result<StorageAdmission> {
+        let admitted = self
+            .admit_cell_request(cell)?
+            .ok_or_else(|| anyhow!("cell request limit reached"))?;
+        anyhow::ensure!(
+            admitted.epoch == epoch,
+            "guest storage admission epoch changed"
+        );
+        Ok(StorageAdmission {
+            cell: cell.into(),
+            admitted,
+        })
+    }
+
+    /// A previously Actor-admitted guest effect uses the published runtime's
+    /// original turn scheduler, storage lock and alarm reporter. Publication
+    /// is checked again inside the turn: a queued operation cannot land on a
+    /// replacement generation, even when ownership retains the same epoch.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn storage_turn<T>(
+        &self,
+        cell: &str,
+        epoch: u64,
+        f: impl FnOnce(&crate::storage::Cells) -> T,
+    ) -> anyhow::Result<T> {
+        let admitted = self.admit_storage_request(cell, epoch)?;
+        self.admitted_storage_turn(&admitted, f).await
+    }
+
+    /// One synchronous storage operation, retaining the caller's admission
+    /// between turns while leaving the original scheduler free for other work.
+    pub(crate) async fn admitted_storage_turn<T>(
+        &self,
+        admission: &StorageAdmission,
+        f: impl FnOnce(&crate::storage::Cells) -> T,
+    ) -> anyhow::Result<T> {
+        let cell = admission.cell.as_str();
+        let epoch = admission.admitted.epoch;
+        let incarnation = &admission.admitted.permit.0;
+        admission
+            .admitted
+            .affiliation
+            .slot()
+            .turn_cell(cell, |worker| {
+                let current = self
+                    .cells
+                    .lock()
+                    .expect("cell registry poisoned")
+                    .published
+                    .get(cell)
+                    .is_some_and(|handle| {
+                        handle.epoch == epoch
+                            && Arc::ptr_eq(&handle.requests, incarnation)
+                            && !handle.requests.quarantined.load(Ordering::Acquire)
+                    });
+                anyhow::ensure!(current, "guest storage publication changed while queued");
+                let (result, moves) = worker.storage_turn(cell, epoch, f)?;
+                // Report before this pool turn releases. A later turn or
+                // replacement cannot install an alarm and then receive this
+                // older observation, including without replicated wake IDs.
+                report_alarm_moves(&Some(self.alarm_reporter.clone()), moves);
+                Ok(result)
+            })
+            .await
+    }
+
+    /// Set inside the failing native turn, before another queued effect can
+    /// enter. The captured admission makes this affect only its incarnation,
+    /// including if a replacement retains the same ownership epoch.
+    pub(crate) fn quarantine_storage_request(&self, admission: &StorageAdmission) {
+        admission
+            .admitted
+            .permit
+            .0
+            .quarantined
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn register_guest_object(
+        &self,
+        admission: &StorageAdmission,
+        guest: crate::application_guest_transport::GuestObject,
+    ) -> anyhow::Result<()> {
+        let mut cells = self.cells.lock().expect("cell registry poisoned");
+        let handle = cells
+            .published
+            .get_mut(&admission.cell)
+            .context("guest native residency disappeared")?;
+        anyhow::ensure!(
+            handle.epoch == admission.admitted.epoch
+                && Arc::ptr_eq(&handle.requests, &admission.admitted.permit.0)
+                && !handle.requests.retiring.load(Ordering::Acquire),
+            "guest native residency is retiring"
+        );
+        handle.guests.retain(|old| !old.same_owner(&guest));
+        handle.guests.push(guest);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn retire_guest_objects(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+        let guests = {
+            let cells = self.cells.lock().expect("cell registry poisoned");
+            let Some(handle) = cells
+                .published
+                .get(cell)
+                .filter(|handle| handle.epoch == epoch)
+            else {
+                return Ok(());
+            };
+            if handle.guests.is_empty() {
+                return Ok(());
+            }
+            // Preserve the connection/publication for accepted cleanup turns,
+            // but prevent any new event or guest registration during stop.
+            handle.requests.retiring.store(true, Ordering::Release);
+            handle.guests.clone()
+        };
+        for guest in guests {
+            guest.retire(self.clone(), cell.into(), epoch).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn admit_storage_retirement(
+        &self,
+        cell: &str,
+        epoch: u64,
+    ) -> anyhow::Result<StorageAdmission> {
+        let cells = self.cells.lock().expect("cell registry poisoned");
+        let handle = cells
+            .published
+            .get(cell)
+            .context("retiring native cell disappeared")?;
+        anyhow::ensure!(
+            handle.epoch == epoch
+                && handle.requests.retiring.load(Ordering::Acquire)
+                && !handle.requests.quarantined.load(Ordering::Acquire),
+            "retiring native cell changed"
+        );
+        let permit = handle
+            .requests
+            .acquire()
+            .context("retiring native cell is saturated")?;
+        Ok(StorageAdmission {
+            cell: cell.into(),
+            admitted: AdmittedCellRequest {
+                epoch,
+                affiliation: handle.residency.slot().affiliate(),
+                permit,
+            },
+        })
+    }
+
+    /// Initial guest delivery follows the same in-turn gate check as
+    /// `drive_cell`; routing/admission alone cannot authorize delivery.
+    /// `actor_name` is the trusted route's name for a named object: like the
+    /// original idFromName() activation, persist it under the open gate as
+    /// part of this event, before guest code can read it.
+    pub(crate) async fn begin_guest_storage_event(
+        &self,
+        admission: &StorageAdmission,
+        actor_name: Option<&str>,
+        alarm: Option<(i64, tokio_util::sync::CancellationToken)>,
+    ) -> anyhow::Result<(
+        crate::application_storage::StorageSession,
+        crate::application_storage::StorageEvent,
+    )> {
+        loop {
+            let mut waiting = None;
+            let begun = self
+                .admitted_storage_turn(admission, |cells| {
+                    if let Some(open) = js::cell_gate_wait(&admission.cell) {
+                        waiting = Some(open);
+                        return Ok(None);
+                    }
+                    let mut session = crate::application_storage::StorageSession::new(
+                        cells,
+                        admission.cell.clone(),
+                        admission.admitted.epoch,
+                    )?;
+                    let event = session.begin_event(cells)?;
+                    if let Some((scheduled_ms, cancelled)) = &alarm {
+                        anyhow::ensure!(
+                            !cancelled.is_cancelled(),
+                            "alarm cancelled before native claim"
+                        );
+                        session.claim_alarm(cells, *scheduled_ms)?;
+                    }
+                    if let Some(name) = actor_name {
+                        if crate::storage::get_actor_name(&admission.cell)?.is_none() {
+                            crate::storage::set_actor_name(&admission.cell, name)?;
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(Some((session, event)))
+                })
+                .await??;
+            if let Some(begun) = begun {
+                return Ok(begun);
+            }
+            let waiting = waiting.expect("closed input gate has a waiter");
+            let opened = if let Some((_, cancelled)) = &alarm {
+                crate::asyncrt::select! {
+                    _ = cancelled.cancelled() => anyhow::bail!("alarm cancelled before input admission"),
+                    opened = waiting => opened,
+                }
+            } else {
+                waiting.await
+            };
+            opened
+                .context("cell stopped before guest delivery")?
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
+
+    /// Host lifecycle cleanup, restricted to classified read statements. It
+    /// holds the original slot affiliation but no guest event admission. The
+    /// cursor table checks the exact native connection again inside the turn.
+    pub(crate) async fn close_guest_read_cursors(
+        &self,
+        resident: &crate::application_storage::CursorResidency,
+    ) {
+        let affiliation = self
+            .cells
+            .lock()
+            .expect("cell registry poisoned")
+            .published
+            .get(resident.scope())
+            .map(|handle| (handle.epoch, handle.residency.slot().affiliate()));
+        let Some((epoch, affiliation)) = affiliation else {
+            return;
+        };
+        let result = affiliation
+            .slot()
+            .turn_cell(resident.scope(), |worker| {
+                let (_, moves) =
+                    worker.storage_turn(resident.scope(), epoch, |cells| resident.close(cells))?;
+                report_alarm_moves(&Some(self.alarm_reporter.clone()), moves);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+        if let Err(error) = result {
+            tracing::debug!(%error, cell = resident.scope(), "guest read cursor owner closed with native residency");
+        }
+    }
+
+    pub(crate) async fn guest_storage_operation(
+        &self,
+        admission: &StorageAdmission,
+        session: &mut crate::application_storage::StorageSession,
+        mut request: celld_applications::storage_wire::Request,
+        accepting: impl Fn() -> bool,
+        cleanup: bool,
+    ) -> anyhow::Result<celld_applications::storage_wire::Reply> {
+        use crate::application_storage::StorageAttempt;
+        use crate::application_storage::StorageSession;
+        if let Err(error) = session.open_facet_stream(&request).await {
+            return Ok(StorageSession::error_reply(&error));
+        }
+        let followup = StorageSession::facet_followup(&request);
+        loop {
+            match self
+                .admitted_storage_turn(admission, |cells| {
+                    if cleanup {
+                        session.try_cleanup_turn(cells, accepting(), request)
+                    } else {
+                        session.try_execute(cells, accepting(), request)
+                    }
+                })
+                .await?
+            {
+                StorageAttempt::Reply(reply) => {
+                    return Ok(session
+                        .finish_facet_request(followup.as_ref(), reply)
+                        .await);
+                }
+                StorageAttempt::Wait {
+                    gate,
+                    request: pending,
+                } => {
+                    request = pending;
+                    gate.await
+                        .context("cell stopped before guest storage")?
+                        .map_err(anyhow::Error::msg)?;
+                }
+            }
+        }
+    }
+
+    /// A cancelled event's native cleanup and output sample cannot enter a
+    /// different event's transaction. An event's own hold allows its rollback.
+    pub(crate) async fn finish_guest_storage_event(
+        &self,
+        admission: &StorageAdmission,
+        session: &mut crate::application_storage::StorageSession,
+        event: &crate::application_storage::StorageEvent,
+        alarm_outcome: Option<(bool, bool)>,
+    ) -> anyhow::Result<(
+        crate::application_storage::PreparedOutput,
+        Option<anyhow::Error>,
+    )> {
+        loop {
+            let mut waiting = None;
+            let finished = self
+                .admitted_storage_turn(admission, |cells| {
+                    if let Some(open) = session.wait_input(cells)? {
+                        waiting = Some(open);
+                        return Ok(None);
+                    }
+                    let finished = session.finish_event_with_alarm(cells, event, alarm_outcome);
+                    if finished.is_err() {
+                        self.quarantine_storage_request(admission);
+                    }
+                    finished.map(Some)
+                })
+                .await??;
+            if let Some(finished) = finished {
+                return Ok(finished);
+            }
+            waiting
+                .expect("closed input gate has a waiter")
+                .await
+                .context("cell stopped before guest settlement")?
+                .map_err(anyhow::Error::msg)?;
+        }
     }
 
     /// Start one cell event and wait for its answer.
@@ -2053,6 +2823,8 @@ impl RuntimeManager {
         receive: tokio::sync::oneshot::Receiver<anyhow::Result<T>>,
         dropped: &'static str,
     ) -> anyhow::Result<T> {
+        #[cfg(target_os = "linux")]
+        self.refresh_application_scope(cell).await?;
         let isolate = self.cell_isolate(cell)?;
         run_cell_event(
             isolate,
@@ -2076,6 +2848,55 @@ async fn run_cell_event<T>(
 ) -> anyhow::Result<T> {
     tokio::spawn(drive_cell(isolate, job, report, None));
     receive.await.context(dropped)?
+}
+
+/// Hold a real pool turn, queue a storage operation, and unpublish it via
+/// the real stop path before releasing that turn. No sleeps or mock registry.
+#[cfg(all(test, unix))]
+pub(crate) async fn check_queued_storage_retirement(
+    runtime: &RuntimeManager,
+    cell: &str,
+    epoch: u64,
+) {
+    use std::future::Future;
+    let held = runtime.cell_isolate(cell).unwrap();
+    let mut queued = std::pin::pin!(runtime.storage_turn(cell, epoch, |_| {
+        panic!("queued storage entered an unpublished runtime")
+    }));
+    let mut stopping = std::pin::pin!(runtime.stop_cell(cell, epoch, StopMode::CloseInPlace));
+    held.slot()
+        .turn_cell(cell, |_| {
+            let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            assert!(queued.as_mut().poll(&mut context).is_pending());
+            assert!(stopping.as_mut().poll(&mut context).is_pending());
+        })
+        .await;
+    assert!(queued
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("publication changed while queued"));
+    stopping.await.unwrap();
+}
+
+/// Poll an actual guest operation behind the original native turn, then change
+/// its host acceptance verdict before it can enter. Keep the private residency
+/// accessor here; tests cannot reconstruct a slot or storage admission.
+#[cfg(all(test, unix))]
+pub(crate) async fn check_queued_guest_acceptance<F: std::future::Future>(
+    runtime: &RuntimeManager,
+    cell: &str,
+    mut queued: std::pin::Pin<&mut F>,
+    retire: impl FnOnce(),
+) {
+    let held = runtime.cell_isolate(cell).unwrap();
+    held.slot()
+        .turn_cell(cell, |_| {
+            let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            assert!(queued.as_mut().poll(&mut context).is_pending());
+            retire();
+        })
+        .await;
 }
 
 fn restored_alarm_from_persisted(
@@ -3316,6 +4137,17 @@ async fn drive_cell_inner(
     // a parked event (denoland/celld#147).
     let slot = affiliation.slot().clone();
     let scope = job.scope().to_string();
+    #[cfg(target_os = "linux")]
+    let application_scope = match crate::application_vm::hosted() {
+        Some(host) => match host.prepare_scope(&scope).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                job.fail(error);
+                return Ok(None);
+            }
+        },
+        None => None,
+    };
     let _queue_producer = if job.is_queue_producer() {
         match slot.queue_producer(&scope) {
             Some(permit) => Some(permit),
@@ -3394,6 +4226,10 @@ async fn drive_cell_inner(
                     pending = Some(job);
                     return None;
                 }
+                #[cfg(target_os = "linux")]
+                let (begun, started) =
+                    worker.turn_begin_application_cell(job, trace, application_scope.clone());
+                #[cfg(not(target_os = "linux"))]
                 let (begun, started) = worker.turn_begin_cell(job, trace);
                 Some((begun, started, worker.take_alarm_moves()))
             })

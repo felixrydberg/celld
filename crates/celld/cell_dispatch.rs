@@ -6,7 +6,7 @@ use crate::engine_api::{
     HttpResponse, HttpResponseWebSocket, RequestBody, RequestId, RuntimeFetch,
 };
 use crate::http_streams::RequestBodyGuard;
-use crate::js::{CallOrder, DoCallReq};
+use crate::js::{CallOrder, DoCallReq, GuestCall};
 use crate::telemetry::TraceContext;
 use anyhow::Context as _;
 use celld_logic::{Epoch, NodeId, RequestError, Route, WebSocketKind};
@@ -108,6 +108,8 @@ pub struct CallContext {
     /// Reclaims a streamed body abandoned by an early error. A local target or
     /// the peer HTTP body takes ownership before this guard is disarmed.
     pub body_guard: RequestBodyGuard,
+    /// Set when an application guest, not a Worker isolate, makes the call.
+    pub guest: Option<GuestCall>,
 }
 
 /// Split a proxied call into its cross-attempt context, its consumable
@@ -136,6 +138,7 @@ pub fn split_do_call(
         reply,
         order,
         parent,
+        guest,
     } = call;
     (
         CallContext {
@@ -146,6 +149,7 @@ pub fn split_do_call(
             cancel,
             order,
             body_guard,
+            guest,
         },
         CallPayload {
             name,
@@ -266,6 +270,30 @@ pub async fn dispatch_call_attempt(
                 body,
                 headers,
             } = payload;
+            if let Some(guest) = call.guest.take() {
+                // The scoped guest event admits and gates itself. This lookup
+                // only found the object local again.
+                drop(app.activity(request, call.scope.clone()));
+                let body = match body {
+                    RequestBody::Bytes(body) => body.to_vec(),
+                    RequestBody::Stream(_) => {
+                        return CallAttempt::Local(Err(anyhow::anyhow!(
+                            "streamed request bodies are unsupported for guest objects"
+                        )))
+                    }
+                };
+                let wire = celld_applications::invocation_wire::HttpRequest {
+                    method,
+                    url,
+                    headers,
+                    body,
+                };
+                return CallAttempt::Local(
+                    serve_guest_object(app, &call.scope, name, guest, wire)
+                        .await
+                        .and_then(|reply| reply.context("object ownership moved during the call")),
+                );
+            }
             dispatch_local_fetch(
                 app,
                 request,
@@ -298,6 +326,31 @@ pub async fn dispatch_call_attempt(
             payload,
         },
     }
+}
+
+/// Run a guest's object call in this node's VM for its application, never in
+/// the Worker runtime. `None` when this node no longer owns the object.
+pub async fn serve_guest_object(
+    app: &AppHandle,
+    scope: &str,
+    name: Option<String>,
+    guest: GuestCall,
+    request: celld_applications::invocation_wire::HttpRequest,
+) -> anyhow::Result<Option<HttpResponse>> {
+    #[cfg(target_os = "linux")]
+    if let Some(applications) = crate::application_vm::hosted() {
+        let (class, id) = scope.split_once(':').context("object scope has no id")?;
+        let object = celld_applications::invocation_wire::ObjectTarget {
+            class: class.into(),
+            id: id.into(),
+            name,
+        };
+        return applications
+            .call_object(app, &guest.application, object, guest.rpc, request)
+            .await;
+    }
+    let _ = (app, scope, name, guest, request);
+    anyhow::bail!("this node hosts no application VMs")
 }
 
 /// workerd's `TypeError` text for a WebSocket response to a request that did

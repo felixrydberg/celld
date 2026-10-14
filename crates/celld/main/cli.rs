@@ -19,6 +19,9 @@ pub(crate) struct Settings {
     /// Whether forwarded scheme and host headers can set `request.url`.
     /// This option is off unless a trusted proxy replaces both headers.
     pub(crate) trust_forwarded_headers: bool,
+    /// Trusted VM host configuration for executable application handlers.
+    pub(crate) application_vms: Option<std::path::PathBuf>,
+    pub(crate) application_domain: Option<String>,
     /// Set only by the `celld dev` supervisor for its child node. No fleet
     /// flag or public environment variable selects the local backend.
     pub(crate) dev_store: Option<std::path::PathBuf>,
@@ -36,6 +39,8 @@ pub(crate) enum Action {
         json: bool,
     },
     Deploy(Vec<String>),
+    ApplicationApi(Vec<String>),
+    Application(Vec<String>),
     Dev(Vec<String>),
     Cell(Vec<String>),
     D1(Vec<String>),
@@ -73,6 +78,8 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         let arguments = arguments[1..].to_vec();
         match action {
             "deploy" => return Ok(Action::Deploy(arguments)),
+            "application-api" => return Ok(Action::ApplicationApi(arguments)),
+            "application" => return Ok(Action::Application(arguments)),
             "dev" => return Ok(Action::Dev(arguments)),
             "cell" => return Ok(Action::Cell(arguments)),
             "d1" => return Ok(Action::D1(arguments)),
@@ -150,6 +157,8 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         advertise: configured_advertise,
         unsafe_public_advertise: celld::env_vars::flag("CELLD_UNSAFE_PUBLIC_ADVERTISE", false)?,
         trust_forwarded_headers: celld::env_vars::flag("CELLD_TRUST_FORWARDED_HEADERS", false)?,
+        application_vms: None,
+        application_domain: None,
         dev_store: if diagnose {
             None
         } else {
@@ -200,6 +209,24 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             }
             "--unsafe-public-advertise" => settings.unsafe_public_advertise = true,
             "--trust-forwarded-headers" => settings.trust_forwarded_headers = true,
+            "--application-domain" => {
+                anyhow::ensure!(cfg!(target_os = "linux"), "--application-domain requires Linux");
+                let domain = args.next().ok_or_else(|| anyhow::anyhow!("--application-domain requires a value"))?;
+                #[cfg(target_os = "linux")]
+                celld::application_vm::validate_platform_domain(&domain)?;
+                settings.application_domain = Some(domain);
+            }
+            "--application-vms" => {
+                anyhow::ensure!(
+                    cfg!(target_os = "linux"),
+                    "--application-vms requires Linux"
+                );
+                settings.application_vms = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--application-vms requires a value"))?
+                        .into(),
+                );
+            }
             "--peer" if diagnose => {
                 let peer = args
                     .next()
@@ -215,6 +242,8 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             }
         }
     }
+    anyhow::ensure!(settings.application_domain.is_none() || settings.application_vms.is_none(),
+        "--application-domain is for nodes without --application-vms; VM hosts use their configured platform_domain");
     if !listen_configured {
         settings.listen = if settings.control_plane {
             celld::startup::Listen::AutoLoopback
@@ -268,6 +297,8 @@ pub(crate) fn print_help() -> anyhow::Result<()> {
 USAGE:
   celld --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld application-api --auth-file FILE --platform-domain DOMAIN --bucket NAME [--listen IP:PORT]
+  celld application --help
   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
@@ -315,6 +346,11 @@ OPTIONS:
                          Let X-Forwarded-Host and X-Forwarded-Proto set the
                          scheme and host in request.url. Set this option only
                          when a trusted proxy replaces both headers
+  --application-domain DOMAIN
+      Serve application assets without VM configuration, Firecracker or KVM.
+  --application-vms FILE
+                         Run application handlers in VMs from this trusted
+                         JSON configuration; without it the node runs none
   -h, --help             Show this help
   -V, --version          Show the celld version
 

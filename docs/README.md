@@ -114,6 +114,8 @@ the waker role, and it wakes only the cells whose owner node has stopped.
 - [Environment variables](#environment-variables)
 - [Services](#services)
 - [Cloudflare compatibility](cloudflare-compat.md)
+- [Application management](application-management.md)
+- [Application setup](application-setup.md)
 - [What celld guarantees](guarantees.md)
 - [Limitations](limitations.md)
 - [Security](security.md)
@@ -314,7 +316,7 @@ subcommand; they need a supported cloud bucket.
 
 ## Operate D1, KV, and R2
 
-These commands use the fleet bucket. `celld d1` and `celld kv` reach the
+These commands use the fleet's storage configuration. `celld d1` and `celld kv` reach the
 database cell through a node.
 
 ```sh
@@ -328,8 +330,9 @@ format. `celld kv bulk get` streams; a named output file changes only
 after the export completes, and a failed stdout export leaves an
 incomplete JSON array.
 
-`celld r2` reads and writes the objects of an `r2_buckets` binding under
-the reserved `r2/<bucket_name>/` prefix. It needs no running node, so a
+`celld r2` opens the actual bucket named by an `r2_buckets` binding with the
+fleet's backend and credentials. Existing key escaping is retained, and the fleet
+bucket's own name is refused. It needs no running node, so a
 release pipeline can publish an artifact before it deploys.
 
 ```sh
@@ -341,7 +344,7 @@ celld r2 put assets app.zip --path dist/app.zip \
 
 The first argument is the `bucket_name`, not the binding name. `--metadata`
 becomes `customMetadata`, and the content flags become `httpMetadata`. An
-object that another tool writes into the prefix is also readable, without
+object that another tool writes into the named bucket is also readable, without
 `cacheExpiry` or checksums. `celld r2 get` streams the body to stdout, and
 `celld r2 head` prints the stored record; with `--json`, the
 `http` and `custom` fields hold `httpMetadata` and `customMetadata`.
