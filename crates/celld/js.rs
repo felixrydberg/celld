@@ -27,6 +27,7 @@ use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 pub(crate) mod guest_activity;
 #[cfg(unix)]
 pub(crate) mod guest_storage;
+mod guest_ops;
 pub(crate) mod input_gate_lifecycle;
 use input_gate_lifecycle::{CrossEntryGateClaim, CrossEntryGateClaims};
 
