@@ -2499,6 +2499,12 @@ struct ActorRuntimeState {
     ws_capture_touched: Mutex<Vec<Weak<IoContext>>>,
     #[cfg(unix)]
     guest_storage_enabled: AtomicBool,
+    /// `EgressPolicy::Deny` has two meanings. Set only on a root guest, built
+    /// with no network device: its fetch goes to the trusted host broker. On any
+    /// other isolate, including a loaded child later promoted by
+    /// `own_guest_facet`, Deny is the capability denial of `globalOutbound: null`.
+    #[cfg(unix)]
+    host_brokers_egress: bool,
     egress: EgressPolicy,
     resource_limits: Option<ResourceLimits>,
     tail_reporting: bool,
@@ -6165,6 +6171,8 @@ impl Worker {
             // to native storage or direct egress while no event is attached.
             #[cfg(unix)]
             guest_storage_enabled: AtomicBool::new(guest),
+            #[cfg(unix)]
+            host_brokers_egress: guest,
             egress: if guest {
                 EgressPolicy::Deny
             } else {
@@ -9694,7 +9702,11 @@ fn op_fetch(
     let guest = false;
     // A loaded worker with globalOutbound: null has no ambient egress: it must
     // reach the world through `env` capabilities. Message matches workerd.
-    if egress == EgressPolicy::Deny && !guest {
+    #[cfg(unix)]
+    let brokered = actor_runtime_state(scope).host_brokers_egress;
+    #[cfg(not(unix))]
+    let brokered = false;
+    if egress == EgressPolicy::Deny && !brokered {
         return loader_throw(
             scope,
             "This worker is not permitted to access the internet via global \

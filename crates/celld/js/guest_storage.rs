@@ -1245,6 +1245,19 @@ pub(super) fn resource_http_request(
     broker(scope, request, "manual".into(), None, None, Some(call))
 }
 
+/// Whether this isolate is in guest mode. Modes: native (default); host-pool
+/// `application_storage` (trusted application pool, native storage with
+/// host-verified cell names, never a guest); guest (`celld-guest`, storage,
+/// egress and R2 brokered through the host). Predicates, do not add another:
+/// - this isolate flag (`guest_storage_enabled`): set at construction for a root
+///   guest, and later only by `own_guest_facet` / `attach_guest_storage`.
+/// - per-event `IoContext.guest_storage`, read via `has_guest_storage()`: set
+///   once by `attach_guest_storage` when the host grants an event its channel.
+/// - process-wide `guest_activity::enabled()`: set once by `celld-guest` at start.
+///
+/// `ActorRuntimeState::host_brokers_egress` is not a mode predicate: it is the
+/// root-guest meaning of `EgressPolicy::Deny` (no network device, fetch goes to
+/// the host broker). A promoted child's Deny stays the capability denial.
 pub(super) fn enabled(scope: &mut v8::PinScope) -> bool {
     scope
         .get_slot::<Arc<ActorRuntimeState>>()

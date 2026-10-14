@@ -194,7 +194,7 @@ pub(super) const CLASS: &[(&str, Class, &str)] = &[
     ("__sc_encode", Pure, "V8 structured clone to bytes"),
     ("__sc_decode", Pure, "V8 structured clone from bytes"),
     ("__structured_clone", Pure, "in-isolate structured clone"),
-    ("__op_fetch", Brokered, "guest_storage::fetch; EgressPolicy::Deny is skipped in a guest"),
+    ("__op_fetch", Brokered, "guest_storage::fetch; Deny is skipped only on a root guest (host_brokers_egress), a promoted child stays denied"),
     ("__r2_head", Brokered, "install-time override (override_ops): guest_return to the host R2 broker"),
     ("__r2_get", Brokered, "guest_return to the host R2 broker"),
     ("__r2_put", Brokered, "guest_return to the host R2 broker"),
