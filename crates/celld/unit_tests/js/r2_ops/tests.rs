@@ -651,3 +651,68 @@ pub(crate) async fn check_guest_head_override() {
         "guest R2 head override: installed in a guest isolate only, attributed to its own continuation under a foreign checkpoint, never reads the store; native head/get unchanged and equal to the broker's head"
     );
 }
+
+/// Prohibited ops with no refusal of their own are denied when a guest isolate
+/// is installed, with the dispatch channel already set so nothing can fall
+/// through to a native path; a native isolate is untouched.
+#[cfg(unix)]
+pub(crate) async fn check_guest_denied_ops() {
+    use crate::js::guest_ops::DENIED;
+    use crate::js::guest_storage::tests::evaluate_in;
+    Engine::init();
+    // Keep the receiver alive so a native queue dispatch would succeed.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    set_queue_dispatch_tx(tx);
+    std::mem::forget(rx);
+    let load = |guest: bool| {
+        let config = Arc::new(WorkerConfig::new(WorkerConfigOptions {
+            src: "export default { fetch() { return new Response('x'); } };".into(),
+            script_name: "denied-ops".into(),
+            do_classes: vec![],
+            bindings: vec![],
+            r2_bindings: vec![],
+            d1_bindings: vec![],
+            kv_bindings: vec![],
+            queue_bindings: vec![],
+            queue_consumers: vec![],
+            workflow_bindings: vec![],
+            vars: vec![],
+            node: "check".into(),
+            modules: vec![],
+            compat: Default::default(),
+        }));
+        if guest {
+            Worker::load_guest_config(config)
+        } else {
+            Worker::load_config(config)
+        }
+        .unwrap()
+    };
+    for guest in [true, false] {
+        let worker = load(guest);
+        let (a, b) = (
+            IoContext::tracked(&worker.runtime_state),
+            IoContext::tracked(&worker.runtime_state),
+        );
+        for op in DENIED {
+            let source = format!("__celld.{op}('{{}}', 'x', 'y'); return true;");
+            let result = evaluate_in(&worker, &a, &b, &source);
+            let spawned = asyncrt::drain_spawns();
+            let denied = format!("{op} is not available in an application guest");
+            if guest {
+                let error = result.expect_err(op);
+                assert!(error.contains(&denied), "{op}: {error}");
+                assert!(spawned.is_empty(), "{op} reached its native body");
+            } else if let Err(error) = result {
+                assert!(!error.contains(&denied), "native {op} denied");
+            }
+        }
+        if guest {
+            let source = "return [__celld.__cron_schedule(), __celld.__queue_consumer()].join() === ',';";
+            assert_eq!(evaluate_in(&worker, &a, &b, source).as_deref(), Ok("true"));
+        }
+    }
+    eprintln!(
+        "guest denied ops: every Prohibited op without its own refusal throws in a guest isolate, none in a native one"
+    );
+}

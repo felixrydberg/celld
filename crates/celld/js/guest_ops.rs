@@ -5,17 +5,72 @@
 //! A review ledger and CI tripwire, not enforcement: the security boundary is
 //! the host (`resource_target`, `broker_owner`, `output().prove`). Every op in
 //! `OP_NAMES` has one row, in table order, so a new upstream op fails the test
-//! below until someone classifies it. `Prohibited` rows are what step 3 turns
-//! into explicit install-time deny stubs.
+//! below until someone classifies it. A `Prohibited` row either refuses inside
+//! its own body ("explicit deny") or gets an install-time deny stub from
+//! `override_ops`; a test pins the stubbed set to the table.
 //!
 //! `Brokered` and `Inline` both reach the host. `Brokered` is a whole-op swap
 //! (the native body is not shared, so an install-time override fits);
 //! `Inline` is a guest branch interleaved with shared or lifecycle code.
-//! "Explicit deny" in a reason means the op already refuses in a guest today.
+//! "Explicit deny" in a reason means the op already refuses in a guest today;
+//! those keep their inline check, since a loaded child flipped to guest after
+//! install gets no override.
 // Only the tests read `CLASS`.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use super::*;
+
+macro_rules! install {
+    ($scope:ident, $functions:ident, $name:literal => $op:path) => {{
+        fn attributed<'s>(
+            scope: &mut v8::PinScope<'s, '_>,
+            args: v8::FunctionCallbackArguments<'s>,
+            rv: v8::ReturnValue<'s, v8::Value>,
+        ) {
+            attributed_op(scope, args, rv, $name, $op)
+        }
+        let at = OP_NAMES.iter().position(|name| *name == $name);
+        $functions[at.expect("overridden op is in OP_NAMES")] =
+            v8::Function::new($scope, attributed).unwrap();
+    }};
+}
+
+/// `Prohibited` ops with no refusal of their own: a guest isolate gets a stub
+/// that throws, instead of relying on an unset native channel, `hosted()`
+/// being `None` or `EgressPolicy::Deny`. v8 callbacks must be fn items, so the
+/// list cannot be built from `CLASS`; a test pins it to the table.
+macro_rules! deny {
+    ($($name:literal),+ $(,)?) => {
+        pub(super) const DENIED: &[&str] = &[$($name),+];
+        fn deny_ops<'s>(
+            scope: &mut v8::PinScope<'s, '_>,
+            functions: &mut [v8::Local<'s, v8::Function>],
+        ) {
+            $({
+                fn refuse<'s>(
+                    scope: &mut v8::PinScope<'s, '_>,
+                    _args: v8::FunctionCallbackArguments<'s>,
+                    _rv: v8::ReturnValue<'s, v8::Value>,
+                ) {
+                    loader_throw(scope, concat!($name, " is not available in an application guest"))
+                }
+                install!(scope, functions, $name => refuse);
+            })+
+        }
+    };
+}
+
+deny!(
+    "__tcp_connect",
+    "__tcp_read",
+    "__tcp_write",
+    "__tcp_shutdown",
+    "__tcp_close",
+    "__tcp_starttls",
+    "__cron_dispatch",
+    "__kv_blob",
+    "__queue_dispatch",
+);
 
 /// Replace whole-op swaps with their guest versions, by `OP_NAMES` position:
 /// names, parameter lists and the bootstrap code cache are untouched, only
@@ -32,21 +87,19 @@ pub(super) fn override_ops<'s>(
     if !(guest_storage::enabled(scope) || guest_activity::enabled()) {
         return;
     }
-    macro_rules! install {
-        ($name:literal => $op:path) => {{
-            fn attributed<'s>(
-                scope: &mut v8::PinScope<'s, '_>,
-                args: v8::FunctionCallbackArguments<'s>,
-                rv: v8::ReturnValue<'s, v8::Value>,
-            ) {
-                attributed_op(scope, args, rv, $name, $op)
-            }
-            let at = OP_NAMES.iter().position(|name| *name == $name);
-            functions[at.expect("overridden op is in OP_NAMES")] =
-                v8::Function::new(scope, attributed).unwrap();
-        }};
-    }
-    install!("__r2_head" => r2_ops::guest_head);
+    install!(scope, functions, "__r2_head" => r2_ops::guest_head);
+    deny_ops(scope, functions);
+    // The harness asks these on every cron and queue cell and reads
+    // `undefined` as "no hosted entry", the answer a guest always gave.
+    install!(scope, functions, "__cron_schedule" => no_host_catalog);
+    install!(scope, functions, "__queue_consumer" => no_host_catalog);
+}
+
+fn no_host_catalog(
+    _scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,12 +146,12 @@ pub(super) const CLASS: &[(&str, Class, &str)] = &[
     ("__hr_event", LocalState, "HTMLRewriter handle in a process-local registry"),
     ("__hr_take", LocalState, "HTMLRewriter handle in a process-local registry"),
     ("__hr_free", LocalState, "HTMLRewriter handle in a process-local registry"),
-    ("__tcp_connect", Prohibited, "raw network; blocked only by EgressPolicy::Deny, which a guest root sets (Allow would dial natively)"),
-    ("__tcp_read", Prohibited, "raw socket I/O; no guest-held socket exists unless connect worked"),
-    ("__tcp_write", Prohibited, "raw socket I/O; no guest-held socket exists unless connect worked"),
-    ("__tcp_shutdown", Prohibited, "raw socket I/O; no guest-held socket exists unless connect worked"),
-    ("__tcp_close", Prohibited, "raw socket registry; harmless but part of the tcp surface"),
-    ("__tcp_starttls", Prohibited, "raw socket TLS upgrade; no guest-held socket exists"),
+    ("__tcp_connect", Prohibited, "raw network; install-time deny (override_ops), not only EgressPolicy::Deny"),
+    ("__tcp_read", Prohibited, "raw socket I/O; install-time deny (override_ops)"),
+    ("__tcp_write", Prohibited, "raw socket I/O; install-time deny (override_ops)"),
+    ("__tcp_shutdown", Prohibited, "raw socket I/O; install-time deny (override_ops)"),
+    ("__tcp_close", Prohibited, "raw socket registry; install-time deny (override_ops)"),
+    ("__tcp_starttls", Prohibited, "raw socket TLS upgrade; install-time deny (override_ops)"),
     ("__container_running", Brokered, "guest_state via the storage channel"),
     ("__container_address", Prohibited, "explicit deny (unconnected): native address never reaches a guest"),
     ("__container_start", Brokered, "run opens via storage op, start brokered as a resource call"),
@@ -141,9 +194,9 @@ pub(super) const CLASS: &[(&str, Class, &str)] = &[
     ("__storage_cancel_pending_puts", Inline, "channel cancel in a guest"),
     ("__actor_abort", Inline, "latches AbortObject on the host channel first"),
     ("__cron_plan", Pure, "celld_logic::cron schedule arithmetic"),
-    ("__cron_schedule", Prohibited, "host catalog lookup; yields nothing only because application_vm::hosted() is None in celld-guest"),
-    ("__cron_dispatch", Prohibited, "runs a cron event in another VM through hosted(); None in celld-guest"),
-    ("__kv_blob", Prohibited, "fleet-bucket I/O with node credentials and native activation_epoch; no guest check, closed only by absent KV_BLOB_STORE and cell storage"),
+    ("__cron_schedule", Prohibited, "explicit none (override_ops): host catalog lookup, a guest stub answers undefined"),
+    ("__cron_dispatch", Prohibited, "runs a cron event in another VM through hosted(); install-time deny (override_ops)"),
+    ("__kv_blob", Prohibited, "fleet-bucket I/O with node credentials and native activation_epoch; install-time deny (override_ops)"),
     ("__process_exit", LocalState, "terminates only the calling isolate's execution"),
     ("__storage_delete", Inline, "storage channel Delete in a guest"),
     ("__storage_delete_many", Inline, "delete_keys: storage channel in a guest"),
@@ -177,9 +230,9 @@ pub(super) const CLASS: &[(&str, Class, &str)] = &[
     ("__svc_call", Brokered, "guest_storage::service_call; native path needs SVC_CALL_TX"),
     ("__svc_call_cancellable", Brokered, "guest_storage::service_call; native path needs SVC_CALL_TX"),
     ("__svc_rpc", Brokered, "guest_storage::service_call; native path needs SVC_RPC_TX"),
-    ("__queue_dispatch", Prohibited, "QUEUE_DISPATCH_TX only; no guest check, closed by the unset channel"),
+    ("__queue_dispatch", Prohibited, "QUEUE_DISPATCH_TX only; install-time deny (override_ops), not only the unset channel"),
     ("__queue_policy", Pure, "celld_logic::queue arithmetic on the request JSON"),
-    ("__queue_consumer", Prohibited, "host catalog lookup; yields nothing only because hosted() is None in celld-guest"),
+    ("__queue_consumer", Prohibited, "explicit none (override_ops): host catalog lookup, a guest stub answers undefined"),
     ("__do_call_cancellable", Brokered, "guest_storage::object_call; native path needs DO_CALL_TX"),
     ("__do_call_cancel", LocalState, "fires a sender in the process cancel registry"),
     ("__rpc_signal_new", LocalState, "process-local RPC signal registry"),
@@ -309,5 +362,22 @@ mod tests {
         assert_ledger(CLASS, super::super::OP_NAMES);
         #[cfg(celld_internal_tests)]
         assert_ledger(TEST_CLASS, super::super::TEST_OP_NAMES);
+    }
+
+    /// The deny list is exactly the `Prohibited` rows that lack an inline refusal.
+    #[test]
+    fn deny_list_matches_ledger() {
+        let wanted: Vec<&str> = CLASS
+            .iter()
+            .filter(|(_, class, reason)| {
+                *class == Prohibited && !reason.starts_with("explicit")
+            })
+            .map(|(name, ..)| *name)
+            .collect();
+        assert_eq!(DENIED, wanted);
+        assert!(CLASS
+            .iter()
+            .filter(|(name, ..)| DENIED.contains(name))
+            .all(|(.., reason)| reason.contains("install-time deny")));
     }
 }

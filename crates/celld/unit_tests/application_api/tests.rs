@@ -802,6 +802,8 @@ async fn application_management_authorization_publication_and_cli() {
     #[cfg(target_os = "linux")]
     crate::js::r2_ops::tests::check_guest_head_override().await;
     #[cfg(target_os = "linux")]
+    crate::js::r2_ops::tests::check_guest_denied_ops().await;
+    #[cfg(target_os = "linux")]
     crate::application_storage::tests::check_javascript_vm().await;
     #[cfg(target_os = "linux")]
     crate::application_storage::tests::check_javascript_vm_cancellation().await;
