@@ -3355,7 +3355,7 @@ async fn run(
                             BrokeredFetch {
                                 flow: ResponseFlow::default(),
                                 pulls,
-                                _stop: stop.drop_guard(),
+                                _stop: stop.clone().drop_guard(),
                                 request: request_upload,
                                 signals,
                                 relay,
