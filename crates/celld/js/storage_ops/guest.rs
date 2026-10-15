@@ -3,7 +3,6 @@
 use super::*;
 
 pub(in crate::js) fn refuse_unbridged_guest_op(scope: &mut v8::PinScope, name: &str) -> bool {
-    #[cfg(unix)]
     if guest_storage::enabled(scope) {
         loader_throw(scope, &format!("guest {name} bridge is not available"));
         return true;
@@ -13,7 +12,6 @@ pub(in crate::js) fn refuse_unbridged_guest_op(scope: &mut v8::PinScope, name: &
 
 pub(super) enum SqlCursorId {
     Native(u64),
-    #[cfg(unix)]
     Guest(Option<String>),
 }
 
@@ -31,7 +29,6 @@ pub(super) fn start_sql(
     query: &str,
     bindings: &[rusqlite::types::Value],
 ) -> Result<SqlStart, String> {
-    #[cfg(unix)]
     if let Some(channel) = guest_storage::channel(scope, cell)? {
         let bindings = bindings
             .iter()
@@ -90,7 +87,6 @@ pub(super) fn ingest_sql(
     cell: &str,
     input: &str,
 ) -> Result<(String, u64, u64), String> {
-    #[cfg(unix)]
     if let Some(channel) = guest_storage::channel(scope, cell)? {
         return match guest_storage::call(
             scope,
@@ -111,7 +107,6 @@ pub(super) fn ingest_sql(
 }
 
 pub(super) fn database_size(scope: &mut v8::PinScope, cell: &str) -> Result<u64, String> {
-    #[cfg(unix)]
     if let Some(channel) = guest_storage::channel(scope, cell)? {
         return match guest_storage::call(scope, &channel, wire::Operation::SqlSize {})? {
             wire::Value::Size { bytes } => Ok(bytes),
@@ -126,7 +121,6 @@ pub(super) fn delete_keys(
     cell: &str,
     keys: &[String],
 ) -> Result<u64, String> {
-    #[cfg(unix)]
     if let Some(channel) = guest_storage::channel(scope, cell)? {
         return match guest_storage::call(
             scope,
@@ -149,7 +143,6 @@ pub(super) fn get_value(
     cell: &str,
     key: &str,
 ) -> Result<Option<storage::StoredValue>, String> {
-    #[cfg(unix)]
     if let Some(channel) = guest_storage::channel(scope, cell)? {
         return guest_storage::get(scope, &channel, vec![key.to_owned()]).map(|entries| {
             entries
@@ -166,7 +159,6 @@ pub(super) fn get_values(
     cell: &str,
     keys: &[String],
 ) -> Result<Vec<(String, storage::StoredValue)>, String> {
-    #[cfg(unix)]
     if let Some(channel) = guest_storage::channel(scope, cell)? {
         return guest_storage::get(scope, &channel, keys.to_vec());
     }
@@ -178,7 +170,6 @@ pub(super) fn put_values(
     cell: &str,
     entries: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    #[cfg(unix)]
     if let Some(channel) = guest_storage::channel(scope, cell)? {
         return guest_storage::put(scope, &channel, entries);
     }
@@ -191,7 +182,6 @@ pub(super) fn put_value(
     key: &str,
     value: &[u8],
 ) -> Result<(), String> {
-    #[cfg(unix)]
     if let Some(channel) = guest_storage::channel(scope, cell)? {
         return guest_storage::put(scope, &channel, &[(key.to_owned(), value.to_vec())]);
     }
@@ -203,7 +193,6 @@ pub(super) fn d1_reply(
     cell: &str,
     request: String,
 ) -> Result<String, String> {
-    #[cfg(unix)]
     if let Some(channel) = guest_storage::channel(scope, cell)? {
         // JSON escaping can grow a byte up to 6x; one D1Run must fit a frame.
         let mut operation = if request.len() > wire::MAX_MESSAGE_BYTES / 8 {
