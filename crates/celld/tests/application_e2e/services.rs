@@ -621,15 +621,20 @@ async fn t29_containers() {
         // this scenario green. Each fixture labels itself, and that label is read
         // back from the daemon. The fixture Dockerfiles pin their base image by
         // digest, so the content behind this label is fixed too.
-        for (image, expected) in [
-            (&fence, celld::application_container::docker::FENCE_LABEL),
-            (&image, celld::application_container::docker::WORKLOAD_LABEL),
+        // The lib's docker helpers are `cfg(test)`, invisible here, so the
+        // expected label is the fixture's own `LABEL` line.
+        for (image, dockerfile) in [
+            (&fence, include_str!("../fixtures/t29-services/fence.Dockerfile")),
+            (&image, include_str!("../fixtures/t29-services/workload.Dockerfile")),
         ] {
-            let labels = celld::application_container::docker::image_labels(image);
+            let expected = dockerfile.lines().find_map(|l| l.strip_prefix("LABEL ")).expect("fixture has a LABEL");
             let (key, value) = expected.split_once('=').expect("fixture label is key=value");
+            let output = Command::new("docker")
+                .args(["image","inspect",image,"--format",&format!("{{{{index .Config.Labels \"{key}\"}}}}")])
+                .kill_on_drop(true).output().await.unwrap();
             assert_eq!(
-                labels.get(key).map(String::as_str),
-                Some(value),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                value,
                 "fixture {image} is not the expected image"
             );
         }
