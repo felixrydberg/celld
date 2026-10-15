@@ -1245,6 +1245,19 @@ pub(super) fn resource_http_request(
     broker(scope, request, "manual".into(), None, None, Some(call))
 }
 
+/// Whether this isolate is in guest mode. Modes: native (default); host-pool
+/// `application_storage` (trusted application pool, native storage with
+/// host-verified cell names, never a guest); guest (`celld-guest`, storage,
+/// egress and R2 brokered through the host). Predicates, do not add another:
+/// - this isolate flag (`guest_storage_enabled`): set at construction for a root
+///   guest, and later only by `own_guest_facet` / `attach_guest_storage`.
+/// - per-event `IoContext.guest_storage`, read via `has_guest_storage()`: set
+///   once by `attach_guest_storage` when the host grants an event its channel.
+/// - process-wide `guest_activity::enabled()`: set once by `celld-guest` at start.
+///
+/// `ActorRuntimeState::host_brokers_egress` is not a mode predicate: it is the
+/// root-guest meaning of `EgressPolicy::Deny` (no network device, fetch goes to
+/// the host broker). A promoted child's Deny stays the capability denial.
 pub(super) fn enabled(scope: &mut v8::PinScope) -> bool {
     scope
         .get_slot::<Arc<ActorRuntimeState>>()
@@ -1840,6 +1853,84 @@ pub(super) fn cancel(channel: &Channel) {
     if let Ok(mut state) = channel.state.try_lock() {
         state.pending.clear();
         state.pending_bytes = 0;
+    }
+}
+
+/// One facet event opened through the root's live session. The host chose the
+/// facet's scope and storage grant; this only carries its code and props.
+#[cfg(unix)]
+pub(super) struct GuestFacet {
+    pub(super) loaded: Option<tokio::sync::watch::Receiver<LoaderState>>,
+    pub(super) facet: guest_storage::FacetGrant,
+    pub(super) id_sc: Vec<u8>,
+    pub(super) props_sc: Vec<u8>,
+}
+
+#[cfg(unix)]
+pub(super) fn guest_facet_open(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments,
+) -> Result<GuestFacet, String> {
+    let loader = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let class_name = args.get(1).to_rust_string_lossy(scope);
+    let parent_scope = args.get(2).to_rust_string_lossy(scope);
+    let owner = args.get(3).to_rust_string_lossy(scope);
+    let name = args.get(4).to_rust_string_lossy(scope);
+    let id_sc = view_bytes(args.get(5)).ok_or("facet identity is not a typed array")?;
+    let props_sc = loader_props_bytes(args.get(6))?;
+    let facet = guest_storage::facet_open(scope, &parent_scope, &class_name, &owner, &name)?;
+    let loaded = loader_registry()
+        .lock()
+        .unwrap()
+        .get(&loader)
+        .map(|entry| entry.state.clone());
+    Ok(GuestFacet {
+        loaded,
+        facet,
+        id_sc,
+        props_sc,
+    })
+}
+
+#[cfg(unix)]
+pub(super) async fn guest_facet_slot(
+    call: GuestFacet,
+) -> Result<(Arc<crate::pool::Slot>, guest_storage::FacetGrant), String> {
+    let loaded = call
+        .loaded
+        .ok_or_else(|| "worker loader: unknown worker".to_string())?;
+    let slot = loaded_worker_slot(loaded).await?;
+    let (scope, depth) = (call.facet.scope.clone(), call.facet.depth);
+    slot.turn(|worker| worker.own_guest_facet(&scope, call.id_sc, call.props_sc, depth))
+        .await
+        .map_err(|error| format!("worker loader facet: {error}"))?;
+    Ok((slot, call.facet))
+}
+
+impl Worker {
+    /// A credential-free guest's facet: the host owns the database, so this
+    /// only selects the facet's instance identity and lets its events attach a
+    /// guest storage channel. A loaded worker is stateless until its first facet.
+    #[cfg(unix)]
+    fn own_guest_facet(
+        &mut self,
+        cell: &str,
+        id_sc: Vec<u8>,
+        props_sc: Vec<u8>,
+        depth: usize,
+    ) -> Result<()> {
+        let inner = self.inner.as_ref().expect("live worker isolate");
+        inner
+            .runtime_state
+            .guest_storage_enabled
+            .store(true, Ordering::Release);
+        let (mut locker, _cells) = self.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = self.realm(hs);
+        let cs = &mut v8::ContextScope::new(hs, realm.context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+        bootstrap::install_facet_config(tc, cell, id_sc, props_sc, depth)
     }
 }
 

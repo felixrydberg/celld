@@ -1,5 +1,40 @@
 # Fork cleanup: shrink the guest diff against upstream celld
 
+## Status (2026-10-14): steps 1-5 done on `refactor/reduce-upstream-conflicts`
+
+Measured vs `v0.6.2` over js.rs, storage_ops, container, websocket, r2_ops,
+bootstrap: hunks 339 → 301 (-11%), inserted lines 4878 → 2182 (-55%).
+js.rs alone: 219 → 186 hunks, +2206 → +1075 lines.
+
+- 566469e: pre-existing compile error on HEAD (moved `stop` token) fixed.
+- 1 a45b011: guest-only items moved to `js/guest_host.rs`, `js/*/guest.rs`,
+  `js/guest_storage.rs`; r2 broker test to `unit_tests/js/r2_ops/tests.rs`.
+- 2 471ddaa: `js/guest_ops.rs` ledger, 0 unreviewed (no `Unreviewed` class:
+  a new op must get a real class).
+- 3 68fc67a: `attributed_op` + `guest_ops::override_ops`; `op_r2_head` is
+  upstream-identical. Stopped there as planned: fixed cost ~+30 js.rs lines,
+  gain ~-6 lines per op, and ops reachable from late-flipped children
+  (container, loader, facet, ws) can't use install-time overrides.
+- 2b d57cb95: install-time deny for the 9 Prohibited ops without their own
+  refusal; `__cron_schedule` / `__queue_consumer` get an `undefined` stub
+  (the harness reads that as "no hosted entry").
+- 4 a68d9ba: **[H] confirmed**: a `globalOutbound: null` child promoted by
+  `own_guest_facet` reached the host fetch broker (only the guest scheduler's
+  root-event check refused it). Fixed with `host_brokers_egress` (root guest
+  only). **[H] refuted**: loaded children get no R2 binding (pinned by tests).
+  Constructing children as guest from the start is not needed.
+- 5 81edaa7: fork cfg(unix) gates dropped (upstream is unix-only in practice),
+  14 `;`-only hunks reverted, brokered R2 read proof documented. Skipped:
+  R2 sync-throw vs reject (every harness call is awaited in an async fn, not
+  observable); single asyncrt `track` hook (unwrapped enqueues such as timers
+  and the unrefed rpc-signal listener would pin the guest busy).
+
+Not verified: real-Firecracker e2e (`tests/application_e2e`, root/KVM/MinIO).
+Pre-existing, not fixed: `tests/application_e2e` does not compile
+(`application_container` is private); the `celld_internal_tests` cfg does not
+compile (`op_loader_count`, `op_test_heap_share`, `op_test_external_memory`
+are missing).
+
 Written 2026-10-13 from a read-only review of the working tree (HEAD = upstream
 v0.6.2 plus uncommitted work). Nothing here is implemented. Facts below were read
 from source; items marked **[H]** are hypotheses that need a test first.

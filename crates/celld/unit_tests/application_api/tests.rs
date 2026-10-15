@@ -789,12 +789,20 @@ async fn application_management_authorization_publication_and_cli() {
     crate::js::guest_storage::tests::check_original_guest_retirement().await;
     #[cfg(unix)]
     crate::js::guest_storage::tests::check_original_guest_cancellation().await;
+    #[cfg(unix)]
+    crate::js::guest_storage::tests::check_guest_child_fetch_stays_denied().await;
+    #[cfg(unix)]
+    crate::js::guest_storage::tests::check_guest_child_has_no_r2().await;
     #[cfg(target_os = "linux")]
     crate::application_javascript_guest::tests::check_application_bootstrap();
     #[cfg(target_os = "linux")]
     crate::application_javascript_guest::tests::check_queue_event().await;
     #[cfg(target_os = "linux")]
-    crate::js::r2_ops::check_application_broker().await;
+    crate::js::r2_ops::tests::check_application_broker().await;
+    #[cfg(target_os = "linux")]
+    crate::js::r2_ops::tests::check_guest_head_override().await;
+    #[cfg(target_os = "linux")]
+    crate::js::r2_ops::tests::check_guest_denied_ops().await;
     #[cfg(target_os = "linux")]
     crate::application_storage::tests::check_javascript_vm().await;
     #[cfg(target_os = "linux")]

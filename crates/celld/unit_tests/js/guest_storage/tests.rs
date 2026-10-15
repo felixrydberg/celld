@@ -193,7 +193,7 @@ fn evaluate(worker: &Worker, context: &Arc<IoContext>, source: &str) -> Result<S
 
 /// Run with CPED naming `origin` while `driver` owns the checkpoint, as a
 /// foreign continuation does.
-fn evaluate_in(
+pub(crate) fn evaluate_in(
     worker: &Worker,
     origin: &Arc<IoContext>,
     driver: &Arc<IoContext>,
@@ -1686,6 +1686,7 @@ export class Counter {
     anonymous.dispose();
     out.disposed = await fail(() => text(anonymous));
     out.egress = await text(L.load(main('export default { async fetch() { try { await fetch("http://example.invalid/"); return new Response("reached"); } catch (e) { return new Response(String(e.message)); } } }')));
+    out.isolated = await text(L.load(main('export default { fetch(req, env) { return new Response(JSON.stringify([Object.keys(env), typeof __r2_head])); } }')));
     out.nullOutbound = await text(L.load({ ...main(plain), globalOutbound: null }));
     out.outbound = await fail(() => text(L.load({ ...main(plain), globalOutbound: S })));
     out.envService = await fail(() => text(L.load({ ...main(plain), env: { service: S } })));
@@ -1746,6 +1747,10 @@ export default { fetch() { return new Response('guest'); } };
         said("egress").contains("not permitted to access the internet"),
         "{out}"
     );
+    // A loaded worker has no bucket and no op names: the install-time guest
+    // overrides (js/guest_ops.rs) skip it, because own_guest_facet flips it
+    // after install, and nothing in it can call `__r2_head`.
+    assert_eq!(said("isolated"), r#"[[],"undefined"]"#, "{out}");
     assert_eq!(said("nullOutbound"), "plain", "{out}");
     for key in ["outbound", "envService", "tails"] {
         assert!(
@@ -1761,6 +1766,206 @@ export default { fetch() { return new Response('guest'); } };
     }
     eprintln!("original V8 guest Worker Loader: get/load, entrypoint fetch/RPC, props, sibling/Wasm modules, limits, dispose and memoization ran a child under the current-thread runtime; Fetcher/env service/tails/text/py refused; local check, separate VM evidence required");
     let _ = host.finish();
+}
+
+/// Every `GuestFetch` that reached the guest scheduler's end of `EGRESS`, by
+/// URL, with the issuing context. The receiver answers each one with the
+/// outside-an-event refusal, as the scheduler does for a context it does not
+/// know, so a leak shows up here instead of as a reply.
+static BROKERED: Mutex<Vec<(String, std::sync::Weak<IoContext>)>> = Mutex::new(Vec::new());
+
+fn record_brokered_fetches() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<GuestFetch>();
+        install_egress(sender).unwrap();
+        std::thread::spawn(move || {
+            while let Some(fetch) = receiver.blocking_recv() {
+                BROKERED
+                    .lock()
+                    .unwrap()
+                    .push((fetch.request.url.clone(), fetch.context.clone()));
+                let _ = fetch.reply.send(Err(FETCH_OUTSIDE_EVENT.into()));
+            }
+        });
+    });
+}
+
+/// Run `Counter.fetch` of `source` once in a guest-mode Worker over `channel`
+/// and return its JSON body plus the context pointer of the root event.
+async fn run_counter(
+    source: &str,
+    script_name: String,
+    r2_bindings: Vec<(String, String)>,
+    cell: &str,
+    channel: &Arc<Channel>,
+) -> (serde_json::Value, *const IoContext) {
+    let mut worker = Worker::load_guest_config(Arc::new(
+        WorkerConfig::new(WorkerConfigOptions {
+            src: source.into(),
+            script_name,
+            do_classes: vec!["Counter".into()],
+            bindings: vec![],
+            r2_bindings,
+            d1_bindings: vec![],
+            kv_bindings: vec![],
+            queue_bindings: vec![],
+            queue_consumers: vec![],
+            workflow_bindings: vec![],
+            vars: vec![],
+            node: "check".into(),
+            modules: vec![],
+            compat: crate::worker_compat(&serde_json::json!({
+                "compatibility_date": "2026-03-01",
+                "compatibility_flags": ["js_rpc"],
+            })),
+        })
+        .with_loaders(vec!["LOADER".into()]),
+    ))
+    .unwrap();
+    channel.begin_turn().unwrap();
+    let (job, response) = fetch_job(cell, Some("named-object"), "/run");
+    let (entry, ops) = worker
+        .turn_begin_guest_cell(job, None, channel.clone())
+        .unwrap();
+    channel.finish_turn().unwrap();
+    let mut root = std::ptr::null();
+    if let Some(mut entry) = entry {
+        root = Arc::as_ptr(&entry.context);
+        drain_entry(&mut worker, &mut entry, ops, channel).await;
+    }
+    let response = response.await.unwrap().unwrap();
+    let out = serde_json::from_slice(&response.body)
+        .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&response.body)));
+    (out, root)
+}
+
+/// A loaded child with `globalOutbound: null` (or none, inheriting the guest
+/// root's `Deny`) must stay denied after `own_guest_facet` flips its isolate
+/// to guest mode: `op_fetch` skips the `Deny` refusal only on a root guest
+/// (`host_brokers_egress`), so nothing a child fetches reaches the broker.
+pub(crate) async fn check_guest_child_fetch_stays_denied() {
+    Engine::init();
+    record_brokered_fetches();
+    let address = address("guest-child-fetch");
+    let cell = address.cell_scope("Counter", "named-object").unwrap();
+    let source = r##"
+const code = `
+  import { DurableObject } from 'cloudflare:workers';
+  const attempt = async (url) => {
+    try { await fetch(url); return 'reached'; } catch (e) { return String(e.message); }
+  };
+  export class F extends DurableObject {
+    egress(url) { return attempt(url); }
+  }
+  export default { async fetch(request) { return new Response(await attempt('http://leak.invalid/plain')); } };
+`;
+export class Counter {
+  constructor(ctx, env) { this.ctx = ctx; this.env = env; }
+  async fetch(request) {
+    const L = this.env.LOADER, out = {};
+    const base = { compatibilityDate: '2026-03-01', mainModule: 'main.js', modules: { 'main.js': code } };
+    const text = async (stub) => (await stub.getEntrypoint().fetch('http://child/')).text();
+    const facet = (name, stub) => this.ctx.facets.get(name, () => ({ class: stub.getDurableObjectClass('F') }));
+    // Never promoted: the Deny refusal itself.
+    out.unpromoted = await text(L.load({ ...base, globalOutbound: null }));
+    // Promoted by a facet, with and without an explicit null outbound.
+    const nulled = L.get('nulled', () => ({ ...base, globalOutbound: null }));
+    out.nulledFacet = await facet('a', nulled).egress('http://leak.invalid/nulled-facet');
+    // The same promoted isolate, now reached as a plain entrypoint.
+    out.nulledPlain = await text(nulled);
+    const inherited = L.get('inherited', () => ({ ...base }));
+    out.inheritedFacet = await facet('b', inherited).egress('http://leak.invalid/inherited-facet');
+    out.inheritedPlain = await text(inherited);
+    await fetch('http://leak.invalid/root').catch(() => {});
+    await this.ctx.storage.put('root', 1);
+    return new Response(JSON.stringify(out));
+  }
+}
+export default { fetch() { return new Response('guest'); } };
+"##;
+    let host = FacetHost::new(&cell);
+    let (out, root) =
+        run_counter(source, address.storage_root(), vec![], &cell, &host.channel).await;
+    host.finish();
+    let said = |key: &str| out[key].as_str().unwrap_or_default().to_owned();
+    eprintln!("guest child fetch: {out}");
+    // (url, issued by the root event): a denied child reaching the broker is the leak.
+    let leaked: Vec<_> = BROKERED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(url, _)| url.contains("leak.invalid"))
+        .map(|(url, context)| (url.clone(), std::ptr::eq(context.as_ptr(), root)))
+        .collect();
+    assert_eq!(
+        said("unpromoted"),
+        "This worker is not permitted to access the internet via global functions like \
+         fetch(). It must use capabilities (such as bindings in 'env') to talk to the \
+         outside world.",
+        "{out}"
+    );
+    for key in ["nulledFacet", "nulledPlain", "inheritedFacet", "inheritedPlain"] {
+        assert_eq!(said(key), said("unpromoted"), "{key}: {out}");
+    }
+    // Only the root guest's own fetch is brokered, from its own event.
+    assert_eq!(leaked, [("http://leak.invalid/root".to_owned(), true)], "{out}");
+}
+
+/// A loaded child gets no R2 binding, however the parent or the request asks,
+/// and cannot name an R2 op: ops are parameters of the compiled internal
+/// scripts (`InternalArguments`), not globals.
+pub(crate) async fn check_guest_child_has_no_r2() {
+    Engine::init();
+    let address = address("guest-child-r2");
+    let cell = address.cell_scope("Counter", "named-object").unwrap();
+    let source = r##"
+const code = `
+  const probe = (env) => ({
+    keys: Object.keys(env),
+    bucket: typeof env.BUCKET,
+    ops: [typeof __r2_head, typeof globalThis.__r2_head, typeof __celld, typeof globalThis.__celld,
+          (() => { try { return new Function('return typeof __r2_head')(); } catch (e) { return String(e); } })()],
+  });
+  export default { fetch(request, env) { return new Response(JSON.stringify(probe(env))); } };
+`;
+export class Counter {
+  constructor(ctx, env) { this.ctx = ctx; this.env = env; }
+  async fetch(request) {
+    const L = this.env.LOADER, out = {};
+    const base = { compatibilityDate: '2026-03-01', mainModule: 'main.js', modules: { 'main.js': code } };
+    const fail = async (f) => { try { return await f(); } catch (e) { return 'refused: ' + String((e && e.message) || e); } };
+    const text = async (stub) => (await stub.getEntrypoint().fetch('http://child/')).text();
+    out.parent = typeof this.env.BUCKET?.head;
+    out.plain = await fail(() => text(L.load(base)));
+    // The parent's bucket cannot be passed through env, nor named in the request.
+    out.envBucket = await fail(() => text(L.load({ ...base, env: { BUCKET: this.env.BUCKET } })));
+    out.r2Buckets = await fail(() => text(L.load({ ...base, r2Buckets: [{ binding: 'BUCKET', bucket_name: 'BUCKET' }] })));
+    out.bindings = await fail(() => text(L.load({ ...base, bindings: [{ type: 'r2_bucket', name: 'BUCKET', bucket_name: 'BUCKET' }] })));
+    return new Response(JSON.stringify(out));
+  }
+}
+export default { fetch() { return new Response('guest'); } };
+"##;
+    let host = Host::named(cell.clone(), Some("named-object"));
+    let binding = vec![("BUCKET".to_owned(), "BUCKET".to_owned())];
+    let (out, _) = run_counter(source, address.storage_root(), binding, &cell, &host.channel).await;
+    let _ = host.finish();
+    eprintln!("guest child r2: {out}");
+    // The parent really has the binding, so the absence below is the loader's doing.
+    assert_eq!(out["parent"], "function", "{out}");
+    for key in ["plain", "envBucket", "r2Buckets", "bindings"] {
+        let said = out[key].as_str().unwrap_or_default();
+        if let Some(refusal) = said.strip_prefix("refused: ") {
+            eprintln!("{key} refused: {refusal}");
+            continue;
+        }
+        let probe: serde_json::Value =
+            serde_json::from_str(said).unwrap_or_else(|_| panic!("{key}: {out}"));
+        assert_eq!(probe["bucket"], "undefined", "{key}: {out}");
+        assert!(!probe["keys"].to_string().contains("BUCKET"), "{key}: {out}");
+        assert_eq!(probe["ops"], serde_json::json!(vec!["undefined"; 5]), "{key}: {out}");
+    }
 }
 
 pub(crate) async fn check_original_guest_response() {

@@ -227,10 +227,7 @@ pub(super) fn run_internal_script<'s>(
         // stay eager so their consumers avoid that cost on the first request.
         None => {
             let mut source = v8::script_compiler::Source::new(code, None);
-            #[cfg(unix)]
             let guest = guest_storage::enabled(scope);
-            #[cfg(not(unix))]
-            let guest = false;
             let options = bootstrap_compile_options(cache, guest);
             let function = v8::script_compiler::compile_function(
                 scope,
