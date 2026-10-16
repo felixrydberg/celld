@@ -23,7 +23,13 @@ fi
 rustup_path=$(command -v rustup || :)
 if [ -z "$rustup_path" ]; then
     rustup_path="$HOME/.cargo/bin/rustup"
-    [ -x "$rustup_path" ] || curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+    if [ ! -x "$rustup_path" ]; then
+        installer=$(mktemp)
+        trap 'rm -f "$installer"' 0
+        curl -fsSL -o "$installer" https://sh.rustup.rs
+        sh "$installer" -y --profile minimal
+        rm -f "$installer"
+    fi
 fi
 # For the pinned toolchain (rust-toolchain.toml), when run from the checkout.
 "$rustup_path" component add rustfmt clippy

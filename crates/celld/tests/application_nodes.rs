@@ -2049,6 +2049,7 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
     let mut roomy: serde_json::Value = serde_json::from_slice(&std::fs::read(&vms).unwrap()).unwrap();
     roomy["max_vms"] = serde_json::json!(4);
     roomy["max_memory_mib"] = serde_json::json!(12288);
+    roomy["startup_pool"] = serde_json::json!(0);
     let roomy_vms = directory.join("lifecycle-vms.json");
     std::fs::write(&roomy_vms, roomy.to_string()).unwrap();
     let lifecycle = start(directory, "lifecycle", Some(&roomy_vms), true, "", &budget).await;
@@ -2095,10 +2096,13 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
         })
         .collect();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let old_vm_pid = vm_pids(&lifecycle)
-        .into_iter()
-        .next()
-        .expect("the old deployment had no VM before replacement");
+    let old_vm_pids = vm_pids(&lifecycle);
+    assert_eq!(
+        old_vm_pids.len(),
+        1,
+        "expected exactly one VM candidate before replacement: {old_vm_pids:?}"
+    );
+    let old_vm_pid = old_vm_pids[0];
     let mut snapshot = store.read(&swap.application).await.unwrap();
     store.activate(&mut snapshot, swap).await.unwrap();
     store.commit(snapshot).await.unwrap();
