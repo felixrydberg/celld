@@ -492,7 +492,5 @@ Unsupported behavior fails clearly rather than degrading silently.
 - **Cron:** minute resolution, UTC, as in the original.
 - **Activation checks:** activation does not verify runtime-image approval or
   service-binding configuration (the management process has no node config);
-  those fail at first dispatch and appear as `failed` in `runtime`.
-- **Status:** a crashed node's last record persists, and handlers not yet
-  launched have no entry.
+  failures appear in the node's logs at first dispatch.
 

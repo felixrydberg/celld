@@ -2095,6 +2095,10 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
         })
         .collect();
     tokio::time::sleep(Duration::from_millis(500)).await;
+    let old_vm_pid = vm_pids(&lifecycle)
+        .into_iter()
+        .next()
+        .expect("the old deployment had no VM before replacement");
     let mut snapshot = store.read(&swap.application).await.unwrap();
     store.activate(&mut snapshot, swap).await.unwrap();
     store.commit(snapshot).await.unwrap();
@@ -2154,14 +2158,13 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
     .await
     .expect("the retained waitUntil work was lost with the replaced deployment");
     // Its VM goes once that work has settled, not at the 600 s idle TTL.
-    let serving = vm_pids(&lifecycle).len();
     timeout(Duration::from_secs(30), async {
-        while vm_pids(&lifecycle).len() >= serving {
+        while Path::new(&format!("/proc/{old_vm_pid}")).exists() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     })
     .await
-    .expect("the replaced deployment's VM was not retired once its work settled");
+    .expect("the replaced deployment's VM was not reaped once its work settled");
     // A drain settles accepted background work before it hands ownership over.
     assert_eq!(
         request(port, "/bg?ms=3000".into()).await,

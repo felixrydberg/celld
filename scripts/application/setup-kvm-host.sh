@@ -20,8 +20,11 @@ if ! /usr/local/bin/firecracker --version 2>/dev/null | grep -q "Firecracker $ve
     sudo install -m 755 "$work/release-$version-x86_64/jailer-$version-x86_64" /usr/local/bin/jailer
     rm -rf "$work"
 fi
-command -v cargo >/dev/null || [ -x "$HOME/.cargo/bin/cargo" ] ||
-    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+rustup_path=$(command -v rustup || :)
+if [ -z "$rustup_path" ]; then
+    rustup_path="$HOME/.cargo/bin/rustup"
+    [ -x "$rustup_path" ] || curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+fi
 # For the pinned toolchain (rust-toolchain.toml), when run from the checkout.
-"$HOME/.cargo/bin/rustup" component add rustfmt clippy
+"$rustup_path" component add rustfmt clippy
 /usr/local/bin/firecracker --version | head -n 1
