@@ -106,38 +106,30 @@ fn run(boot: Option<BootMode>) -> anyhow::Result<()> {
         Some(BootMode::Template) => "--template".to_owned(),
         Some(BootMode::Check) => "/opt/celld/javascript-check.json".to_owned(),
         None => arguments.next().ok_or_else(|| {
-            anyhow::anyhow!("usage: celld-guest CONFIG.json | --application BOOTSTRAP ARTIFACT_ROOT [SHARED_ROOT] | --template")
+            anyhow::anyhow!("usage: celld-guest CONFIG.json | --prewarm | --template")
         })?,
     };
+    anyhow::ensure!(arguments.next().is_none(), "unexpected guest argument");
     if path == "--template" {
         // The unassigned template VM: no tokio runtime and no V8, so a snapshot
-        // holds nothing random. A claim execs the application mode.
-        anyhow::ensure!(arguments.next().is_none(), "unexpected guest argument");
+        // holds nothing random. A prewarm execs the prewarmed mode.
         return celld::application_template_agent::run();
     }
-    let application = if path == "--application" {
-        let bootstrap = arguments
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("missing bootstrap disk"))?;
-        let root = arguments
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("missing application root"))?;
-        Some((bootstrap, root, arguments.next()))
-    } else {
-        None
-    };
-    anyhow::ensure!(arguments.next().is_none(), "unexpected guest argument");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     // As in the host: one process Domain, so services (HTTP streams) never
     // split between a per-runtime instance and one installed lazily later.
     celld::asyncrt::set_host_handle(runtime.handle().clone());
-    if let Some((bootstrap, root, shared)) = application {
+    if path == "--prewarm" {
+        // Exec'd after this VM's own reseed: the runtime and V8 start before
+        // any application is known, which arrives with the claim.
+        celld::js::Engine::init();
+        let (bootstrap, root, shared) = celld::application_template_agent::claimed()?;
         runtime.block_on(celld::application_javascript_guest::run_application(
-            std::path::Path::new(&bootstrap),
-            std::path::Path::new(&root),
-            shared.as_deref().map(std::path::Path::new),
+            std::path::Path::new(bootstrap),
+            std::path::Path::new(root),
+            shared.map(std::path::Path::new),
         ))
     } else {
         runtime.block_on(celld::application_javascript_guest::run(

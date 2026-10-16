@@ -227,8 +227,10 @@ heap settlement. Their totals are nested.
 `startup_pool` (optional, default 0) keeps that many restored VMs per template
 ready for a claim. With 0 each launch restores on demand. With `N > 0` the node
 refills each template it has needed, in the background, up to `N` waiting VMs
-with the guest agent connected and no application; a cold launch claims one
-(`path` = `pool`) instead of restoring. A waiting VM holds no application data,
+with no application; a cold launch claims one (`path` = `pool`) instead of
+restoring. Every restored VM, pooled or not, first gets fresh host entropy and
+starts its own prewarmed guest process (V8 engine and runtime), so a claim only
+loads the application. A waiting VM holds no application data,
 and a claimed VM serves only its handler and is destroyed at retirement; it never
 returns to the pool. Waiting, restoring, reaping and quarantined pool VMs count
 at their actual class memory against `max_vms` and `max_memory_mib`; refill leaves

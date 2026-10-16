@@ -6265,6 +6265,32 @@ pub(crate) async fn check_supervised_handler_bridge(
                 .trim()
                 .into();
         if std::env::var_os("CELLD_APPLICATION_MEMORY_CHECK_ONLY").is_some() {
+            // Restored and pooled VMs alone: their randomness and lifecycle.
+            if std::env::var_os("CELLD_APPLICATION_POOL_CHECK_ONLY").is_some() {
+                check_restored_vms(
+                    app,
+                    &store,
+                    &javascript_options,
+                    directory.path(),
+                    &resource.application,
+                )
+                .await;
+                assert!(owned_vm_pids().is_empty(), "restored VMM was not reaped");
+                check_startup_pool(
+                    app,
+                    &store,
+                    &javascript_options,
+                    directory.path(),
+                    &resource.application,
+                    owned_vm_pids,
+                )
+                .await;
+                assert!(
+                    owned_vm_pids().is_empty(),
+                    "startup pool VMM was not reaped"
+                );
+                return;
+            }
             if std::env::var_os("CELLD_APPLICATION_MEMORY_LOADER_BACKGROUND_CHECK_ONLY").is_some() {
                 loader_background_baseline::run(
                     app,
@@ -6606,7 +6632,6 @@ export default { get fetch() {
         }
         let call = |vm: &Vm, name: &str, path: &str, deadline: Duration| {
             let (client, app, resource) = (vm.client(), app.clone(), resource.clone());
-            let console = vm.console.clone();
             let (name, url) = (name.to_owned(), format!("http://staged{path}"));
             async move {
                 client
@@ -6625,10 +6650,7 @@ export default { get fetch() {
                     )
                     .await
                     .unwrap_or_else(|error| {
-                        panic!(
-                            "staged invocation failed: {error:#}; {}",
-                            String::from_utf8_lossy(&console.lock().unwrap())
-                        )
+                        panic!("staged invocation failed: {error:#}; {}", client.console())
                     })
             }
         };

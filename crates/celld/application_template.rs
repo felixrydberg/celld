@@ -84,6 +84,8 @@ pub(crate) struct Templates {
     pyodide: tokio::sync::Mutex<HashMap<String, PyodideEntry>>,
     startup: AtomicBool,
     ready: AtomicBool,
+    /// Startup CPU boost slots, in vCPUs (`Jail::boost`).
+    boosts: Arc<tokio::sync::Semaphore>,
 }
 
 /// What one Pyodide runtime drive has needed so far.
@@ -201,6 +203,11 @@ impl Templates {
             pyodide: Default::default(),
             startup: Default::default(),
             ready: Default::default(),
+            // ponytail: half the host's CPUs may run boosted startups; make it
+            // node config if a host needs another split.
+            boosts: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(1, |cpus| (cpus.get() / 2).max(1)),
+            )),
         })
     }
 
@@ -498,6 +505,28 @@ impl Templates {
         }
         idle.reaping.extend(broken.iter().map(|vm| vm.memory_mib));
         broken
+    }
+
+    /// Baselines: only the template of `memory_mib` stays needed, and other
+    /// idle VMs are evicted, so the next refill is that template's. A later
+    /// launch of another class marks its template needed again.
+    #[cfg(test)]
+    pub(crate) fn focus(&self, memory_mib: u32) -> Vec<Idle> {
+        for entry in self.built.lock().expect("templates poisoned").values_mut() {
+            entry.needed &= entry
+                .template
+                .as_ref()
+                .is_some_and(|template| template.memory_mib == memory_mib);
+        }
+        let mut idle = self.idle.lock().expect("idle VMs poisoned");
+        let (kept, evicted): (Vec<_>, Vec<_>) = idle
+            .ready
+            .drain(..)
+            .partition(|(_, vm)| vm.memory_mib == memory_mib);
+        idle.ready = kept;
+        let evicted: Vec<_> = evicted.into_iter().map(|(_, vm)| vm).collect();
+        idle.reaping.extend(evicted.iter().map(|vm| vm.memory_mib));
+        evicted
     }
 
     pub(crate) fn evict_all(&self) -> Vec<Idle> {
@@ -839,6 +868,13 @@ impl Staged {
                 .join(&self.parent)
                 .join(&self.id)
         });
+        let boosts = options.templates.boosts.clone();
+        let boost = boost_slots(&boosts, options.vcpus, options.cpu_quota);
+        let quota = if boost.is_some() {
+            full_vcpus(options.vcpus)
+        } else {
+            options.cpu_quota
+        };
         let mut command = Command::new(&options.jailer);
         command
             .arg("--id")
@@ -854,7 +890,7 @@ impl Staged {
             .args(["--cgroup-version", "2", "--parent-cgroup"])
             .arg(&self.parent)
             .arg("--cgroup")
-            .arg(format!("cpu.max={} 100000", options.cpu_quota));
+            .arg(format!("cpu.max={quota} 100000"));
         #[cfg(test)]
         if leaf.is_none() && std::env::var_os("CELLD_APPLICATION_MEMORY_CHECK_ONLY").is_some() {
             // Enable accounting before attachment; this adds no memory limit.
@@ -895,8 +931,29 @@ impl Staged {
             cgroup,
             leaf,
             memory_writer: None,
+            cpu_quota: options.cpu_quota,
+            vcpus: options.vcpus,
+            boosts,
+            boost,
         })
     }
+}
+
+/// A class quota of whole vCPUs.
+fn full_vcpus(vcpus: u8) -> u32 {
+    u32::from(vcpus) * 100_000
+}
+
+/// Boost slots for a VM held below its vCPUs, if they are free now; startup
+/// never waits for one.
+fn boost_slots(
+    boosts: &Arc<tokio::sync::Semaphore>,
+    vcpus: u8,
+    quota: u32,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    (full_vcpus(vcpus) > quota)
+        .then(|| boosts.clone().try_acquire_many_owned(vcpus.into()).ok())
+        .flatten()
 }
 
 /// A running jailer/VMM and its console; the workspace lives as long as it.
@@ -912,9 +969,45 @@ pub(crate) struct Jail {
     leaf: Option<cgroup::Leaf>,
     /// Stored on the physical owner, never detached on a transition timeout.
     memory_writer: Option<tokio::task::JoinHandle<Result<cgroup::MemorySample>>>,
+    /// The class quota; while `boost` is held the VM runs at full vCPUs.
+    cpu_quota: u32,
+    vcpus: u8,
+    boosts: Arc<tokio::sync::Semaphore>,
+    boost: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Jail {
+    /// Full vCPUs until `settle`, if boost slots are free: startup is not held
+    /// to a fractional class quota. Every startup phase is bounded by its own
+    /// timeout and a failed VM is killed, which frees the slots. Failing to
+    /// boost leaves the class quota, which is safe.
+    pub(crate) fn boost(&mut self) {
+        if self.boost.is_none() {
+            self.boost = boost_slots(&self.boosts, self.vcpus, self.cpu_quota)
+                .filter(|_| self.set_cpu_max(full_vcpus(self.vcpus)).is_ok());
+        }
+    }
+
+    /// Back to the class quota. A VM that cannot be held to it must not run.
+    pub(crate) fn settle(&mut self) -> Result<()> {
+        if self.boost.is_some() {
+            self.set_cpu_max(self.cpu_quota)?;
+            self.boost = None;
+        }
+        Ok(())
+    }
+
+    fn set_cpu_max(&self, quota: u32) -> Result<()> {
+        let value = format!("{quota} 100000");
+        match (&self.leaf, &self.cgroup) {
+            (Some(leaf), _) => leaf.set_cpu_max(&value),
+            (None, Some(path)) => {
+                std::fs::write(path.join("cpu.max"), value).context("configure cgroup cpu.max")
+            }
+            (None, None) => bail!("application VM has no cgroup"),
+        }
+    }
+
     pub(crate) fn retained_target(&self, nominal_bytes: u64, margin: u64) -> Result<Option<u64>> {
         self.leaf
             .as_ref()
@@ -1036,17 +1129,19 @@ impl Jail {
     }
 }
 
-/// Time spent reaching the agent's hello, since the boot began.
+/// Time spent reaching the agent's hello, then the prewarmed guest's, since
+/// the boot began.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Boot {
     pub prepared: Duration,
     pub spawned: Duration,
     pub configured: Duration,
     pub hello: Duration,
+    pub prewarmed: Duration,
 }
 
-/// A started VM whose agent is connected and waits for a claim: assigned to no
-/// application, holding no application data. Once claimed it serves one
+/// A started VM whose prewarmed guest is connected and waits for a claim:
+/// assigned to no application, holding no application data. Once claimed it serves one
 /// handler and is destroyed at retirement; it never returns here.
 pub(crate) struct Idle {
     pub jail: Jail,

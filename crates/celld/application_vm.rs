@@ -12,7 +12,7 @@ use crate::application_javascript_guest::native_namespace_owns_object;
 use crate::application_template::{
     cold_boot, load, wait_for_api, Boot, Idle, Jail, Staged, Template, Templates,
 };
-use crate::application_template_agent::{claim, AGENT_PORT, HELLO};
+use crate::application_template_agent::{claim, prewarm, AGENT_PORT, HELLO};
 use crate::applications::{
     content_digest, Application, ApplicationLimits, ApplicationSizeClass, ApplicationStore,
     HandlerState, HandlerStatus,
@@ -145,8 +145,6 @@ pub(crate) struct Exit {
 pub(crate) struct Vm {
     client: VmClient,
     task: Option<JoinHandle<Result<Exit>>>,
-    #[cfg(test)]
-    console: Arc<Mutex<Vec<u8>>>,
     /// `restore` or `cold`, as `vm_startup` reports it.
     #[cfg(test)]
     path: &'static str,
@@ -158,9 +156,19 @@ pub(crate) struct VmClient {
     transport: Client,
     supervisor: Arc<assigned_supervisor::Control>,
     stop: CancellationToken,
+    #[cfg(test)]
+    console: Arc<Mutex<Vec<u8>>>,
+    /// The `vm_startup` fields, for baselines.
+    #[cfg(test)]
+    pub(crate) startup: serde_json::Value,
 }
 
 impl VmClient {
+    /// The guest's serial console so far, a 16 KiB ring.
+    #[cfg(test)]
+    pub(crate) fn console(&self) -> String {
+        String::from_utf8_lossy(&self.console.lock().expect("VM console poisoned")).into_owned()
+    }
     #[cfg(test)]
     pub(crate) async fn invoke(
         &self,
@@ -361,7 +369,7 @@ impl Vm {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn console(&self) -> String {
-        String::from_utf8_lossy(&self.console.lock().expect("VM console poisoned")).into_owned()
+        self.client.console()
     }
     #[cfg(test)]
     pub(crate) async fn wait(mut self) -> Result<Exit> {
@@ -3365,8 +3373,9 @@ struct Started {
     booted: Duration,
 }
 
-/// A restore from `template`, else a cold boot into template mode, until the
-/// guest agent says hello: a VM that no application has claimed. `abandoned`
+/// A restore from `template`, else a cold boot into template mode, then the
+/// prewarm, until the prewarmed guest says hello: a VM that no application has
+/// claimed. `abandoned`
 /// ends the boot early. A failed boot has killed and reaped its VMM.
 async fn boot(
     options: &LaunchOptions,
@@ -3408,13 +3417,20 @@ async fn boot(
         let configured = began.elapsed();
         // A restore resets the agent's connection and it dials again, so the
         // host never sees the template's own.
+        let (mut agent_stream, _) = agent.accept().await?;
+        ensure!(agent_stream.read_u8().await? == HELLO, "guest agent hello");
+        let hello = began.elapsed();
+        // Fresh entropy for this VM alone; the agent then execs the prewarmed
+        // guest, which starts the generic runtime and dials again.
+        agent_stream.write_all(&prewarm()?).await?;
         let (mut guest, _) = agent.accept().await?;
-        ensure!(guest.read_u8().await? == HELLO, "guest agent hello");
+        ensure!(guest.read_u8().await? == HELLO, "prewarmed guest hello");
         let boot = Boot {
             prepared,
             spawned,
             configured,
-            hello: began.elapsed(),
+            hello,
+            prewarmed: began.elapsed(),
         };
         Ok((guest, boot))
     };
@@ -3429,6 +3445,8 @@ async fn boot(
             },
         }
     };
+    // Boosted since spawn; an unclaimed VM waits at its class quota.
+    let result = result.and_then(|started| jail.settle().map(|()| started));
     match result {
         Ok((guest, boot)) => Ok(Idle {
             jail,
@@ -3495,6 +3513,8 @@ async fn claim_vm(
     } = idle;
     let pid = jail.pid;
     let (api, root) = (jail.root.join("api.sock"), jail.root.clone());
+    // Loading the application runs at full vCPUs until its Ready frame.
+    jail.boost();
     let startup = async {
         let image_bytes = point_drive(&api, &root, "handler", image).await?;
         let shared_bytes = match shared {
@@ -3532,6 +3552,7 @@ async fn claim_vm(
             },
         }
     };
+    let result = result.and_then(|ready| jail.settle().map(|()| ready));
     match result {
         Ok((dispatcher, claimed)) => Ok(Started {
             jail,
@@ -3685,8 +3706,10 @@ async fn start(
         configure_ms = ms(phases.configured - phases.spawned),
         // Until the guest agent is connected (cold: the boot; restore: the redial).
         agent_ms = ms(phases.hello - phases.configured),
-        claim_ms = ms(claimed - phases.hello),
-        // The application guest, started by the claim, until its Ready frame.
+        // Reseed, exec and the generic runtime, until the prewarmed guest dials.
+        prewarm_ms = ms(phases.prewarmed - phases.hello),
+        claim_ms = ms(claimed - phases.prewarmed),
+        // The application, loaded by the claim, until its Ready frame.
         guest_ready_ms = ms(booted - claimed),
         deployment_ms = ms(began.elapsed() - booted),
         ms = ms(began.elapsed()),
@@ -3700,9 +3723,22 @@ async fn start(
         transport: transport.clone(),
         supervisor: supervisor.clone(),
         stop: stop.clone(),
+        #[cfg(test)]
+        console: jail.console.clone(),
+        #[cfg(test)]
+        startup: serde_json::json!({
+            "path": path,
+            "prepareMs": ms(phases.prepared),
+            "spawnMs": ms(phases.spawned - phases.prepared),
+            "configureMs": ms(phases.configured - phases.spawned),
+            "agentMs": ms(phases.hello - phases.configured),
+            "prewarmMs": ms(phases.prewarmed - phases.hello),
+            "claimMs": ms(claimed - phases.prewarmed),
+            "guestReadyMs": ms(booted - claimed),
+            "deploymentMs": ms(began.elapsed() - booted),
+            "ms": ms(began.elapsed()),
+        }),
     };
-    #[cfg(test)]
-    let test_console = jail.console.clone();
     let pid = jail.pid;
     let task = tokio::spawn(async move {
         let (reason, status) = assigned_supervisor::wait(
@@ -3740,8 +3776,6 @@ async fn start(
     Ok(Vm {
         client,
         task: Some(task),
-        #[cfg(test)]
-        console: test_console,
         #[cfg(test)]
         path,
     })

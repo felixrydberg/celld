@@ -337,6 +337,10 @@ Unknown class names, container aliases (`dev`, `standard`) and raw `vcpus` or
 with their CPU allocation enforced by the VM's own cgroup v2 `cpu.max` quota.
 CPU quotas are maxima. Admission does not reserve host CPU cores, and contention
 can reduce service below the class ceiling; quotas promise no minimum share.
+Startup is the exception. Until its Ready frame, a fractional-class VM runs at its
+whole vCPU while restoring, prewarming and loading its application, if the node
+has boost slots free (half its CPUs, counted in vCPUs). A waiting pool VM and a
+ready VM are held to the class quota.
 Classes have no per-class disk allocation; handler and runtime drives remain
 read-only. The node admits the selected class only if its capacity permits it.
 

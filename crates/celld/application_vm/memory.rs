@@ -395,6 +395,24 @@ pub(super) async fn request(
     body
 }
 
+/// The host `vm_startup` record and the guest's initialization timings, read
+/// from the `key=value` fields its tracing writes to the console.
+fn launch(client: &VmClient, class: ApplicationSizeClass, mode: &str) -> Value {
+    let console = client.console();
+    let phases = |event: &str| {
+        let line = console.lines().find(|line| line.contains(event))?;
+        let fields: serde_json::Map<_, _> = line
+            .split_whitespace()
+            .filter_map(|field| field.split_once('='))
+            .filter_map(|(key, value)| Some((key.to_owned(), json!(value.parse::<f64>().ok()?))))
+            .collect();
+        Some(fields)
+    };
+    json!({"kind":"launch","class":class,"mode":mode,"host":client.startup,
+        "application":phases("guest_application_initialization"),
+        "worker":phases("guest_worker_initialization")})
+}
+
 pub(super) async fn no_vms(pool: &VmPool, owned: fn() -> HashSet<u32>) {
     timeout(Duration::from_secs(30), async {
         while !owned().is_empty() || pool.snapshot().vms != 0 {
@@ -491,6 +509,7 @@ pub(super) async fn run(
                 request(app, &client, "/status", &recorder, class).await["retained"],
                 false
             );
+            recorder.emit(launch(&client, class, "initial"));
             recorder
                 .sample("application-ready", class, &pool, &client, owned)
                 .await;
@@ -581,6 +600,65 @@ pub(super) async fn run(
             // A startup pool may retain or refill unassigned VMs; physical reap
             // of every VMM is proved at pool shutdown, not inferred from RSS.
             recorder.host("assigned-retirement", Some(class), &pool, owned);
+
+            // The initial launch above was a pool miss: a class is refilled only
+            // once needed. A second application claims that refill (startup 1)
+            // or restores again (startup 0).
+            recorder.context("fresh-acquire", Some(class), startup);
+            if startup > 0 {
+                // Reaping every waiting VM times one clean refill. Other classes'
+                // refills would take the slots it needs (refill never takes the
+                // last one), so only this class stays needed while it waits.
+                for idle in pool.templates.evict_all() {
+                    pool.reap(idle);
+                }
+                let mib = class.resources().1;
+                let refill = Instant::now();
+                timeout(Duration::from_secs(60), async {
+                    while !pool.templates.status()["templates"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["memoryMib"] == mib && t["idle"].as_u64() >= Some(1))
+                    {
+                        for idle in pool.templates.focus(mib) {
+                            pool.reap(idle);
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .expect("startup pool did not refill");
+                // Wall clock: includes the reaps it waited for and the 200 ms warmer tick.
+                recorder.emit(json!({"kind":"refill","class":class,
+                    "latencyUs":refill.elapsed().as_micros()}));
+                // Let the guest settle before sampling its idle memory.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                recorder.host("pool-waiting", Some(class), &pool, owned);
+            }
+            let application = stage(
+                store,
+                options,
+                &format!("memory-{startup}-{index}-fresh"),
+                class,
+            )
+            .await;
+            let began = Instant::now();
+            let lease = pool
+                .acquire(app, &application, &deployment, &handler)
+                .await
+                .unwrap();
+            recorder.emit(json!({"kind":"acquire","class":class,"mode":"fresh",
+                "latencyUs":began.elapsed().as_micros()}));
+            request(app, &lease, "/status", &recorder, class).await;
+            let fresh = launch(&lease, class, "fresh");
+            assert_eq!(
+                fresh["host"]["path"],
+                if startup > 0 { "pool" } else { "restore" }
+            );
+            recorder.emit(fresh);
+            drop(lease);
+            pool.retire_deployment(&application, &deployment).await;
         }
         stop.cancel();
         sampler.await.unwrap();

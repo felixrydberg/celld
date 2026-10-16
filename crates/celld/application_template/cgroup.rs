@@ -207,6 +207,11 @@ impl Leaf {
         sample(&self.directory, "memory.events.local")
     }
 
+    pub(crate) fn set_cpu_max(&self, value: &str) -> Result<()> {
+        ensure!(self.spawned && !self.removed, "VM cgroup not live");
+        write(&self.directory, "cpu.max", value)
+    }
+
     /// A descriptor-owned writer; the Jail retains and joins its blocking task.
     pub(crate) fn memory_limit(&self) -> Result<MemoryLimit> {
         ensure!(self.spawned && !self.removed, "VM cgroup not live");
