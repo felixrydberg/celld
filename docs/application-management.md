@@ -249,7 +249,7 @@ All requests require one `Authorization: Bearer TOKEN` header. `BASE` is
 | Method/path | Body/result |
 |---|---|
 | `GET /v1/applications?limit=100&cursor=TOKEN` | One page: `applications:[{"application":{...},"revision":{"token":"..."}}]`, `next_cursor` (null at the end); no fleet revision |
-| `GET BASE` | `application` (metadata, including `route_ids` and `asset_route_id`), `hostnames` (served handlers), `asset_hostname` (active static route, otherwise null), `runtime` (node-observed state), `revision` |
+| `GET BASE` | `application` (metadata, including `route_ids` and `asset_route_id`), `hostnames` (served handlers), `asset_hostname` (active static route, otherwise null), `revision` |
 | `POST BASE` | `{"revision":{"token":null}}` to create an absent application |
 | `PUT BASE/resources` | `{"revision":{"token":"..."},"resource":{...}}` |
 | `PUT BASE/deployments/VERSION` | Full immutable deployment manifest; path and body identities must agree |
@@ -283,16 +283,9 @@ legacy fleet catalog are unsupported; there is no migration reader.
 
 ## Status
 
-`get` returns two separate things. `application` is what is meant to run
-(resources are registered, not provisioned). `runtime` is what nodes reported:
-one record per node that has observed anything, with `node`,
-`observed_at_unix_secs` and, per handler, `deployment`, `handler` and a state of
-`launching`, `serving`, `draining` or `failed` with a fixed host-chosen reason
-(unapproved image, launch failed, unproved reap; raw errors stay in host logs).
-Each node overwrites its own record, and deletes it when it has nothing to
-report and at drain. An empty list means no node has reported; an old timestamp
-means a crashed node may have left a stale record (at most 64 records are
-returned). Handlers active in application metadata but not yet launched have no entry.
+`get` returns what is meant to run: `application` (resources are registered,
+not provisioned). Nodes report no per-handler runtime state; launch failures and
+reaps are in each node's logs.
 
 ## Secrets and limits
 
@@ -337,6 +330,10 @@ Unknown class names, container aliases (`dev`, `standard`) and raw `vcpus` or
 with their CPU allocation enforced by the VM's own cgroup v2 `cpu.max` quota.
 CPU quotas are maxima. Admission does not reserve host CPU cores, and contention
 can reduce service below the class ceiling; quotas promise no minimum share.
+Startup is the exception. Until its Ready frame, a fractional-class VM runs at its
+whole vCPU while restoring, prewarming and loading its application, if the node
+has boost slots free (half its CPUs, counted in vCPUs). A waiting pool VM and a
+ready VM are held to the class quota.
 Classes have no per-class disk allocation; handler and runtime drives remain
 read-only. The node admits the selected class only if its capacity permits it.
 

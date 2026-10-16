@@ -395,6 +395,56 @@ pub(super) async fn request(
     body
 }
 
+/// The host `vm_startup` record and the guest's initialization timings, read
+/// from the `key=value` fields its tracing writes to the console.
+fn launch(client: &VmClient, class: ApplicationSizeClass, mode: &str) -> Value {
+    let console = client.console();
+    let phases = |event: &str| {
+        let line = console.lines().find(|line| line.contains(event))?;
+        let fields: serde_json::Map<_, _> = line
+            .split_whitespace()
+            .filter_map(|field| field.split_once('='))
+            .filter_map(|(key, value)| Some((key.to_owned(), json!(value.parse::<f64>().ok()?))))
+            .collect();
+        Some(fields)
+    };
+    json!({"kind":"launch","class":class,"mode":mode,"host":client.startup,
+        "application":phases("guest_application_initialization"),
+        "worker":phases("guest_worker_initialization"),
+        "acquire":std::mem::take(&mut *TIMINGS.lock().unwrap())})
+}
+
+/// Host acquire timings logged since the last launch record.
+static TIMINGS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+struct Timings;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Timings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Fields(serde_json::Map<String, Value>);
+        impl tracing::field::Visit for Fields {
+            fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+                self.0.insert(field.name().into(), json!(value));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().into(), json!(value));
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().into(), json!(format!("{value:?}")));
+            }
+        }
+        let mut fields = Fields(Default::default());
+        event.record(&mut fields);
+        if matches!(
+            fields.0.get("event").and_then(Value::as_str),
+            Some("vm_acquire" | "vm_launch")
+        ) {
+            TIMINGS.lock().unwrap().push(Value::Object(fields.0));
+        }
+    }
+}
+
 pub(super) async fn no_vms(pool: &VmPool, owned: fn() -> HashSet<u32>) {
     timeout(Duration::from_secs(30), async {
         while !owned().is_empty() || pool.snapshot().vms != 0 {
@@ -456,14 +506,7 @@ pub(super) async fn run(
     let handler = name("memory");
     for startup in [0, 1] {
         recorder.context("template-bootstrap", None, startup);
-        let pool = Arc::new(
-            VmPool::new(
-                config(options, startup, 120),
-                store.clone(),
-                format!("memory-pool-{startup}"),
-            )
-            .unwrap(),
-        );
+        let pool = Arc::new(VmPool::new(config(options, startup, 120), store.clone()).unwrap());
         let (stop, sampler) = recorder.start_sampler(&pool, owned);
         recorder.host("before-template", None, &pool, owned);
         let began = Instant::now();
@@ -491,6 +534,7 @@ pub(super) async fn run(
                 request(app, &client, "/status", &recorder, class).await["retained"],
                 false
             );
+            recorder.emit(launch(&client, class, "initial"));
             recorder
                 .sample("application-ready", class, &pool, &client, owned)
                 .await;
@@ -581,6 +625,65 @@ pub(super) async fn run(
             // A startup pool may retain or refill unassigned VMs; physical reap
             // of every VMM is proved at pool shutdown, not inferred from RSS.
             recorder.host("assigned-retirement", Some(class), &pool, owned);
+
+            // The initial launch above was a pool miss: a class is refilled only
+            // once needed. A second application claims that refill (startup 1)
+            // or restores again (startup 0).
+            recorder.context("fresh-acquire", Some(class), startup);
+            if startup > 0 {
+                // Reaping every waiting VM times one clean refill. Other classes'
+                // refills would take the slots it needs (refill never takes the
+                // last one), so only this class stays needed while it waits.
+                for idle in pool.templates.evict_all() {
+                    pool.reap(idle);
+                }
+                let mib = class.resources().1;
+                let refill = Instant::now();
+                timeout(Duration::from_secs(60), async {
+                    while !pool.templates.status()["templates"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|t| t["memoryMib"] == mib && t["idle"].as_u64() >= Some(1))
+                    {
+                        for idle in pool.templates.focus(mib) {
+                            pool.reap(idle);
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .expect("startup pool did not refill");
+                // Wall clock: includes the reaps it waited for and the 200 ms warmer tick.
+                recorder.emit(json!({"kind":"refill","class":class,
+                    "latencyUs":refill.elapsed().as_micros()}));
+                // Let the guest settle before sampling its idle memory.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                recorder.host("pool-waiting", Some(class), &pool, owned);
+            }
+            let application = stage(
+                store,
+                options,
+                &format!("memory-{startup}-{index}-fresh"),
+                class,
+            )
+            .await;
+            let began = Instant::now();
+            let lease = pool
+                .acquire(app, &application, &deployment, &handler)
+                .await
+                .unwrap();
+            recorder.emit(json!({"kind":"acquire","class":class,"mode":"fresh",
+                "latencyUs":began.elapsed().as_micros()}));
+            request(app, &lease, "/status", &recorder, class).await;
+            let fresh = launch(&lease, class, "fresh");
+            assert_eq!(
+                fresh["host"]["path"],
+                if startup > 0 { "pool" } else { "restore" }
+            );
+            recorder.emit(fresh);
+            drop(lease);
+            pool.retire_deployment(&application, &deployment).await;
         }
         stop.cancel();
         sampler.await.unwrap();
@@ -591,9 +694,7 @@ pub(super) async fn run(
 
     // Bounded sustained requests and simultaneous work in two distinct VMs.
     recorder.context("burst-template-bootstrap", None, 0);
-    let pool = Arc::new(
-        VmPool::new(config(options, 0, 30), store.clone(), "memory-burst".into()).unwrap(),
-    );
+    let pool = Arc::new(VmPool::new(config(options, 0, 30), store.clone()).unwrap());
     let (stop, sampler) = recorder.start_sampler(&pool, owned);
     pool.prepare(app).await.unwrap();
     recorder.context("burst-workload", Some(ApplicationSizeClass::Lite), 0);
@@ -714,9 +815,15 @@ async fn t33_memory_followons() {
 }
 
 pub(super) async fn bridge_check(application: &str) {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_test_writer()
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::prelude::*;
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_test_writer()
+                .with_filter(LevelFilter::WARN),
+        )
+        .with(Timings.with_filter(LevelFilter::INFO))
         .try_init();
     crate::asyncrt::bind_test_runtime();
     assert!(std::env::var_os("CELLD_APPLICATION_JAVASCRIPT_TEST_VM_IMAGE").is_some());
@@ -904,14 +1011,7 @@ async fn run_followons(
         "remaining":["pause/thaw timer/clock/heartbeat/retained-client wakes",
             "repeat trials","regression/pressure thresholds","16GiB density target selection"]}));
 
-    let pool = Arc::new(
-        VmPool::new(
-            config(options, 0, 120),
-            store.clone(),
-            "memory-followons".into(),
-        )
-        .unwrap(),
-    );
+    let pool = Arc::new(VmPool::new(config(options, 0, 120), store.clone()).unwrap());
     let (stop, sampler) = recorder.start_sampler(&pool, owned);
     pool.prepare(app).await.unwrap();
     recorder.disk(&pool);

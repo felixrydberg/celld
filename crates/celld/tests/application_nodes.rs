@@ -1627,16 +1627,6 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
     }
     assert_ne!(status(one.internal, "other.test", &format!("/do/{object}")).await, 200);
     assert_eq!(get(one.public, "route.test", "/bump?name=o1").await, "o1:7");
-    let status = store.status(&application).await.unwrap();
-    assert_eq!(status.len(), 2);
-    let mut reported: Vec<_> = status.iter().map(|item| item.node.clone()).collect();
-    reported.sort();
-    let mut expected = vec![
-        format!("127.0.0.1:{}", one.internal),
-        format!("127.0.0.1:{}", two.internal),
-    ];
-    expected.sort();
-    assert_eq!(reported, expected);
     // T14: application queues. The first use fixes each queue's owner, here
     // node two; its alarm dispatches batches to the consumer handler's VM there,
     // and the log lives in the application's own D1 database. A second
@@ -1767,9 +1757,7 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
         assert_eq!(&cron_rows(&one, host).await, before, "{host}: a withdrawn trigger ran");
     }
     drain(two).await;
-    assert_eq!(store.status(&application).await.unwrap().len(), 1);
     drain(one).await;
-    assert!(store.status(&application).await.unwrap().is_empty());
     // The script-path fixtures cannot durably hand armed alarms over. Exit
     // does not revoke their last node lease; wait for the real fence before
     // the replicated phase can acquire their old scopes.
@@ -1875,7 +1863,6 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
         "armed"
     );
     drain(application_only).await;
-    assert!(store.status(&application).await.unwrap().is_empty());
     // Cold ownership recovery can take tens of seconds; this fixture budget
     // must cover it as well as the queue handler. Production defaults stay intact.
     let budget = [("CELLD_HANDLER_BUDGET_S", "60")];
@@ -2044,9 +2031,7 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
     assert_eq!(delivered(&rows, "jobs", 200), [1, 2], "{rows:?}");
     assert_eq!(rows.len(), 2, "{rows:?}");
     drain(peer).await;
-    assert_eq!(store.status(&application).await.unwrap().len(), 1);
     drain(moved).await;
-    assert!(store.status(&application).await.unwrap().is_empty());
     // T20: replacement under load on a real node, then a drain with retained
     // work. The same code under another LABEL replaces `one` while a slow
     // request, a retained waitUntil and a delayed object write started on `one`
@@ -2064,6 +2049,7 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
     let mut roomy: serde_json::Value = serde_json::from_slice(&std::fs::read(&vms).unwrap()).unwrap();
     roomy["max_vms"] = serde_json::json!(4);
     roomy["max_memory_mib"] = serde_json::json!(12288);
+    roomy["startup_pool"] = serde_json::json!(0);
     let roomy_vms = directory.join("lifecycle-vms.json");
     std::fs::write(&roomy_vms, roomy.to_string()).unwrap();
     let lifecycle = start(directory, "lifecycle", Some(&roomy_vms), true, "", &budget).await;
@@ -2110,6 +2096,13 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
         })
         .collect();
     tokio::time::sleep(Duration::from_millis(500)).await;
+    let old_vm_pids = vm_pids(&lifecycle);
+    assert_eq!(
+        old_vm_pids.len(),
+        1,
+        "expected exactly one VM candidate before replacement: {old_vm_pids:?}"
+    );
+    let old_vm_pid = old_vm_pids[0];
     let mut snapshot = store.read(&swap.application).await.unwrap();
     store.activate(&mut snapshot, swap).await.unwrap();
     store.commit(snapshot).await.unwrap();
@@ -2170,20 +2163,12 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
     .expect("the retained waitUntil work was lost with the replaced deployment");
     // Its VM goes once that work has settled, not at the 600 s idle TTL.
     timeout(Duration::from_secs(30), async {
-        loop {
-            let statuses = store.status(&application).await.unwrap();
-            if !statuses
-                .iter()
-                .flat_map(|status| &status.handlers)
-                .any(|handler| handler.deployment.as_str() == "one")
-            {
-                break;
-            }
+        while Path::new(&format!("/proc/{old_vm_pid}")).exists() {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     })
     .await
-    .expect("the replaced deployment's VM was not retired once its work settled");
+    .expect("the replaced deployment's VM was not reaped once its work settled");
     // A drain settles accepted background work before it hands ownership over.
     assert_eq!(
         request(port, "/bg?ms=3000".into()).await,
@@ -2192,7 +2177,6 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
     let handed_off = vm_pids(&lifecycle);
     assert!(!handed_off.is_empty(), "no VM held the retained work");
     drain(lifecycle).await;
-    assert!(store.status(&application).await.unwrap().is_empty());
     // The successor adopts the resources on a fresh VM: nothing the old owner's
     // VM held is still running, and the object continues from its last write.
     let adopted = start(directory, "lifecycle-successor", Some(&roomy_vms), true, "", &budget).await;

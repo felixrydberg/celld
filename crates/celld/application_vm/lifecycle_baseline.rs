@@ -350,14 +350,7 @@ pub(super) async fn run(
         );
         let mut configuration = config(options, 0, ttl);
         configuration.max_vms = 1;
-        let pool = Arc::new(
-            VmPool::new(
-                configuration,
-                store.clone(),
-                format!("memory-lifecycle-{ttl}"),
-            )
-            .unwrap(),
-        );
+        let pool = Arc::new(VmPool::new(configuration, store.clone()).unwrap());
         let (sampling_stop, sampling) = recorder.start_sampler(&pool, owned);
         pool.prepare(app).await.unwrap();
         recorder.disk(&pool);

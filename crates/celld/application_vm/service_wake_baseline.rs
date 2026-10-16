@@ -167,10 +167,9 @@ pub(super) async fn run(
     let mut configuration = config(options, 0, 30);
     configuration.max_vms = 2;
     configuration.max_memory_mib = u64::from(ApplicationSizeClass::Standard4.resources().1);
-    let dispatcher =
-        RouteDispatcher::new(configuration, store.clone(), "memory-service-wake".into())
-            .await
-            .unwrap();
+    let dispatcher = RouteDispatcher::new(configuration, store.clone())
+        .await
+        .unwrap();
     let pool = dispatcher.routes.pool.as_ref().unwrap();
     let host = super::tests::assigned_host(store, &application, "caller").await;
     let caller = pool

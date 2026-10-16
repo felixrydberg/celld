@@ -32,8 +32,7 @@ deployment (activate an older one to roll back; stage and activate one without
 a handler to remove it). Nodes started with --application-domain serve assets; --application-vms serves executable
 deployments.
 get shows metadata under application (resources are registered, not
-provisioned) and node-observed handler state under runtime (one record per node,
-empty until a node reports; check observed_at_unix_secs for freshness).";
+provisioned).";
 
 async fn response(request: RequestBuilder) -> anyhow::Result<Value> {
     let mut response = request

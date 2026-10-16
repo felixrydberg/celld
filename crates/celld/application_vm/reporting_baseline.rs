@@ -34,14 +34,7 @@ pub(super) async fn run(
         "idleObservationSeconds":[2,5,30],"startupPool":0,"nominalBudgetMib":24576,
         "policy":"same kernel and zero-balloon device in both arms; no forced GC or RSS admission",
         "scope":"JS/native/Wasm reporting pair; no Python or independent-host qualification"}));
-    let pool = Arc::new(
-        VmPool::new(
-            config(options, 0, 120),
-            store.clone(),
-            "memory-reporting".into(),
-        )
-        .unwrap(),
-    );
+    let pool = Arc::new(VmPool::new(config(options, 0, 120), store.clone()).unwrap());
     let (stop, sampler) = recorder.start_sampler(&pool, owned);
     pool.prepare(app).await.unwrap();
     recorder.disk(&pool);

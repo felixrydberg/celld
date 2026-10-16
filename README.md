@@ -379,6 +379,60 @@ isolate holds a dead heap until something allocates, so celld forces a
 collection when a measurement is above that share. A restart of the process
 is not necessary.
 
+## Testing on a KVM host
+
+The application VM tests boot real Firecracker VMs and need `/dev/kvm`, which
+WSL and most laptops lack. Any Ubuntu x86_64 host reachable over SSH can run
+them. `scripts/application/remote.sh` sends your working tree to the host, runs
+a command there and copies the run's `evidence/` back to
+`evidence/<host>-<time>/`.
+
+Create a key for test hosts with the full path, so it lands in your profile even
+from an elevated Windows shell (a bare file name goes to the current directory,
+`C:\Windows\System32` when elevated). Press Enter at both passphrase prompts:
+
+```sh
+ssh-keygen -t ed25519 -f C:\Users\<you>\.ssh\celld-test -C celld-test
+```
+
+On Linux or macOS use `-f ~/.ssh/celld-test`. `remote.sh` always logs in with
+`~/.ssh/celld-test`. The key has no passphrase, so use it for test hosts only.
+
+On the host, create a user for it. `from=` limits the key to your network, so a
+copied key is useless elsewhere. Adjust the range, and replace the placeholder
+`ssh-ed25519 AAAA... celld-test` with the whole line of `celld-test.pub`
+(print it with `type C:\Users\<you>\.ssh\celld-test.pub`):
+
+```sh
+sudo adduser --disabled-password --gecos "" celld
+sudo usermod -p '*' -aG kvm celld
+sudo install -d -m 700 -o celld -g celld /home/celld/.ssh
+echo 'from="192.168.1.0/24" ssh-ed25519 AAAA... celld-test' | sudo tee /home/celld/.ssh/authorized_keys > /dev/null
+sudo chown celld:celld /home/celld/.ssh/authorized_keys && sudo chmod 600 /home/celld/.ssh/authorized_keys
+echo 'celld ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/celld && sudo chmod 440 /etc/sudoers.d/celld && sudo visudo -c
+```
+
+`usermod -p '*'` matters: `adduser --disabled-password` leaves the account
+locked, and sshd refuses key logins to locked accounts.
+
+The tests run as root, so unattended runs need the passwordless `sudo` line,
+which makes the key root-equivalent on that host. Then:
+
+```sh
+# once per host: build tools, Firecracker, jailer, Rust
+scripts/application/remote.sh celld@host 'sh scripts/application/setup-kvm-host.sh'
+# one test, here the memory baseline
+scripts/application/remote.sh celld@host 'sh scripts/application/vm-test.sh \
+  application_vm::memory_baseline::t33_memory_baseline \
+  CELLD_APPLICATION_MEMORY_CHECK_ONLY=1 CELLD_APPLICATION_MEMORY_OUTPUT=evidence/memory.jsonl'
+```
+
+`remote.sh` sends every file git does not ignore, uncommitted edits included, as
+LF text to `~/celld-remote/src`; Cargo's target directory stays on the host
+between runs. `vm-test.sh` builds the guest kernel on first use (into
+`~/celld-kernel`), the static guest, its runtime image and the lib test binary,
+then runs the test as root and fails if a VMM is left over.
+
 ## Contributions
 
 Pull requests are disabled. Coding agents make it too easy to send a large,

@@ -227,8 +227,10 @@ heap settlement. Their totals are nested.
 `startup_pool` (optional, default 0) keeps that many restored VMs per template
 ready for a claim. With 0 each launch restores on demand. With `N > 0` the node
 refills each template it has needed, in the background, up to `N` waiting VMs
-with the guest agent connected and no application; a cold launch claims one
-(`path` = `pool`) instead of restoring. A waiting VM holds no application data,
+with no application; a cold launch claims one (`path` = `pool`) instead of
+restoring. Every restored VM, pooled or not, first gets fresh host entropy and
+starts its own prewarmed guest process (V8 engine and runtime), so a claim only
+loads the application. A waiting VM holds no application data,
 and a claimed VM serves only its handler and is destroyed at retirement; it never
 returns to the pool. Waiting, restoring, reaping and quarantined pool VMs count
 at their actual class memory against `max_vms` and `max_memory_mib`; refill leaves
@@ -417,7 +419,7 @@ celld application resource --app shop --file counter.json   # durable_object "co
 celld application artifact --app shop --file handler.img   # note artifact_sha256
 celld application stage    --app shop --file deployment.json
 celld application activate --app shop --deployment v1
-celld application get      --app shop                       # runtime shows serving; hostnames lists <id>.apps.example.com
+celld application get      --app shop                       # hostnames lists <id>.apps.example.com
 curl -H 'Host: <id>.apps.example.com' http://NODE_PUBLIC/...
 ```
 
@@ -490,7 +492,5 @@ Unsupported behavior fails clearly rather than degrading silently.
 - **Cron:** minute resolution, UTC, as in the original.
 - **Activation checks:** activation does not verify runtime-image approval or
   service-binding configuration (the management process has no node config);
-  those fail at first dispatch and appear as `failed` in `runtime`.
-- **Status:** a crashed node's last record persists, and handlers not yet
-  launched have no entry.
+  failures appear in the node's logs at first dispatch.
 

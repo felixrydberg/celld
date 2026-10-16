@@ -191,14 +191,7 @@ pub(super) async fn run(
         "fixtureSha256":content_digest(SOURCE.as_bytes()),"pauseSeconds":[2,5,30,2,5],
         "invocationLimitMs":60000,"policy":"plain PATCH /vm on the original assigned VM; full reservations; no GC",
         "scope":"control and retained-client survival only; no guest heartbeat claim"}));
-    let pool = Arc::new(
-        VmPool::new(
-            config(options, 0, 120),
-            store.clone(),
-            "memory-freeze".into(),
-        )
-        .unwrap(),
-    );
+    let pool = Arc::new(VmPool::new(config(options, 0, 120), store.clone()).unwrap());
     let (stop, sampler) = recorder.start_sampler(&pool, owned);
     pool.prepare(app).await.unwrap();
     recorder.disk(&pool);

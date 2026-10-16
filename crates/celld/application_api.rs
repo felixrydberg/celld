@@ -330,8 +330,7 @@ async fn inspect(
         .application(&id)
         .ok_or((StatusCode::NOT_FOUND, "application does not exist".into()))?;
     // "application" is catalog metadata (resources are registered, not
-    // provisioned); "runtime" is only what a node reported observing.
-    let runtime = state.store.status(&id).await.map_err(internal)?;
+    // provisioned).
     // Public hostname of each served handler of the active deployment.
     let hostnames: std::collections::BTreeMap<_, _> = app
         .active
@@ -346,7 +345,7 @@ async fn inspect(
     let asset_hostname = app.active.as_ref().filter(|deployment| deployment.assets.is_some())
         .and(app.asset_route_id.as_ref()).map(|id| format!("{}.{}", id.as_str(), state.platform_domain));
     Ok(Json(
-        json!({"revision": Revision::of(&snapshot), "application": app, "hostnames": hostnames, "asset_hostname": asset_hostname, "runtime": runtime}),
+        json!({"revision": Revision::of(&snapshot), "application": app, "hostnames": hostnames, "asset_hostname": asset_hostname}),
     ))
 }
 

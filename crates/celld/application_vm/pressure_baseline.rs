@@ -274,7 +274,7 @@ pub(super) async fn run(
         shared_cache_bytes: 256 * MIB,
         idle_cache: None,
     });
-    let pool = Arc::new(VmPool::new(config, store.clone(), "pressure-node".into()).unwrap());
+    let pool = Arc::new(VmPool::new(config, store.clone()).unwrap());
     let parent = Arc::new(Group::registered_parent().unwrap());
     assert_eq!(parent.scalar("memory.max").unwrap(), 14 * 1024 * MIB);
     assert_eq!(parent.scalar("memory.high").unwrap(), 13 * 1024 * MIB);

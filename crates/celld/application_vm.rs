@@ -12,10 +12,9 @@ use crate::application_javascript_guest::native_namespace_owns_object;
 use crate::application_template::{
     cold_boot, load, wait_for_api, Boot, Idle, Jail, Staged, Template, Templates,
 };
-use crate::application_template_agent::{claim, AGENT_PORT, HELLO};
+use crate::application_template_agent::{claim, prewarm, AGENT_PORT, HELLO};
 use crate::applications::{
     content_digest, Application, ApplicationLimits, ApplicationSizeClass, ApplicationStore,
-    HandlerState, HandlerStatus,
 };
 use anyhow::{ensure, Context, Result};
 use bytes::Bytes;
@@ -145,8 +144,6 @@ pub(crate) struct Exit {
 pub(crate) struct Vm {
     client: VmClient,
     task: Option<JoinHandle<Result<Exit>>>,
-    #[cfg(test)]
-    console: Arc<Mutex<Vec<u8>>>,
     /// `restore` or `cold`, as `vm_startup` reports it.
     #[cfg(test)]
     path: &'static str,
@@ -158,9 +155,19 @@ pub(crate) struct VmClient {
     transport: Client,
     supervisor: Arc<assigned_supervisor::Control>,
     stop: CancellationToken,
+    #[cfg(test)]
+    console: Arc<Mutex<Vec<u8>>>,
+    /// The `vm_startup` fields, for baselines.
+    #[cfg(test)]
+    pub(crate) startup: serde_json::Value,
 }
 
 impl VmClient {
+    /// The guest's serial console so far, a 16 KiB ring.
+    #[cfg(test)]
+    pub(crate) fn console(&self) -> String {
+        String::from_utf8_lossy(&self.console.lock().expect("VM console poisoned")).into_owned()
+    }
     #[cfg(test)]
     pub(crate) async fn invoke(
         &self,
@@ -275,6 +282,7 @@ impl Vm {
         deployment: &Name,
         handler: &Name,
     ) -> Result<Self> {
+        let began = Instant::now();
         let manifest = store
             .deployment(application, deployment)
             .await?
@@ -284,7 +292,9 @@ impl Vm {
             .application(application)
             .context("application does not exist")?;
         let mut pin = prepare_pin(&options, manifest, handler, &app.resources)?;
+        let metadata = began.elapsed();
         pin.runtime_environment = store.resolve_environment(app, &pin.handler).await?;
+        let secrets = began.elapsed();
         pin.limits = app.limits;
         let selected = pin
             .limits
@@ -302,6 +312,14 @@ impl Vm {
             .cached_artifact(application, &pin.handler.artifact_sha256)
             .await?
             .context("handler artifact is missing")?;
+        let ms = |elapsed: Duration| elapsed.as_secs_f64() * 1000.0;
+        tracing::info!(
+            event = "vm_launch",
+            metadata_ms = ms(metadata),
+            secrets_ms = ms(secrets - metadata),
+            artifact_ms = ms(began.elapsed() - secrets),
+            "application VM inputs read"
+        );
         // The shared drive goes only to a handler that declares it needs it.
         let needs_runtime = crate::application_pyodide::needs_runtime(&pin.handler)?;
         if !needs_runtime {
@@ -361,7 +379,7 @@ impl Vm {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn console(&self) -> String {
-        String::from_utf8_lossy(&self.console.lock().expect("VM console poisoned")).into_owned()
+        self.client.console()
     }
     #[cfg(test)]
     pub(crate) async fn wait(mut self) -> Result<Exit> {
@@ -910,93 +928,6 @@ struct PoolState {
     closed: bool,
 }
 
-/// Handler states this pool observed, republished per application so the
-/// management API reports launches, failures and drains rather than catalog
-/// metadata. The lock is held across the write, so records publish in order.
-struct Observed {
-    store: Arc<ApplicationStore>,
-    /// Trusted node identity; each node keeps its own record per application.
-    node: String,
-    handlers: tokio::sync::Mutex<BTreeMap<VmKey, HandlerState>>,
-}
-
-impl Observed {
-    async fn set(&self, key: &VmKey, state: Option<HandlerState>) {
-        let mut handlers = self.handlers.lock().await;
-        match state {
-            Some(state) => handlers.insert(key.clone(), state),
-            None => handlers.remove(key),
-        };
-        self.publish(&handlers, &key.0).await;
-        while handlers
-            .values()
-            .filter(|state| matches!(state, HandlerState::Failed { .. }))
-            .count()
-            > 256
-        {
-            let Some(oldest) = handlers
-                .iter()
-                .find(|(candidate, state)| {
-                    *candidate != key && matches!(state, HandlerState::Failed { .. })
-                })
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            handlers.remove(&oldest);
-            self.publish(&handlers, &oldest.0).await;
-        }
-    }
-
-    /// A replaced deployment: serving handlers drain, failures are forgotten.
-    async fn retire(&self, application: &ApplicationId, deployment: &Name) {
-        let mut handlers = self.handlers.lock().await;
-        let retired = |key: &VmKey| key.0 == *application && key.1 == *deployment;
-        handlers
-            .retain(|key, state| !(retired(key) && matches!(state, HandlerState::Failed { .. })));
-        for (_, state) in handlers.iter_mut().filter(|(key, _)| retired(key)) {
-            if *state == HandlerState::Serving {
-                *state = HandlerState::Draining;
-            }
-        }
-        self.publish(&handlers, application).await;
-    }
-
-    /// The pool is gone: it can no longer vouch for any handler.
-    async fn clear(&self) {
-        let mut handlers = self.handlers.lock().await;
-        let applications: BTreeSet<_> = handlers.keys().map(|key| key.0.clone()).collect();
-        handlers.clear();
-        for application in applications {
-            self.publish(&handlers, &application).await;
-        }
-    }
-
-    async fn publish(&self, handlers: &BTreeMap<VmKey, HandlerState>, application: &ApplicationId) {
-        let status = handlers
-            .iter()
-            .filter(|(key, _)| key.0 == *application)
-            .map(|(key, state)| HandlerStatus {
-                deployment: key.1.clone(),
-                handler: key.2.clone(),
-                state: state.clone(),
-            })
-            .collect::<Vec<_>>();
-        // A node with nothing to report keeps no record. Status is an
-        // observation: a failed write must not stop serving.
-        let written = if status.is_empty() {
-            self.store.clear_status(application, &self.node).await
-        } else {
-            self.store
-                .publish_status(application, &self.node, status)
-                .await
-        };
-        if let Err(error) = written {
-            tracing::error!(error = %format!("{error:#}"), "application status publication failed");
-        }
-    }
-}
-
 /// A leased VM. Live work prevents expiry; an unused lease does not extend retention.
 pub(crate) struct VmLease {
     client: VmClient,
@@ -1025,7 +956,6 @@ pub(crate) struct VmPool {
     config: VmHostConfig,
     store: Arc<ApplicationStore>,
     state: Arc<Mutex<PoolState>>,
-    observed: Arc<Observed>,
     changed: Arc<tokio::sync::Notify>,
     templates: Arc<Templates>,
     /// Cancelled at shutdown: ends the refill and any restore in flight.
@@ -1184,11 +1114,7 @@ impl VmPool {
         })
     }
 
-    pub(crate) fn new(
-        config: VmHostConfig,
-        store: Arc<ApplicationStore>,
-        node: String,
-    ) -> Result<Self> {
+    pub(crate) fn new(config: VmHostConfig, store: Arc<ApplicationStore>) -> Result<Self> {
         config.validate()?;
         store.enable_artifact_cache(crate::applications::ArtifactCache::new(
             Duration::from_secs(config.artifact_cache_ttl_secs.unwrap_or(600)),
@@ -1246,11 +1172,6 @@ impl VmPool {
         Ok(Self {
             config,
             service_routes: Default::default(),
-            observed: Arc::new(Observed {
-                store: store.clone(),
-                node,
-                handlers: Default::default(),
-            }),
             store,
             state,
             changed,
@@ -1656,7 +1577,6 @@ impl VmPool {
                                 self.config.clone(),
                                 self.store.clone(),
                                 self.state.clone(),
-                                self.observed.clone(),
                                 self.changed.clone(),
                                 self.templates.clone(),
                                 self.pressure.clone(),
@@ -1745,7 +1665,6 @@ impl VmPool {
         config: VmHostConfig,
         store: Arc<ApplicationStore>,
         state: Arc<Mutex<PoolState>>,
-        observed: Arc<Observed>,
         changed: Arc<tokio::sync::Notify>,
         templates: Arc<Templates>,
         pressure: Arc<Mutex<pressure::Guard>>,
@@ -1756,8 +1675,8 @@ impl VmPool {
         size_class: ApplicationSizeClass,
     ) {
         let memory = u64::from(size_class.resources().1);
-        observed.set(&key, Some(HandlerState::Launching)).await;
-        let mut reason = "launch failed";
+        let began = Instant::now();
+        let (mut checked, mut launched_at) = (Duration::ZERO, Duration::ZERO);
         let launched = async {
             let manifest = store
                 .deployment(&key.0, &key.1)
@@ -1768,9 +1687,7 @@ impl VmPool {
                 .iter()
                 .find(|handler| handler.id == key.2)
                 .context("handler is not in staged deployment")?;
-            let mut options = config
-                .options(&handler.runtime_image_sha256, templates.clone())
-                .inspect_err(|_| reason = "runtime image is not approved")?;
+            let mut options = config.options(&handler.runtime_image_sha256, templates.clone())?;
             let catalog = store.read(&key.0).await?;
             let current = catalog
                 .application(&key.0)
@@ -1790,7 +1707,9 @@ impl VmPool {
             if crate::application_pyodide::needs_runtime(handler)? {
                 options.shared = Some(templates.pyodide(&options, &app).await?);
             }
+            checked = began.elapsed();
             let vm = Vm::launch(options, &store, &key.0, &key.1, &key.2).await?;
+            launched_at = began.elapsed();
             let leases = Arc::new(());
             let client = vm.client();
             let configured = (|| -> Result<_> {
@@ -1815,10 +1734,6 @@ impl VmPool {
             Ok(vm) => vm,
             Err(error) => {
                 tracing::error!(error = %format!("{error:#}"), "application VM launch failed");
-                let failed = HandlerState::Failed {
-                    reason: reason.into(),
-                };
-                observed.set(&key, Some(failed)).await;
                 // A failed launch has already killed and waited for its VMM.
                 let mut state = state.lock().expect("VM pool poisoned");
                 state.slots.remove(&key);
@@ -1904,27 +1819,22 @@ impl VmPool {
                 retire.cancel();
             }
         }
-        observed.set(&key, Some(HandlerState::Serving)).await;
         let _ = publish.send(Some(Ok(client.clone())));
         changed.notify_waiters();
+        let ms = |elapsed: Duration| elapsed.as_secs_f64() * 1000.0;
+        tracing::info!(
+            event = "vm_acquire",
+            check_ms = ms(checked),
+            launch_ms = ms(launched_at - checked),
+            assign_ms = ms(began.elapsed() - launched_at),
+            "application VM published"
+        );
         crate::asyncrt::select! {
             _ = retire.cancelled() => {}
             _ = client.stop.cancelled() => {}
         }
         retire.cancel();
-        observed.set(&key, Some(HandlerState::Draining)).await;
         let reaped = vm.shutdown().await;
-        // Before the slot is freed, so a relaunch of this key cannot be erased.
-        let failed = match &reaped {
-            Ok(exit) if exit.reason == "memory limit exhausted" => Some(HandlerState::Failed {
-                reason: "memory limit exhausted".into(),
-            }),
-            Err(_) => Some(HandlerState::Failed {
-                reason: "VM reap unproved; capacity quarantined".into(),
-            }),
-            _ => None,
-        };
-        observed.set(&key, failed).await;
         let mut state = state.lock().expect("VM pool poisoned");
         if matches!(state.slots.get(&key), Some(Slot::Ready(ready)) if Arc::ptr_eq(&ready.client.pin, &client.pin))
         {
@@ -1963,7 +1873,6 @@ impl VmPool {
             Self::sweep(&mut state, Duration::from_secs(self.config.idle_ttl_secs));
         }
         self.changed.notify_waiters();
-        self.observed.retire(application, deployment).await;
     }
 
     /// Rollback: a deployment that is active again may lease and launch.
@@ -2005,7 +1914,6 @@ impl VmPool {
                     "application VM reap unproved for {} VMs",
                     snapshot.quarantined + stuck
                 );
-                self.observed.clear().await;
                 self.templates.discard().await?;
                 return Ok(());
             }
@@ -2586,11 +2494,7 @@ impl RouteDispatcher {
     }
 
     /// Serves the committed catalog from its first request.
-    pub(crate) async fn new(
-        config: VmHostConfig,
-        store: Arc<ApplicationStore>,
-        node: String,
-    ) -> Result<Self> {
+    pub(crate) async fn new(config: VmHostConfig, store: Arc<ApplicationStore>) -> Result<Self> {
         let fence = config.container_fence_image.clone();
         let domain = config.platform_domain.clone();
         let scopes = ScopeCache {
@@ -2601,7 +2505,7 @@ impl RouteDispatcher {
             ..Default::default()
         };
         let routes = Arc::new(Routes {
-            pool: Some(VmPool::new(config, store.clone(), node)?),
+            pool: Some(VmPool::new(config, store.clone())?),
             store,
             domain,
             scopes: Mutex::new(scopes),
@@ -3107,7 +3011,6 @@ static HOSTED: std::sync::OnceLock<RouteDispatcher> = std::sync::OnceLock::new()
 pub async fn host(
     config: &Path,
     bucket: crate::bucket::Bucket,
-    node: String,
     app: &crate::actor::AppHandle,
 ) -> Result<()> {
     ensure!(HOSTED.get().is_none(), "application VMs are already hosted");
@@ -3115,8 +3018,7 @@ pub async fn host(
         .await
         .context("read application VM configuration")?;
     let config = serde_json::from_slice(&config).context("invalid application VM configuration")?;
-    let dispatcher =
-        RouteDispatcher::new(config, Arc::new(ApplicationStore::new(bucket)), node).await?;
+    let dispatcher = RouteDispatcher::new(config, Arc::new(ApplicationStore::new(bucket))).await?;
     if let Err(error) = dispatcher.routes.pool()?.prepare(app).await {
         let cleanup = dispatcher.shutdown().await;
         return Err(error.context(format!("application startup failed; cleanup: {cleanup:?}")));
@@ -3365,8 +3267,9 @@ struct Started {
     booted: Duration,
 }
 
-/// A restore from `template`, else a cold boot into template mode, until the
-/// guest agent says hello: a VM that no application has claimed. `abandoned`
+/// A restore from `template`, else a cold boot into template mode, then the
+/// prewarm, until the prewarmed guest says hello: a VM that no application has
+/// claimed. `abandoned`
 /// ends the boot early. A failed boot has killed and reaped its VMM.
 async fn boot(
     options: &LaunchOptions,
@@ -3408,13 +3311,20 @@ async fn boot(
         let configured = began.elapsed();
         // A restore resets the agent's connection and it dials again, so the
         // host never sees the template's own.
+        let (mut agent_stream, _) = agent.accept().await?;
+        ensure!(agent_stream.read_u8().await? == HELLO, "guest agent hello");
+        let hello = began.elapsed();
+        // Fresh entropy for this VM alone; the agent then execs the prewarmed
+        // guest, which starts the generic runtime and dials again.
+        agent_stream.write_all(&prewarm()?).await?;
         let (mut guest, _) = agent.accept().await?;
-        ensure!(guest.read_u8().await? == HELLO, "guest agent hello");
+        ensure!(guest.read_u8().await? == HELLO, "prewarmed guest hello");
         let boot = Boot {
             prepared,
             spawned,
             configured,
-            hello: began.elapsed(),
+            hello,
+            prewarmed: began.elapsed(),
         };
         Ok((guest, boot))
     };
@@ -3429,6 +3339,8 @@ async fn boot(
             },
         }
     };
+    // Boosted since spawn; an unclaimed VM waits at its class quota.
+    let result = result.and_then(|started| jail.settle().map(|()| started));
     match result {
         Ok((guest, boot)) => Ok(Idle {
             jail,
@@ -3495,6 +3407,8 @@ async fn claim_vm(
     } = idle;
     let pid = jail.pid;
     let (api, root) = (jail.root.join("api.sock"), jail.root.clone());
+    // Loading the application runs at full vCPUs until its Ready frame.
+    jail.boost();
     let startup = async {
         let image_bytes = point_drive(&api, &root, "handler", image).await?;
         let shared_bytes = match shared {
@@ -3532,6 +3446,7 @@ async fn claim_vm(
             },
         }
     };
+    let result = result.and_then(|ready| jail.settle().map(|()| ready));
     match result {
         Ok((dispatcher, claimed)) => Ok(Started {
             jail,
@@ -3580,6 +3495,7 @@ async fn start(
     image: PathBuf,
     reply: &mut oneshot::Sender<Result<Vm>>,
 ) -> Result<Vm> {
+    let entered = Instant::now();
     ensure!(
         unsafe { libc::geteuid() } == 0,
         "jailed VM launch requires the trusted root supervisor"
@@ -3678,6 +3594,8 @@ async fn start(
         event = "vm_startup",
         path,
         pid = jail.pid,
+        // Checks, bootstrap and template lookup before the boot or the claim.
+        admission_ms = ms(began.saturating_duration_since(entered)),
         // A pool VM was prepared earlier: its time starts at the claim.
         prepare_ms = ms(phases.prepared),
         spawn_ms = ms(phases.spawned - phases.prepared),
@@ -3685,8 +3603,10 @@ async fn start(
         configure_ms = ms(phases.configured - phases.spawned),
         // Until the guest agent is connected (cold: the boot; restore: the redial).
         agent_ms = ms(phases.hello - phases.configured),
-        claim_ms = ms(claimed - phases.hello),
-        // The application guest, started by the claim, until its Ready frame.
+        // Reseed, exec and the generic runtime, until the prewarmed guest dials.
+        prewarm_ms = ms(phases.prewarmed - phases.hello),
+        claim_ms = ms(claimed - phases.prewarmed),
+        // The application, loaded by the claim, until its Ready frame.
         guest_ready_ms = ms(booted - claimed),
         deployment_ms = ms(began.elapsed() - booted),
         ms = ms(began.elapsed()),
@@ -3700,9 +3620,23 @@ async fn start(
         transport: transport.clone(),
         supervisor: supervisor.clone(),
         stop: stop.clone(),
+        #[cfg(test)]
+        console: jail.console.clone(),
+        #[cfg(test)]
+        startup: serde_json::json!({
+            "path": path,
+            "admissionMs": ms(began.saturating_duration_since(entered)),
+            "prepareMs": ms(phases.prepared),
+            "spawnMs": ms(phases.spawned - phases.prepared),
+            "configureMs": ms(phases.configured - phases.spawned),
+            "agentMs": ms(phases.hello - phases.configured),
+            "prewarmMs": ms(phases.prewarmed - phases.hello),
+            "claimMs": ms(claimed - phases.prewarmed),
+            "guestReadyMs": ms(booted - claimed),
+            "deploymentMs": ms(began.elapsed() - booted),
+            "ms": ms(began.elapsed()),
+        }),
     };
-    #[cfg(test)]
-    let test_console = jail.console.clone();
     let pid = jail.pid;
     let task = tokio::spawn(async move {
         let (reason, status) = assigned_supervisor::wait(
@@ -3740,8 +3674,6 @@ async fn start(
     Ok(Vm {
         client,
         task: Some(task),
-        #[cfg(test)]
-        console: test_console,
         #[cfg(test)]
         path,
     })

@@ -425,8 +425,7 @@ pub(super) async fn run(
     let mut configuration = config(options, 0, ttl);
     configuration.max_vms = 3;
     configuration.memory_guard = Some(guard(cache));
-    let pool =
-        Arc::new(VmPool::new(configuration, store.clone(), format!("density-{arm}")).unwrap());
+    let pool = Arc::new(VmPool::new(configuration, store.clone()).unwrap());
     let parent = Group::registered_parent().unwrap();
     let (stop, sampler) = recorder.start_sampler(&pool, owned);
     pool.templates.begin_startup();

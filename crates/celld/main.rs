@@ -4562,7 +4562,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         prepare_with_unhealthy_listeners(
             &listener,
             &internal_listener,
-            celld::application_vm::host(config, bucket, app.advertise.clone(), &app),
+            celld::application_vm::host(config, bucket, &app),
         )
         .await
         .context("prepare application startup caches")?;

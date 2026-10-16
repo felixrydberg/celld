@@ -422,7 +422,7 @@ pub(super) async fn run(
     let mut configuration = config(options, 0, 30);
     configuration.max_vms = 3;
     configuration.memory_guard = Some(guard());
-    let pool = Arc::new(VmPool::new(configuration, store.clone(), "cache-node".into()).unwrap());
+    let pool = Arc::new(VmPool::new(configuration, store.clone()).unwrap());
     let parent = Arc::new(Group::registered_parent().unwrap());
     let (sampling_stop, sampling) = recorder.start_sampler(&pool, owned);
     timeout(Duration::from_secs(1500), pool.prepare(app))

@@ -5,11 +5,14 @@
 //! Guest side of a snapshot start (T26). A template VM boots `celld-guest
 //! --template` instead of the application guest: this agent holds no V8 and no
 //! random state. It dials the host, and after a snapshot restore (which resets
-//! the connection) dials again. A claim reseeds the kernel, sets the clock,
-//! mounts the handler's read-only image (and the shared Pyodide runtime, for
-//! a Python handler) that the host pointed the template's placeholder drives
-//! at, and `exec`s the application guest, so V8 and Rust draw fresh randomness
-//! in a fresh process. The claim format lives here, shared with the host.
+//! the connection) dials again. A prewarm reseeds the kernel, sets the clock and
+//! `exec`s `celld-guest --prewarm`, so V8 and Rust draw fresh randomness in a
+//! fresh process of this VM alone. That process starts the generic runtime
+//! before any application is known, then dials again and waits for its claim.
+//! A claim reseeds once more, sets the clock and mounts the handler's read-only
+//! image (and the shared Pyodide runtime, for a Python handler) that the host
+//! pointed the template's placeholder drives at. The message formats live
+//! here, shared with the host.
 
 use anyhow::{ensure, Context, Result};
 use celld_applications::bootstrap::DISK_BYTES;
@@ -22,6 +25,7 @@ use std::time::{Duration, Instant};
 pub(crate) const AGENT_PORT: u32 = 5003;
 pub(crate) const HELLO: u8 = b'R';
 const CLAIM: u8 = b'C';
+const PREWARM: u8 = b'W';
 const BOOTSTRAP: &str = "/run/bootstrap.bin";
 /// The template's placeholder drives, in the order the host attaches them.
 const HANDLER_DEVICE: &str = "/dev/vdb";
@@ -40,13 +44,7 @@ const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
 /// has already pointed the placeholder drives at. The guest answers one byte: 0
 /// once it is assigned, else 1 and the reason.
 pub(crate) fn claim(bootstrap: &[u8], image_bytes: u64, shared_bytes: u64) -> Result<Vec<u8>> {
-    let mut entropy = [0; 32];
-    getrandom::fill(&mut entropy).map_err(|error| anyhow::anyhow!("host entropy: {error}"))?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
-    let mut message = vec![CLAIM];
-    message.extend(entropy);
-    message.extend(now.as_secs().to_le_bytes());
-    message.extend(now.subsec_nanos().to_le_bytes());
+    let mut message = fresh(CLAIM)?;
     message.extend((u32::try_from(bootstrap.len())?).to_le_bytes());
     message.extend(bootstrap);
     message.extend(image_bytes.to_le_bytes());
@@ -54,55 +52,92 @@ pub(crate) fn claim(bootstrap: &[u8], image_bytes: u64, shared_bytes: u64) -> Re
     Ok(message)
 }
 
-/// Runs until a claim `exec`s the application guest, so it returns only on error.
+/// A prewarm: `PREWARM`, 32 bytes of host entropy and the wall clock, as a
+/// claim begins. The guest answers by dialing again from its prewarmed process.
+pub(crate) fn prewarm() -> Result<Vec<u8>> {
+    fresh(PREWARM)
+}
+
+fn fresh(tag: u8) -> Result<Vec<u8>> {
+    let mut entropy = [0; 32];
+    getrandom::fill(&mut entropy).map_err(|error| anyhow::anyhow!("host entropy: {error}"))?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let mut message = vec![tag];
+    message.extend(entropy);
+    message.extend(now.as_secs().to_le_bytes());
+    message.extend(now.subsec_nanos().to_le_bytes());
+    Ok(message)
+}
+
+/// Runs until a prewarm `exec`s the prewarmed guest, so it returns only on error.
 pub fn run() -> Result<()> {
     loop {
-        let Ok(mut stream) = crate::application_javascript_guest::connect(AGENT_PORT) else {
-            std::thread::sleep(Duration::from_millis(2));
-            continue;
-        };
-        if stream.write_all(&[HELLO]).is_err() {
-            continue;
-        }
-        // Idle until claimed: a socket timeout is not an error, a reset or a
-        // close (a restore resets the connection) means dial again.
-        let mut tag = [0];
-        let claimed = loop {
-            match stream.read(&mut tag) {
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    ) => {}
-                Ok(1) => break tag[0] == CLAIM,
-                _ => break false,
-            }
-        };
-        if !claimed {
+        let mut stream = dial();
+        // Idle until told to prewarm: a reset or a close (a restore resets the
+        // connection) means dial again.
+        if wait(&mut stream) != Some(PREWARM) {
             continue;
         }
-        return match assign(&mut stream) {
-            Ok(shared) => {
-                stream.write_all(&[0])?;
-                // CLOEXEC closes the agent socket; the guest dials its own.
-                let mut guest = std::process::Command::new(std::env::current_exe()?);
-                guest.args(["--application", BOOTSTRAP, ROOT]);
-                if shared {
-                    guest.arg(SHARED_ROOT);
-                }
-                Err(guest.exec()).context("exec application guest")
-            }
-            Err(error) => {
-                let _ = stream.write_all(&[1]);
-                let _ = stream.write_all(format!("{error:#}").as_bytes());
-                Err(error)
-            }
-        };
+        reseed_and_set_clock(&mut stream)?;
+        // CLOEXEC closes the agent socket; the prewarmed guest dials its own.
+        let mut guest = std::process::Command::new(std::env::current_exe()?);
+        return Err(guest.arg("--prewarm").exec()).context("exec prewarmed guest");
     }
 }
 
-/// Whether the shared runtime was mounted too.
-fn assign(stream: &mut impl Read) -> Result<bool> {
+/// The prewarmed guest, once its generic runtime is up: waits for the claim and
+/// returns the bootstrap, the handler root and, for a Python handler, the
+/// shared runtime root, all in place. A refused claim tells the host why.
+pub fn claimed() -> Result<(&'static str, &'static str, Option<&'static str>)> {
+    let mut stream = dial();
+    ensure!(
+        wait(&mut stream) == Some(CLAIM),
+        "prewarmed guest lost its host"
+    );
+    match assign(&mut stream) {
+        Ok(shared) => {
+            stream.write_all(&[0])?;
+            Ok((BOOTSTRAP, ROOT, shared.then_some(SHARED_ROOT)))
+        }
+        Err(error) => {
+            let _ = stream.write_all(&[1]);
+            let _ = stream.write_all(format!("{error:#}").as_bytes());
+            Err(error)
+        }
+    }
+}
+
+/// A connection to the host that has said hello.
+fn dial() -> std::fs::File {
+    loop {
+        if let Ok(mut stream) = crate::application_javascript_guest::connect(AGENT_PORT) {
+            if stream.write_all(&[HELLO]).is_ok() {
+                return stream;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The host's next message tag; `None` once the connection is gone. A socket
+/// timeout is not an error.
+fn wait(stream: &mut impl Read) -> Option<u8> {
+    let mut tag = [0];
+    loop {
+        match stream.read(&mut tag) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Ok(1) => return Some(tag[0]),
+            _ => return None,
+        }
+    }
+}
+
+/// The head of both messages: credited host entropy, then the wall clock.
+fn reseed_and_set_clock(stream: &mut impl Read) -> Result<()> {
     let mut entropy = [0; 32];
     stream.read_exact(&mut entropy)?;
     reseed(&entropy)?;
@@ -118,6 +153,12 @@ fn assign(stream: &mut impl Read) -> Result<bool> {
         "set clock: {}",
         std::io::Error::last_os_error()
     );
+    Ok(())
+}
+
+/// Whether the shared runtime was mounted too.
+fn assign(stream: &mut impl Read) -> Result<bool> {
+    reseed_and_set_clock(stream)?;
     let mut length = [0; 4];
     stream.read_exact(&mut length)?;
     let length = u32::from_le_bytes(length) as usize;
