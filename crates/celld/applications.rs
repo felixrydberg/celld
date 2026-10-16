@@ -139,17 +139,6 @@ pub fn content_digest(body: &[u8]) -> String {
         .collect()
 }
 
-const STATUS_PREFIX: &str = "runtime/";
-const MAX_STATUS_RECORDS: usize = 64;
-
-fn status_key(application: &ApplicationId, node: &str) -> String {
-    format!(
-        "{}{STATUS_PREFIX}{}.json",
-        application.storage_root(),
-        content_digest(node.as_bytes())
-    )
-}
-
 fn artifact_key(application: &ApplicationId, digest: &str) -> Result<String> {
     ensure!(
         digest.len() == 64
@@ -285,39 +274,6 @@ impl Application {
         }
         Ok(())
     }
-}
-
-/// What a node's runtime observed for one pinned handler. The catalog says what
-/// is meant to run; only this record says what a node actually launched.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum HandlerState {
-    Launching,
-    Serving,
-    Draining,
-    /// A fixed, host-chosen reason; causes and guest output stay in host logs.
-    Failed {
-        reason: String,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HandlerStatus {
-    pub deployment: Name,
-    pub handler: Name,
-    #[serde(flatten)]
-    pub state: HandlerState,
-}
-
-/// One overwritten record per application and node, bounded by that node's
-/// tracked handlers. The timestamp lets readers judge freshness: a crashed
-/// node cannot retract its last record.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeStatus {
-    pub node: String,
-    pub observed_at_unix_secs: u64,
-    pub handlers: Vec<HandlerStatus>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1302,54 +1258,6 @@ impl ApplicationStore {
             "stored deployment identity mismatch"
         );
         Ok(Some(deployment))
-    }
-
-    /// Trusted node code only: each node overwrites its own record.
-    pub async fn publish_status(
-        &self,
-        application: &ApplicationId,
-        node: &str,
-        handlers: Vec<HandlerStatus>,
-    ) -> Result<()> {
-        let observed_at_unix_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-        let body = serde_json::to_vec(&RuntimeStatus {
-            node: node.to_owned(),
-            observed_at_unix_secs,
-            handlers,
-        })?;
-        self.bucket
-            .put(&status_key(application, node), Bytes::from(body))
-            .await
-    }
-
-    pub async fn clear_status(&self, application: &ApplicationId, node: &str) -> Result<()> {
-        self.bucket.delete(&status_key(application, node)).await
-    }
-
-    /// Every node's record; empty until some node has published. Never derived
-    /// from the catalog.
-    pub async fn status(&self, application: &ApplicationId) -> Result<Vec<RuntimeStatus>> {
-        let prefix = format!("{}{STATUS_PREFIX}", application.storage_root());
-        let records = self.bucket.list(&prefix).await?;
-        ensure!(
-            records.len() <= MAX_STATUS_RECORDS,
-            "application has more than {MAX_STATUS_RECORDS} node status records"
-        );
-        let mut statuses = Vec::new();
-        for record in records {
-            // A node may clear its record between the listing and the read.
-            let Some((body, _)) = self.bucket.get(record.location.as_ref()).await? else {
-                continue;
-            };
-            ensure!(
-                body.len() as u64 <= MAX_METADATA_BYTES,
-                "application status exceeds metadata limit"
-            );
-            statuses.push(serde_json::from_slice(&body)?);
-        }
-        Ok(statuses)
     }
 
     /// Code is scoped to the authenticated application even when identical

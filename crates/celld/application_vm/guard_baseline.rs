@@ -338,7 +338,7 @@ pub(super) async fn run(
         idle_cache: None,
     };
     config.memory_guard = Some(guard);
-    let pool = Arc::new(VmPool::new(config, store.clone(), "guard-node".into()).unwrap());
+    let pool = Arc::new(VmPool::new(config, store.clone()).unwrap());
     let parent = Arc::new(Group::registered_parent().unwrap());
     assert_parent(&parent);
     assert_eq!(parent.scalar("memory.current").unwrap(), 0);
@@ -565,19 +565,6 @@ pub(super) async fn run(
         );
         "VM reap unproved; capacity quarantined"
     };
-    let states = store.status(&basic).await.unwrap();
-    assert!(
-        states
-            .iter()
-            .flat_map(|state| state.handlers.iter())
-            .any(|handler| handler.deployment == name("memory")
-                && handler.handler == name("memory")
-                && handler.state
-                    == HandlerState::Failed {
-                        reason: reason.into()
-                    }),
-        "OOM status did not preserve its fixed failure reason"
-    );
     let after_oom = pool.templates.memory_sample().unwrap().unwrap();
     assert!(
         after_oom.oom_kill > before_oom.oom_kill

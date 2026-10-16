@@ -252,7 +252,7 @@ pub(super) async fn run(
     }));
     let mut configuration = config(options, 0, 30);
     configuration.max_vms = 1;
-    let dispatcher = RouteDispatcher::new(configuration, store.clone(), "memory-mixed-wake".into())
+    let dispatcher = RouteDispatcher::new(configuration, store.clone())
         .await
         .unwrap();
     dispatcher.install_alarm_host(app.clone()).unwrap();

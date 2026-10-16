@@ -410,7 +410,39 @@ fn launch(client: &VmClient, class: ApplicationSizeClass, mode: &str) -> Value {
     };
     json!({"kind":"launch","class":class,"mode":mode,"host":client.startup,
         "application":phases("guest_application_initialization"),
-        "worker":phases("guest_worker_initialization")})
+        "worker":phases("guest_worker_initialization"),
+        "acquire":std::mem::take(&mut *TIMINGS.lock().unwrap())})
+}
+
+/// Host acquire timings logged since the last launch record.
+static TIMINGS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+struct Timings;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Timings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Fields(serde_json::Map<String, Value>);
+        impl tracing::field::Visit for Fields {
+            fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+                self.0.insert(field.name().into(), json!(value));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().into(), json!(value));
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().into(), json!(format!("{value:?}")));
+            }
+        }
+        let mut fields = Fields(Default::default());
+        event.record(&mut fields);
+        if matches!(
+            fields.0.get("event").and_then(Value::as_str),
+            Some("vm_acquire" | "vm_launch")
+        ) {
+            TIMINGS.lock().unwrap().push(Value::Object(fields.0));
+        }
+    }
 }
 
 pub(super) async fn no_vms(pool: &VmPool, owned: fn() -> HashSet<u32>) {
@@ -474,14 +506,7 @@ pub(super) async fn run(
     let handler = name("memory");
     for startup in [0, 1] {
         recorder.context("template-bootstrap", None, startup);
-        let pool = Arc::new(
-            VmPool::new(
-                config(options, startup, 120),
-                store.clone(),
-                format!("memory-pool-{startup}"),
-            )
-            .unwrap(),
-        );
+        let pool = Arc::new(VmPool::new(config(options, startup, 120), store.clone()).unwrap());
         let (stop, sampler) = recorder.start_sampler(&pool, owned);
         recorder.host("before-template", None, &pool, owned);
         let began = Instant::now();
@@ -669,9 +694,7 @@ pub(super) async fn run(
 
     // Bounded sustained requests and simultaneous work in two distinct VMs.
     recorder.context("burst-template-bootstrap", None, 0);
-    let pool = Arc::new(
-        VmPool::new(config(options, 0, 30), store.clone(), "memory-burst".into()).unwrap(),
-    );
+    let pool = Arc::new(VmPool::new(config(options, 0, 30), store.clone()).unwrap());
     let (stop, sampler) = recorder.start_sampler(&pool, owned);
     pool.prepare(app).await.unwrap();
     recorder.context("burst-workload", Some(ApplicationSizeClass::Lite), 0);
@@ -792,9 +815,15 @@ async fn t33_memory_followons() {
 }
 
 pub(super) async fn bridge_check(application: &str) {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_test_writer()
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::prelude::*;
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_test_writer()
+                .with_filter(LevelFilter::WARN),
+        )
+        .with(Timings.with_filter(LevelFilter::INFO))
         .try_init();
     crate::asyncrt::bind_test_runtime();
     assert!(std::env::var_os("CELLD_APPLICATION_JAVASCRIPT_TEST_VM_IMAGE").is_some());
@@ -982,14 +1011,7 @@ async fn run_followons(
         "remaining":["pause/thaw timer/clock/heartbeat/retained-client wakes",
             "repeat trials","regression/pressure thresholds","16GiB density target selection"]}));
 
-    let pool = Arc::new(
-        VmPool::new(
-            config(options, 0, 120),
-            store.clone(),
-            "memory-followons".into(),
-        )
-        .unwrap(),
-    );
+    let pool = Arc::new(VmPool::new(config(options, 0, 120), store.clone()).unwrap());
     let (stop, sampler) = recorder.start_sampler(&pool, owned);
     pool.prepare(app).await.unwrap();
     recorder.disk(&pool);

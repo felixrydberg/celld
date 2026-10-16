@@ -276,8 +276,7 @@ pub(super) async fn run(
     let mut configuration = config(options, 0, 1);
     configuration.max_vms = 1;
     configuration.memory_guard = Some(guard());
-    let pool =
-        Arc::new(VmPool::new(configuration, store.clone(), "loader-background".into()).unwrap());
+    let pool = Arc::new(VmPool::new(configuration, store.clone()).unwrap());
     let parent = Group::registered_parent().unwrap();
     let (stop, sampler) = recorder.start_sampler(&pool, owned);
     pool.prepare(app).await.unwrap();

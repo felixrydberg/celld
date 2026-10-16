@@ -419,7 +419,7 @@ celld application resource --app shop --file counter.json   # durable_object "co
 celld application artifact --app shop --file handler.img   # note artifact_sha256
 celld application stage    --app shop --file deployment.json
 celld application activate --app shop --deployment v1
-celld application get      --app shop                       # runtime shows serving; hostnames lists <id>.apps.example.com
+celld application get      --app shop                       # hostnames lists <id>.apps.example.com
 curl -H 'Host: <id>.apps.example.com' http://NODE_PUBLIC/...
 ```
 

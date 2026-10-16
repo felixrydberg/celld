@@ -249,8 +249,7 @@ pub(super) async fn run(
             shared_cache_bytes: 256 * MIB,
             idle_cache: None,
         });
-        let pool =
-            Arc::new(VmPool::new(settings, store.clone(), format!("cpu-{startup}")).unwrap());
+        let pool = Arc::new(VmPool::new(settings, store.clone()).unwrap());
         let parent = Group::registered_parent().unwrap();
         pool.prepare(app).await.unwrap();
         assert_eq!(pool.templates.state_files().len(), 6);

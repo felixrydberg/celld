@@ -249,7 +249,7 @@ pub(super) async fn run(
     configuration.max_vms = (SPARSE + 3) as u32;
     configuration.max_memory_mib = 40 * 1024;
     configuration.memory_guard = Some(guard());
-    let pool = Arc::new(VmPool::new(configuration, store.clone(), "working-set".into()).unwrap());
+    let pool = Arc::new(VmPool::new(configuration, store.clone()).unwrap());
     let parent = Group::registered_parent().unwrap();
     let (stop, sampler) = recorder.start_sampler(&pool, owned);
     pool.templates.begin_startup();

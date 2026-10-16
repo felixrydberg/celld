@@ -132,9 +132,7 @@ pub(crate) async fn check_inactive_cron_candidates_keep_ownership_without_arming
         "idle_ttl_secs":1,"platform_domain":"apps.test"
     }))
     .unwrap();
-    let dispatcher = RouteDispatcher::new(config, store, "cron-test".into())
-        .await
-        .unwrap();
+    let dispatcher = RouteDispatcher::new(config, store).await.unwrap();
     assert!(dispatcher.owns_storage_cell(&scope).await.unwrap());
     assert!(dispatcher
         .cron_entry(&scope)
@@ -508,9 +506,6 @@ fn catalog_authenticates_objects_for_guest_peer_and_storage_paths() {
 }
 
 #[cfg(test)]
-const NODE: &str = "node-pool";
-
-#[cfg(test)]
 pub(super) const TEST_DOMAIN: &str = "apps.test";
 
 #[cfg(test)]
@@ -683,7 +678,7 @@ export default {
             ..config.clone()
         },
     ] {
-        assert!(VmPool::new(broken, store.clone(), NODE.into()).is_err());
+        assert!(VmPool::new(broken, store.clone()).is_err());
     }
     let text = |result: Result<crate::js::HttpResponse>| match result {
         Ok(response) => String::from_utf8(response.body).unwrap(),
@@ -722,23 +717,6 @@ export default {
         .await
         .unwrap_or_else(|_| panic!("{what}"));
     }
-    // What the pool observed for a deployment, as the management API reads it.
-    let observed = |deployment: &str| {
-        let deployment = name(deployment);
-        async move {
-            let status = store.status(first).await.unwrap().pop()?;
-            let mut handlers = status.handlers.into_iter();
-            handlers
-                .find(|handler| handler.deployment == deployment)
-                .map(|handler| handler.state)
-        }
-    };
-    let failed = |reason: &str| {
-        Some(HandlerState::Failed {
-            reason: reason.into(),
-        })
-    };
-    assert!(observed("pool-a").await.is_none(), "nothing launched yet");
     // Mismatched, symlinked and unapproved images refuse launch and release
     // their reservation without leaving a VMM.
     let mut mismatched = options.runtime.clone();
@@ -761,7 +739,6 @@ export default {
                 ..config.clone()
             },
             store.clone(),
-            NODE.into(),
         )
         .unwrap();
         let error = pool
@@ -770,21 +747,16 @@ export default {
             .err()
             .expect("an unapproved image launched");
         assert!(format!("{error:#}").contains(refusal), "{error:#}");
-        assert_eq!(observed("pool-a").await, failed("launch failed"));
         assert!(settled(&pool, 0), "refused image kept capacity or a VMM");
         pool.shutdown().await.unwrap();
     }
-    let pool = VmPool::new(config.clone(), store.clone(), NODE.into()).unwrap();
+    let pool = VmPool::new(config.clone(), store.clone()).unwrap();
     let error = pool
         .acquire(app, first, &name("pool-unapproved"), &handler)
         .await
         .err()
         .unwrap();
     assert!(format!("{error:#}").contains("not approved"));
-    assert_eq!(
-        observed("pool-unapproved").await,
-        failed("runtime image is not approved")
-    );
     assert!(settled(&pool, 0));
     // Fresh admission refuses both a never-active manifest and a replaced
     // generation before reserving capacity. The capacity exercises below use
@@ -813,7 +785,6 @@ export default {
     assert!(Arc::ptr_eq(&warm.pin, &a[0].pin));
     assert_eq!(text(call(&warm, "/").await), "pool-a");
     assert!(settled(&pool, 1));
-    assert_eq!(observed("pool-a").await, Some(HandlerState::Serving));
     // Another deployment of the same application gets its own VM.
     let b = pool
         .acquire_inner(app, first, &name("pool-b"), &handler, true)
@@ -867,7 +838,6 @@ export default {
     assert!(settled(&pool, 2));
     // Replacement: a retired deployment refuses new leases, its live lease
     // keeps serving, and the VM is reaped once that lease settles.
-    assert_eq!(observed("pool-c").await, Some(HandlerState::Serving));
     let mut snapshot = store.read(first).await.unwrap();
     let current = store
         .deployment(first, &name("pool-c"))
@@ -877,7 +847,6 @@ export default {
     store.activate(&mut snapshot, current).await.unwrap();
     store.commit(snapshot).await.unwrap();
     pool.retire_deployment(first, &name("pool-c")).await;
-    assert_eq!(observed("pool-c").await, Some(HandlerState::Draining));
     assert!(format!(
         "{:#}",
         pool.acquire(app, first, &name("pool-c"), &handler)
@@ -895,10 +864,6 @@ export default {
     )
     .await;
     until(|| settled(&pool, 1), "retired VMM was not reaped").await;
-    assert!(
-        observed("pool-c").await.is_none(),
-        "reaped VM still reported"
-    );
     // A caller cancelled during startup cannot abandon the VMM: the pool owns
     // startup, keeps the VM within capacity and still reaps it. A restore takes
     // about 250 ms, so the cancel comes well before it.
@@ -943,32 +908,10 @@ export default {
         .unwrap()
         .unwrap();
     assert!(settled(&pool, 0));
-    assert!(store.status(first).await.unwrap().is_empty());
     assert!(pool
         .acquire_inner(app, first, &name("pool-a"), &handler, true)
         .await
         .is_err());
-    // Status is per node: two nodes serving one application keep two records,
-    // and one node's shutdown removes only its own.
-    let [node_a, node_b] = ["node-a", "node-b"]
-        .map(|node| VmPool::new(config.clone(), store.clone(), node.into()).unwrap());
-    let (a, b) = tokio::join!(
-        node_a.acquire_inner(app, first, &pool_a, &handler, true),
-        node_b.acquire_inner(app, first, &pool_a, &handler, true)
-    );
-    let leases = (a.unwrap(), b.unwrap());
-    let nodes = || async {
-        let records = store.status(first).await.unwrap();
-        let mut nodes: Vec<_> = records.into_iter().map(|record| record.node).collect();
-        nodes.sort();
-        nodes
-    };
-    assert_eq!(nodes().await, ["node-a", "node-b"]);
-    drop(leases);
-    node_a.shutdown().await.unwrap();
-    assert_eq!(nodes().await, ["node-b"]);
-    node_b.shutdown().await.unwrap();
-    assert!(nodes().await.is_empty());
     // Leave the shared fixture app's activation as this check found it.
     let mut snapshot = store.read(first).await.unwrap();
     if let Some(active) = previous_active {
@@ -1383,7 +1326,7 @@ export default {
         store.commit(snapshot).await.unwrap();
     }
     // Staged is not published: no route, and no VM launches for it.
-    let dispatcher = RouteDispatcher::new(config.clone(), store.clone(), NODE.into())
+    let dispatcher = RouteDispatcher::new(config.clone(), store.clone())
         .await
         .unwrap();
     let shared_templates = dispatcher.routes.pool.as_ref().unwrap().templates.status();
@@ -1401,16 +1344,6 @@ export default {
         .lock()
         .unwrap()
         .slots
-        .is_empty());
-    assert!(dispatcher
-        .routes
-        .pool
-        .as_ref()
-        .unwrap()
-        .observed
-        .handlers
-        .lock()
-        .await
         .is_empty());
     assert!(dispatcher.routes.scopes.lock().unwrap().entries.is_empty());
     assert_eq!(
@@ -1481,17 +1414,6 @@ export default {
         .all(|(application, _, _)| application == first));
     assert!(dispatcher
         .routes
-        .pool
-        .as_ref()
-        .unwrap()
-        .observed
-        .handlers
-        .lock()
-        .await
-        .keys()
-        .all(|(application, _, _)| application == first));
-    assert!(dispatcher
-        .routes
         .scopes
         .lock()
         .unwrap()
@@ -1536,9 +1458,7 @@ export default {
     // A restarted dispatcher serves the committed catalog from a cold pool.
     dispatcher.shutdown().await.unwrap();
     assert!(vms(&dispatcher, 0));
-    let dispatcher = RouteDispatcher::new(config, store.clone(), NODE.into())
-        .await
-        .unwrap();
+    let dispatcher = RouteDispatcher::new(config, store.clone()).await.unwrap();
     assert_eq!(
         get(app, &dispatcher, &host, "/").await.as_deref(),
         Some("route-a /")
@@ -1819,19 +1739,6 @@ export default {
     }
     let name = |value: &str| -> Name { value.to_owned().try_into().unwrap() };
     let handler = name("javascript");
-    let observed = |deployment: &str| {
-        let deployment = name(deployment);
-        async move {
-            store
-                .status(first)
-                .await
-                .unwrap()
-                .into_iter()
-                .flat_map(|record| record.handlers)
-                .find(|handler| handler.deployment == deployment)
-                .map(|handler| handler.state)
-        }
-    };
     let activate = |id: &str| {
         let id = name(id);
         async move {
@@ -1841,11 +1748,7 @@ export default {
             store.commit(snapshot).await.unwrap();
         }
     };
-    let dispatcher = Arc::new(
-        RouteDispatcher::new(config, store.clone(), NODE.into())
-            .await
-            .unwrap(),
-    );
+    let dispatcher = Arc::new(RouteDispatcher::new(config, store.clone()).await.unwrap());
     let vms = |count: u32| {
         let pool = dispatcher.routes.pool.as_ref().unwrap().snapshot();
         assert_eq!(pool.quarantined, 0);
@@ -1901,7 +1804,6 @@ export default {
         slow.iter().all(|slow| !slow.is_finished()),
         "the replacement did not happen under in-flight work"
     );
-    assert_eq!(observed("load-a").await, Some(HandlerState::Draining));
     // In-flight requests finish on the pinned old deployment.
     for slow in slow {
         assert_eq!(slow.await.unwrap().unwrap(), "load-a /slow");
@@ -1961,10 +1863,6 @@ export default {
         replied.elapsed()
     );
     until(|| vms(1), "old VMM was not reaped").await;
-    assert!(
-        observed("load-a").await.is_none(),
-        "reaped VM still reported"
-    );
     assert!(dispatcher
         .routes
         .pool
@@ -2358,17 +2256,9 @@ async fn check_startup_classes(
             memory_guard: None,
         },
         store.clone(),
-        "startup-classes".into(),
     )
     .unwrap();
-    let cancelled = Arc::new(
-        VmPool::new(
-            pool.config.clone(),
-            store.clone(),
-            "startup-cancelled".into(),
-        )
-        .unwrap(),
-    );
+    let cancelled = Arc::new(VmPool::new(pool.config.clone(), store.clone()).unwrap());
     let owner = cancelled.clone();
     let initialization_app = app.clone();
     let preparing = tokio::spawn(async move { owner.prepare(&initialization_app).await });
@@ -2481,7 +2371,6 @@ async fn check_startup_classes(
         pool.config.clone(),
         store.clone(),
         pool.state.clone(),
-        pool.observed.clone(),
         pool.changed.clone(),
         pool.templates.clone(),
         pool.pressure.clone(),
@@ -2705,9 +2594,9 @@ export default {
             startup_pool: size,
             ..config.clone()
         };
-        assert!(VmPool::new(broken, store.clone(), NODE.into()).is_err());
+        assert!(VmPool::new(broken, store.clone()).is_err());
     }
-    let pool = VmPool::new(config.clone(), store.clone(), NODE.into()).unwrap();
+    let pool = VmPool::new(config.clone(), store.clone()).unwrap();
     let pooled = |what: &str| pool.templates.status()[what].as_u64().unwrap();
     async fn until(mut done: impl FnMut() -> bool, what: &str) {
         timeout(Duration::from_secs(60), async {
@@ -4542,7 +4431,7 @@ async fn check_python_handlers(
         startup_pool: 0,
         memory_guard: None,
     };
-    let pool = VmPool::new(config, store.clone(), NODE.into()).unwrap();
+    let pool = VmPool::new(config, store.clone()).unwrap();
     let (deployment, handler) = (name("python"), name("python"));
     let mut snapshot = store.read(&application).await.unwrap();
     let manifest = store
@@ -5316,7 +5205,6 @@ export default class Main extends WorkerEntrypoint {
                 memory_guard: None,
             },
             store.clone(),
-            "services-test".into(),
         )
         .await
         .unwrap(),
@@ -5873,7 +5761,6 @@ export default { fetch(request, env) { return env.BOX.getByName('same').fetch(re
                 memory_guard: None,
             },
             store.clone(),
-            "containers-test".into(),
         )
         .await
         .unwrap(),
@@ -6131,7 +6018,6 @@ pub(crate) async fn check_supervised_handler_bridge(
             memory_guard: None,
         },
         failed_store,
-        "startup-failed".into(),
     )
     .unwrap();
     assert!(failed.prepare(app).await.is_err());
@@ -6151,12 +6037,7 @@ pub(crate) async fn check_supervised_handler_bridge(
         "a missing startup cache was built on lookup"
     );
     failed.shutdown().await.unwrap();
-    let panicked = VmPool::new(
-        failed.config.clone(),
-        failed.store.clone(),
-        "startup-panicked".into(),
-    )
-    .unwrap();
+    let panicked = VmPool::new(failed.config.clone(), failed.store.clone()).unwrap();
     let charge = panicked.charge_startup(256).await.unwrap();
     let error = tokio::spawn(async move {
         let _charge = charge;

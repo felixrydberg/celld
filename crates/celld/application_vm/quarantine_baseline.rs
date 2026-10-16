@@ -235,8 +235,7 @@ pub(super) async fn run(
     let mut configuration = config(options, 0, 30);
     configuration.max_vms = 1;
     configuration.memory_guard = Some(failure::guard());
-    let pool =
-        Arc::new(VmPool::new(configuration, store.clone(), "quarantine-node".into()).unwrap());
+    let pool = Arc::new(VmPool::new(configuration, store.clone()).unwrap());
     let parent = Group::registered_parent().unwrap();
     timeout(Duration::from_secs(1500), pool.prepare(app))
         .await

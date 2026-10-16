@@ -277,16 +277,14 @@ async fn check_activation(
 }
 
 /// T10: one handler lifecycle through the CLI. Replacing and removing a
-/// handler keeps the application's resource identity, denied edits leave
-/// the catalog revision untouched, and `runtime` reports only what a node
-/// published, never what the catalog merely declares.
+/// handler keeps the application's resource identity, and denied edits leave
+/// the catalog revision untouched.
 async fn check_lifecycle(
     api: &str,
     backend: &ApplicationStore,
-    (reader, manager, owner, operator): (&str, &str, &str, &str),
+    (reader, manager, owner): (&str, &str, &str),
     digest: &str,
 ) {
-    use crate::applications::{HandlerState, HandlerStatus};
     let one = id("one");
     let directory = tempfile::tempdir().unwrap();
     let file = |name: &str, bytes: &[u8]| {
@@ -412,45 +410,10 @@ async fn check_lifecycle(
         handlers(&deployed),
         [pair("main", digest), pair("extra", digest)]
     );
-    assert_eq!(deployed["runtime"], json!([]));
     // Only the `http` handler has a host-assigned hostname.
     let hostname = deployed["hostnames"]["main"].as_str().unwrap().to_owned();
     assert!(hostname.ends_with(".apps.test") && hostname.len() == 32 + ".apps.test".len());
     assert_eq!(deployed["hostnames"].as_object().unwrap().len(), 1);
-    // A node observation shows beside, and distinct from, the catalog.
-    let main = HandlerStatus {
-        deployment: name,
-        handler: "main".to_owned().try_into().unwrap(),
-        state: HandlerState::Serving,
-    };
-    let extra = HandlerStatus {
-        handler: "extra".to_owned().try_into().unwrap(),
-        state: HandlerState::Failed {
-            reason: "launch failed".into(),
-        },
-        ..main.clone()
-    };
-    backend
-        .publish_status(&one, "node-a", vec![main, extra])
-        .await
-        .unwrap();
-    let observed = inspect(reader, "one").await;
-    assert_eq!(
-        observed["runtime"][0]["handlers"],
-        json!([
-            {"deployment": "lifecycle-1", "handler": "main", "state": "serving"},
-            {"deployment": "lifecycle-1", "handler": "extra", "state": "failed", "reason": "launch failed"}
-        ])
-    );
-    assert!(
-        observed["runtime"][0]["observed_at_unix_secs"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
-    assert_eq!(observed["application"], deployed["application"]);
-    assert_eq!(observed["runtime"][0]["node"], "node-a");
-    assert_eq!(inspect(operator, "two").await["runtime"], json!([]));
     // Replace one handler's code, then remove the other handler; neither
     // touches the registered resource identity.
     let resources = deployed["application"]["resources"].clone();
@@ -1333,13 +1296,7 @@ async fn application_management_authorization_publication_and_cli() {
             .len(),
         1
     );
-    check_lifecycle(
-        &api,
-        &backend,
-        (&reader, &manager, &owner, &operator),
-        &digest,
-    )
-    .await;
+    check_lifecycle(&api, &backend, (&reader, &manager, &owner), &digest).await;
     assert!(cli("http://example.com", &manager, "list", None, &[])
         .await
         .is_err());
