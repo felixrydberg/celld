@@ -1082,9 +1082,21 @@ impl Bucket {
 
     /// Body and CAS token, or `None` when the key does not exist.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<(Bytes, String)>> {
+        self.get_bounded(key, u64::MAX, "object exceeds limit").await
+    }
+
+    /// `get` that fails with `too_large` for an object over `max` bytes
+    /// before reading its body: one request where HEAD + GET would take two.
+    pub async fn get_bounded(
+        &self,
+        key: &str,
+        max: u64,
+        too_large: &'static str,
+    ) -> anyhow::Result<Option<(Bytes, String)>> {
         let key = self.key(key);
         match self.store.get(&Path::from(key.as_str())).await {
             Ok(result) => {
+                anyhow::ensure!(result.meta.size <= max, too_large);
                 let token = self
                     .backend
                     .token(result.meta.e_tag.clone(), result.meta.version.clone())
@@ -1366,6 +1378,14 @@ impl Bucket {
             objects: result.result.objects,
             page_token: result.page_token,
         })
+    }
+
+    /// The CAS token a listed object carries, the one `head` would answer, so
+    /// a listing can stand in for a HEAD per object.
+    pub(crate) fn listed_token(&self, object: &ObjectMeta) -> anyhow::Result<String> {
+        self.backend
+            .token(object.e_tag.clone(), object.version.clone())
+            .with_context(|| format!("list {}://{}/{}", self.scheme(), self.name, object.location))
     }
 
     /// One page of the immediate child "directories" that start with `prefix`.

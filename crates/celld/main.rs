@@ -832,59 +832,136 @@ fn spawn_cron_arm(app: AppHandle) {
 
 /// Arm each application cron cell whose schedule this node has not armed, as
 /// `spawn_cron_arm` does for the Worker's: through the ordinary Durable Object
-/// path, on every node, with ownership deciding which cell answers. Boot and any
-/// catalog change (activation, replacement) arrive here; a failed arm is retried.
+/// path, on every node, with ownership deciding which cell answers. Edge-
+/// triggered like upstream's: one scan of every cron at boot, one whenever this
+/// node learns the catalog changed (of just the applications it names, with no
+/// listing). A change made by another process reaches it through the catalog
+/// sweep (`CELLD_SYNC_SWEEP_S`), so no timer rescans every cron. An owner lost
+/// later is recovered by the wake scan from the cell's armed alarm, exactly as a
+/// Worker cron is, so it needs no rescan. Only a bucket-mode node arms: arming
+/// goes through ownership routing, so any node can, and a relayed one
+/// (`CELLD_SYNC_UPSTREAM`) neither sweeps nor lists the catalog.
 #[cfg(target_os = "linux")]
 fn spawn_application_cron_arm(app: AppHandle) {
     tokio::spawn(async move {
-        let mut cursor = None;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let Some(applications) = celld::application_vm::hosted() else {
-                return;
-            };
-            if !app.healthy().await {
-                continue;
-            }
-            let page = match applications.cron_candidates(cursor.clone()).await {
-                Ok(page) => page,
+        let Some(applications) = celld::application_vm::hosted() else {
+            return;
+        };
+        if applications.relayed() {
+            return;
+        }
+        // Routing needs node authority, exactly as the wake scan does.
+        while !app.healthy().await {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        applications
+            .run_cron_scans(|changed| scan_application_crons(&app, applications, changed))
+            .await;
+    });
+}
+
+/// One pass over every cron cell, or over those of the applications `changed`
+/// names, which lists no index. A failed page or arm is retried with the bounded
+/// backoff `spawn_cron_arm` uses; past it, what was not armed is returned for
+/// `run_cron_scans` to scan again.
+// ponytail: sequential, so a cell failing all five attempts delays the rest by
+// ~7.5 s; arm concurrently if a fleet ever has many persistently failing crons.
+#[cfg(target_os = "linux")]
+async fn scan_application_crons(
+    app: &AppHandle,
+    applications: &celld::application_vm::RouteDispatcher,
+    changed: celld::application_vm::Changed,
+) -> Option<celld::application_vm::Changed> {
+    use celld::application_vm::Changed;
+    let mut failed = std::collections::BTreeSet::new();
+    if let Changed::Apps(changed) = changed {
+        for application in changed {
+            match applications.cron_scopes(&application).await {
+                Ok(cells) => {
+                    for cell in cells {
+                        if !arm_with_retries(app, applications, &cell).await {
+                            failed.insert(application.clone());
+                        }
+                    }
+                }
                 Err(error) => {
-                    tracing::warn!(%error, "application cron candidate page failed; retrying");
-                    // Invalid provider cursors recover by a conservative complete cycle.
-                    if error.to_string().contains("cursor") || error.to_string().contains("token") {
-                        cursor = None;
-                    }
-                    continue;
+                    tracing::warn!(%error, ?application, "application crons not read; retrying later");
+                    failed.insert(application);
                 }
-            };
-            let mut retry = false;
-            for candidate in page.candidates {
-                let cell = candidate.scope;
-                match applications.cron_candidate_ready(&cell).await {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) if error.is::<celld::applications::UncommittedCellIndex>() => {
-                        continue
-                    }
-                    Err(error) => {
-                        tracing::warn!(cell, %error, "application cron metadata failed; retrying page");
-                        retry = true;
-                        continue;
-                    }
-                }
-                match arm_cron_schedule(app.clone(), cell.clone()).await {
-                    Ok(()) => {}
-                    Err(error) => {
-                        tracing::warn!(cell, %error, "application cron arm failed; retrying page");
-                        retry = true;
-                    }
-                }
-            }
-            if !retry {
-                cursor = page.next_cursor;
             }
         }
-    });
+        return (!failed.is_empty()).then_some(Changed::Apps(failed));
+    }
+    let mut cursor = None;
+    let mut failures = 0u32;
+    loop {
+        let page = match applications.cron_candidates(cursor.clone()).await {
+            Ok(page) => page,
+            Err(error) => {
+                failures += 1;
+                if failures == 5 {
+                    tracing::error!(%error, "application cron candidates not listed");
+                    return Some(Changed::All);
+                }
+                tracing::warn!(%error, failures, "application cron candidate page failed; retrying");
+                // Invalid provider cursors recover by a conservative complete cycle.
+                if error.to_string().contains("cursor") || error.to_string().contains("token") {
+                    cursor = None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500 << failures)).await;
+                continue;
+            }
+        };
+        for candidate in page.candidates {
+            if !arm_with_retries(app, applications, &candidate.scope).await {
+                failed.insert(candidate.address.application);
+            }
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return (!failed.is_empty()).then_some(Changed::Apps(failed)),
+        }
+    }
+}
+
+/// `arm_application_cron` with the bounded backoff `spawn_cron_arm` uses;
+/// false when every attempt failed.
+#[cfg(target_os = "linux")]
+async fn arm_with_retries(
+    app: &AppHandle,
+    applications: &celld::application_vm::RouteDispatcher,
+    cell: &str,
+) -> bool {
+    for attempt in 0..5 {
+        match arm_application_cron(app, applications, cell).await {
+            Ok(()) => return true,
+            Err(error) if attempt == 4 => {
+                tracing::error!(cell, %error, "application cron not armed; retrying later");
+            }
+            Err(error) => {
+                tracing::warn!(cell, %error, attempt, "application cron arm failed, retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(500 << attempt)).await;
+            }
+        }
+    }
+    false
+}
+
+/// Arm `cell` if the committed catalog gives it an active schedule; an inactive
+/// cron or one whose index is ahead of the served revision is left alone.
+#[cfg(target_os = "linux")]
+async fn arm_application_cron(
+    app: &AppHandle,
+    applications: &celld::application_vm::RouteDispatcher,
+    cell: &str,
+) -> anyhow::Result<()> {
+    match applications.cron_candidate_ready(cell).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(()),
+        Err(error) if error.is::<celld::applications::UncommittedCellIndex>() => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    arm_cron_schedule(app.clone(), cell.to_owned()).await
 }
 
 /// Adopt the deployment `pointer` names.
@@ -2551,10 +2628,19 @@ async fn application_ingress(
         return Err(Box::new(Request::from_parts(parts, body)));
     }
     let request = Request::from_parts(parts, body);
+    // One route, and so one catalog revision, for the asset check and the Worker.
+    let route = match applications.route(&url).await {
+        Ok(Some(route)) => route,
+        Ok(None) => return Ok(response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}")),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "application route failed");
+            return Ok(response(StatusCode::INTERNAL_SERVER_ERROR, "application failed"));
+        }
+    };
     // Like the original ingress, a GET/HEAD the handler's assets serve never
     // reaches the handler (and so never launches its VM).
     {
-        match applications.asset_resolver_for(&url).await {
+        match applications.route_assets(&route).await {
             Ok(Some(resolver)) => {
                 if matches!(*request.method(), hyper::Method::GET | hyper::Method::HEAD) {
                     if let Some(reply) = serve_assets(&resolver, &request).await { return Ok(reply); }
@@ -2604,11 +2690,11 @@ async fn application_ingress(
         body: bytes,
     };
     let dispatched = applications
-        .dispatch(app, celld::js::handler_budget(), request, stream)
+        .dispatch_route(app, &route, celld::js::handler_budget(), request, stream)
         .await;
     Ok(match dispatched {
         Ok(Some(reply)) => runtime_response(reply, preserve_representation_length),
-        // The route was withdrawn between the claim and the dispatch.
+        // An asset-only route whose assets did not serve the request.
         Ok(None) => response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"),
         Err(error) if error.is::<celld::application_vm::CapacityExhausted>() => {
             response(StatusCode::SERVICE_UNAVAILABLE, format!("{error}"))
@@ -2834,6 +2920,43 @@ async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply
         },
         Err(_) => peer_response(response(StatusCode::BAD_REQUEST, "invalid probe challenge")),
     }
+}
+
+/// A child's long-poll for the catalog epoch (`CELLD_SYNC_UPSTREAM` on its
+/// side): held while it is up to date, so it can run for about 20 seconds.
+async fn internal_sync(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let (parts, body) = request.into_parts();
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("sync", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::GET {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(applications) = celld::application_vm::hosted() {
+        let (status, body) = applications
+            .answer_sync(parts.uri.query(), app.is_draining())
+            .await;
+        return peer_response(response(status, body));
+    }
+    peer_response(response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"))
 }
 
 /// Adopt one released cell for a terminating peer. A successful response
@@ -3133,6 +3256,7 @@ async fn handle_internal(
     let evict_scope = path.strip_prefix("/evict/");
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
+        "/peer/sync" => internal_sync(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, node_state(app.snapshot().await)),

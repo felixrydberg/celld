@@ -22,12 +22,8 @@ fn pending_cron_arms(
 
 #[cfg(test)]
 #[test]
-fn scope_cache_bounds_bytes_expiration_and_live_pins() {
-    let mut cache = ScopeCache {
-        max_entries: 3,
-        max_bytes: 20,
-        ..Default::default()
-    };
+fn scope_cache_bounds_bytes_recency_and_live_pins() {
+    let mut cache = BoundedCache::new(3, 20);
     let address = ResourceAddress {
         application: ApplicationId {
             app: "cache".to_owned().try_into().unwrap(),
@@ -39,6 +35,11 @@ fn scope_cache_bounds_bytes_expiration_and_live_pins() {
     };
     let pinned = Arc::new(ScopeMetadata {
         scope: "cell-0".into(),
+        snapshot: Arc::new(Snapshot {
+            id: address.application.clone(),
+            application: None,
+            token: None,
+        }),
         address,
         compat: Default::default(),
         queue: None,
@@ -57,10 +58,15 @@ fn scope_cache_bounds_bytes_expiration_and_live_pins() {
     );
     cache.insert("oversized".into(), 21, pinned.clone());
     assert!(cache.get("oversized").is_none());
-    for (at, _, _) in cache.entries.values_mut() {
-        *at -= RECONCILE_PERIOD;
+    // No expiry: a used entry outlives a newer unused one.
+    for (used, _, _) in cache.entries.values_mut() {
+        *used -= RECONCILE_PERIOD;
     }
-    assert!(cache.get("cell-99").is_none());
+    assert!(cache.get("cell-97").is_some());
+    cache.insert("cell-100".into(), 6, pinned.clone());
+    assert!(cache.get("cell-97").is_some());
+    assert!(cache.get("cell-98").is_none() || cache.get("cell-99").is_none());
+    cache.retain(|_, _| false);
     assert_eq!(cache.bytes, 0);
 }
 
@@ -157,6 +163,379 @@ pub(crate) async fn check_inactive_cron_candidates_keep_ownership_without_arming
         .slots
         .is_empty());
     dispatcher.shutdown().await.unwrap();
+}
+
+/// The cron arm scans at boot and on a catalog change, whether its own epoch
+/// poll or the catalog sweep saw it, and reads nothing in between: the boot
+/// scan is one LIST page plus a GET per cron and a change scans only the
+/// application it touched, so the scans are the arm's whole bucket traffic.
+#[cfg(test)]
+pub(crate) async fn check_cron_scans_are_edge_triggered() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("bucket.sqlite");
+    let store = Arc::new(ApplicationStore::new(
+        crate::dev::open_local_bucket(&database).unwrap(),
+    ));
+    let application = ApplicationId {
+        app: "edge-cron".to_owned().try_into().unwrap(),
+    };
+    let cron = |id: &str| crate::applications::Resource {
+        resource: ResourceRef {
+            kind: ResourceKind::Cron,
+            id: id.to_owned().try_into().unwrap(),
+        },
+        configuration: serde_json::json!({}),
+    };
+    let mut snapshot = store.read(&application).await.unwrap();
+    snapshot.create(application.clone()).unwrap();
+    snapshot
+        .register_resource(&application, cron("tick"))
+        .unwrap();
+    store.commit(snapshot).await.unwrap();
+    let scope = ResourceAddress {
+        application: application.clone(),
+        resource: cron("tick").resource,
+    }
+    .cell_scope(celld_logic::cron::RESERVED_CLASS, "tick")
+    .unwrap();
+    let config = serde_json::from_value(serde_json::json!({
+        "jailer":"/unavailable/jailer", "firecracker":"/unavailable/firecracker",
+        "kernel":{"path":"/unavailable/kernel", "sha256":"a".repeat(64)},
+        "runtimes":[{"path":"/unavailable/runtime", "sha256":"b".repeat(64)}],
+        "uid":1000,"gid":1000,"max_vms":2,"max_memory_mib":12288,
+        "idle_ttl_secs":1,"platform_domain":"apps.test"
+    }))
+    .unwrap();
+    let dispatcher = RouteDispatcher::new(config, store.clone()).await.unwrap();
+    // Serve the application, so reconcile watches its revision.
+    assert!(dispatcher.owns_storage_cell(&scope).await.unwrap());
+    let scans = Mutex::new(Vec::new());
+    let seen = || scans.lock().unwrap().clone();
+    let pause = |ms| tokio::time::sleep(Duration::from_millis(ms));
+    // Set to make the next scan report everything it was given as not armed.
+    let fail_next = std::sync::atomic::AtomicBool::new(false);
+    let driver = dispatcher.run_cron_scans(|changed| {
+        scans.lock().unwrap().push(changed.clone());
+        let failed = fail_next.swap(false, Ordering::SeqCst).then_some(changed);
+        async move { failed }
+    });
+    let script = async {
+        pause(300).await;
+        assert_eq!(seen(), [Changed::All], "boot scans everything once");
+        // Idle across a reconcile tick: no change, no scan.
+        pause(900).await;
+        dispatcher.reconcile().await.unwrap();
+        assert_eq!(seen().len(), 1, "an idle node does not rescan");
+        let mut snapshot = store.read(&application).await.unwrap();
+        snapshot.register_resource(&application, cron("tock")).unwrap();
+        store.commit(snapshot).await.unwrap();
+        // The committing node's own store wakes its poll loop; nothing else runs.
+        pause(300).await;
+        assert_eq!(
+            seen()[1..],
+            [Changed::Apps(BTreeSet::from([application.clone()]))],
+            "a changed revision rescans only its application, once, at once"
+        );
+        pause(800).await;
+        assert_eq!(
+            seen().len(),
+            2,
+            "with no news nothing rescans, however long"
+        );
+        // Another process commits a new application. No epoch poll brings news
+        // of it within this test, so the sweep is what tells the arm: just that
+        // application, once. (The first sweep only takes the baseline.)
+        let mut known = None;
+        dispatcher.routes.sweep_catalog(&mut known).await.unwrap();
+        let fresh = ApplicationId {
+            app: "swept-cron".to_owned().try_into().unwrap(),
+        };
+        let other = ApplicationStore::new(crate::dev::open_local_bucket(&database).unwrap());
+        let mut snapshot = other.read(&fresh).await.unwrap();
+        snapshot.create(fresh.clone()).unwrap();
+        other.commit(snapshot).await.unwrap();
+        dispatcher.routes.sweep_catalog(&mut known).await.unwrap();
+        pause(300).await;
+        assert_eq!(
+            seen()[2..],
+            [Changed::Apps(BTreeSet::from([fresh]))],
+            "a sweep rescans only the applications it found changed"
+        );
+        dispatcher.routes.sweep_catalog(&mut known).await.unwrap();
+        pause(300).await;
+        assert_eq!(seen().len(), 3, "an unchanged catalog sweeps to nothing");
+        // What a scan could not arm is scanned again after `CRON_RETRY`, with
+        // no news needed, and only once it succeeds does the arm go quiet.
+        fail_next.store(true, Ordering::SeqCst);
+        let flaky = ApplicationId {
+            app: "flaky-cron".to_owned().try_into().unwrap(),
+        };
+        let mut snapshot = other.read(&flaky).await.unwrap();
+        snapshot.create(flaky.clone()).unwrap();
+        other.commit(snapshot).await.unwrap();
+        dispatcher.routes.sweep_catalog(&mut known).await.unwrap();
+        let again = Changed::Apps(BTreeSet::from([flaky]));
+        pause(100).await;
+        assert_eq!(&seen()[3..], std::slice::from_ref(&again));
+        tokio::time::sleep(CRON_RETRY + Duration::from_millis(200)).await;
+        assert_eq!(seen()[3..], [again.clone(), again], "retried once");
+        // Well inside the dispatcher's own 5 s poll, which would add a scan.
+        tokio::time::sleep(CRON_RETRY + Duration::from_millis(100)).await;
+        assert_eq!(seen().len(), 5, "an armed retry is not repeated");
+    };
+    crate::asyncrt::select! {
+        () = script => {}
+        () = driver => unreachable!("the driver never returns"),
+    }
+    dispatcher.shutdown().await.unwrap();
+}
+
+/// Nodes watch one epoch log, not every application: idle costs nothing, an
+/// unchanged log costs one GET for any number of cached applications, another
+/// store's commit costs that GET plus one read of the application it touched
+/// (none if this node does not serve it), a log this node cannot follow is
+/// re-checked in full, and an evicted application is read cold and current.
+#[cfg(test)]
+pub(crate) async fn check_catalog_epoch_polling() {
+    use std::sync::atomic::AtomicUsize;
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("bucket.sqlite");
+    let open = || Arc::new(ApplicationStore::new(crate::dev::open_local_bucket(&database).unwrap()));
+    let (node, other) = (open(), open());
+    let ids: Vec<ApplicationId> = (0..3)
+        .map(|index| ApplicationId {
+            app: format!("epoch-{index}").try_into().unwrap(),
+        })
+        .collect();
+    let cron = |id: &str| crate::applications::Resource {
+        resource: ResourceRef {
+            kind: ResourceKind::Cron,
+            id: id.to_owned().try_into().unwrap(),
+        },
+        configuration: serde_json::json!({}),
+    };
+    for id in &ids {
+        let mut snapshot = other.read(id).await.unwrap();
+        snapshot.create(id.clone()).unwrap();
+        other.commit(snapshot).await.unwrap();
+    }
+    // Polled by hand: a dispatcher's own loop would add requests to the counts.
+    let routes = Routes::new(
+        node.clone(),
+        None,
+        "apps.test".to_owned(),
+        METADATA_CACHE_ENTRIES,
+        METADATA_CACHE_BYTES,
+    );
+    let ops = |reset: bool| {
+        let counter: &AtomicUsize = &node.catalog_ops;
+        if reset {
+            counter.swap(0, Ordering::SeqCst)
+        } else {
+            counter.load(Ordering::SeqCst)
+        }
+    };
+    // What the cron arm would be told since the last look here.
+    let pending = || lock(&routes.catalog_pending).take();
+    let only = |id: &ApplicationId| Changed::Apps(BTreeSet::from([id.clone()]));
+    let (idle, mut watch) = (Duration::from_secs(60), EpochWatch::default());
+    // Nothing served, nothing asked.
+    ops(true);
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(true), 0, "an idle node makes no bucket request");
+    for id in &ids {
+        routes.app(id).await.unwrap();
+    }
+    assert_eq!(ops(true), 3, "three cold reads");
+    // The first look after idleness is a full pass: epoch + one HEAD each.
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(true), 1 + 3);
+    for _ in 0..3 {
+        routes.poll_epoch(&mut watch, idle).await.unwrap();
+        assert_eq!(ops(true), 1, "an unchanged epoch costs one GET for any N");
+    }
+    assert_eq!(pending(), None, "nothing changed, nothing signalled");
+    // Another node commits to a served application: the log names it, so the
+    // period costs the GET and one read, and no HEAD for the other two.
+    let mut snapshot = other.read(&ids[0]).await.unwrap();
+    snapshot.register_resource(&ids[0], cron("tick")).unwrap();
+    let revision = other.commit(snapshot).await.unwrap();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(true), 1 + 1, "epoch and one read");
+    assert_eq!(routes.app(&ids[0]).await.unwrap().revision(), Some(&*revision));
+    assert_eq!(pending(), Some(only(&ids[0])), "only that application changed");
+    // A commit to one this node does not serve costs the GET alone, yet the
+    // cron arm hears of it.
+    let fresh = ApplicationId {
+        app: "epoch-fresh".to_owned().try_into().unwrap(),
+    };
+    let mut snapshot = other.read(&fresh).await.unwrap();
+    snapshot.create(fresh.clone()).unwrap();
+    other.commit(snapshot).await.unwrap();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(true), 1, "an unserved application is not read");
+    assert_eq!(pending(), Some(only(&fresh)));
+    // The log keeps 64 changes: a node further behind cannot tell what it
+    // missed, so it checks every application and the cron arm scans them all.
+    let kv = |n: usize| crate::applications::Resource {
+        resource: ResourceRef {
+            kind: ResourceKind::Kv,
+            id: format!("kv-{n}").try_into().unwrap(),
+        },
+        configuration: serde_json::json!({}),
+    };
+    let mut latest = String::new();
+    for n in 0..65 {
+        let mut snapshot = other.read(&ids[2]).await.unwrap();
+        snapshot.register_resource(&ids[2], kv(n)).unwrap();
+        latest = other.commit(snapshot).await.unwrap();
+    }
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(true), 1 + 3 + 1, "epoch, a HEAD each, one read");
+    assert_eq!(routes.app(&ids[2]).await.unwrap().revision(), Some(&*latest));
+    assert_eq!(pending(), Some(Changed::All));
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(true), 1, "and is caught up");
+    // A body that is not a log (an older binary's) is checked in full too, then
+    // costs the GET alone until a commit starts a log again.
+    let write = crate::dev::open_local_bucket(&database).unwrap();
+    write.put("applications/v2/epoch", "tok\n1").await.unwrap();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(true), 1 + 3);
+    assert_eq!(pending(), Some(Changed::All));
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(true), 1);
+    assert_eq!(pending(), None);
+    let mut snapshot = other.read(&ids[1]).await.unwrap();
+    snapshot.register_resource(&ids[1], kv(0)).unwrap();
+    let revision = other.commit(snapshot).await.unwrap();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(true), 1 + 3 + 1, "a new log is checked in full");
+    assert_eq!(routes.app(&ids[1]).await.unwrap().revision(), Some(&*revision));
+    assert_eq!(pending(), Some(Changed::All));
+    // Everything idle past the limit leaves the cache, and the node goes quiet.
+    routes.poll_epoch(&mut watch, Duration::ZERO).await.unwrap();
+    assert!(lock(&routes.apps).entries.is_empty());
+    assert_eq!(ops(true), 0);
+    // A commit while evicted is found by the cold read, and the first look
+    // afterwards re-checks it rather than trusting a stale epoch.
+    let mut snapshot = other.read(&ids[1]).await.unwrap();
+    snapshot.register_resource(&ids[1], cron("tock")).unwrap();
+    let revision = other.commit(snapshot).await.unwrap();
+    assert_eq!(routes.app(&ids[1]).await.unwrap().revision(), Some(&*revision));
+    ops(true);
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(true), 1 + 1);
+    // This node's own commit wakes its loop's pass at once.
+    let dispatcher = RouteDispatcher::static_host("apps.test".to_owned(), node.clone())
+        .await
+        .unwrap();
+    let routes = &dispatcher.routes;
+    routes.app(&ids[1]).await.unwrap();
+    let mut snapshot = node.read(&ids[1]).await.unwrap();
+    snapshot.register_resource(&ids[1], cron("tick")).unwrap();
+    let revision = node.commit(snapshot).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        while routes.app(&ids[1]).await.unwrap().revision() != Some(&*revision) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a local commit is served without waiting for a poll period");
+    dispatcher.shutdown().await.unwrap();
+}
+
+/// A node reads the bucket only for itself or for a child that asked: a
+/// relayed node waits for its first view and then follows views, never the
+/// bucket, while a bucket-mode node keeps reading for a child even when it
+/// serves nothing.
+#[cfg(test)]
+#[tokio::test]
+async fn relayed_node_follows_its_view_and_a_listened_to_node_keeps_reading() {
+    use crate::catalog_sync::{Upstream, View};
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("bucket.sqlite");
+    let open = || {
+        Arc::new(ApplicationStore::new(
+            crate::dev::open_local_bucket(&database).unwrap(),
+        ))
+    };
+    let (node, other) = (open(), open());
+    let id = ApplicationId {
+        app: "relayed".to_owned().try_into().unwrap(),
+    };
+    let mut snapshot = other.read(&id).await.unwrap();
+    snapshot.create(id.clone()).unwrap();
+    other.commit(snapshot).await.unwrap();
+    let ops = || node.catalog_ops.swap(0, Ordering::SeqCst);
+    let view = |epoch| View {
+        epoch,
+        age: Duration::ZERO,
+        received: std::time::Instant::now(),
+    };
+    let mut routes = Routes::new(
+        node.clone(),
+        None,
+        "apps.test".to_owned(),
+        METADATA_CACHE_ENTRIES,
+        METADATA_CACHE_BYTES,
+    );
+    let (idle, mut watch) = (Duration::from_secs(60), EpochWatch::default());
+
+    ops();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(), 0, "serving nothing, with no child, reads nothing");
+    routes.sync.answer(None, None, true).await;
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(), 1, "a node a child asked keeps reading");
+
+    routes.sync = Arc::new(CatalogSync::new(vec![Upstream {
+        node: "parent".to_owned(),
+        addr: "127.0.0.1:1".to_owned(),
+    }]));
+    routes.app(&id).await.unwrap();
+    ops();
+    let mut watch = EpochWatch {
+        forced: true,
+        ..Default::default()
+    };
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(), 0, "without a view a relayed node reads nothing");
+    assert!(
+        watch.forced && watch.seen.is_none(),
+        "and keeps what it owes"
+    );
+
+    let epoch = node.epoch().await.unwrap().map(Arc::new);
+    routes.sync.publish(view(epoch));
+    ops();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(
+        ops(),
+        1,
+        "the first look re-checks the one application, not the epoch"
+    );
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(), 0, "an unchanged view costs the bucket nothing");
+
+    let kv = crate::applications::Resource {
+        resource: ResourceRef {
+            kind: ResourceKind::Kv,
+            id: "kv".to_owned().try_into().unwrap(),
+        },
+        configuration: serde_json::json!({}),
+    };
+    let mut snapshot = other.read(&id).await.unwrap();
+    snapshot.register_resource(&id, kv).unwrap();
+    let revision = other.commit(snapshot).await.unwrap();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(), 0, "a commit the view has not carried is not seen");
+    let epoch = node.epoch().await.unwrap().map(Arc::new);
+    routes.sync.publish(view(epoch));
+    ops();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(ops(), 1, "the view names it: one read");
+    assert_eq!(routes.app(&id).await.unwrap().revision(), Some(&*revision));
 }
 
 #[cfg(test)]
@@ -767,7 +1146,8 @@ export default {
             .await
             .err()
             .unwrap()
-            .is::<DeploymentRetiring>());
+            .to_string()
+            .contains("deployment is not active"));
         assert!(settled(&pool, 0));
     }
     // Concurrent cold acquires share one startup; a later acquire is warm.
@@ -814,10 +1194,18 @@ export default {
     assert!(settled(&pool, 2));
     // Releasing a's leases makes it the idle victim; c launches only after a's
     // VMM is reaped, so capacity never exceeds two VMs.
+    // A released VM is idle, and so a victim, once its guest reports so, not
+    // when its last event ends: until then it may still run background work.
+    let idle = |client: &VmClient| {
+        pool.state.lock().unwrap().slots.values().any(|slot| {
+            matches!(slot, Slot::Ready(ready)
+                if Arc::ptr_eq(&ready.client.pin, &client.pin) && ready.idle())
+        })
+    };
     let evicted = warm.client.clone();
     drop(a);
     drop(warm);
-    until(|| evicted.transport.pending() == 0, "a did not settle").await;
+    until(|| idle(&evicted), "a did not settle").await;
     let c = pool
         .acquire_inner(app, first, &name("pool-c"), &handler, true)
         .await
@@ -827,7 +1215,9 @@ export default {
     assert!(settled(&pool, 2));
     // Warm reuse never crosses applications: the other application's VM
     // replaces idle b and serves its own pinned environment.
+    let released = b.client.clone();
     drop(b);
+    until(|| idle(&released), "b did not settle").await;
     let foreign = pool
         .acquire(app, &other, &name("pool-other"), &handler)
         .await
@@ -836,8 +1226,8 @@ export default {
     assert_eq!(foreign.pin.application, other);
     assert_eq!(text(call(&foreign, "/").await), "pool-other");
     assert!(settled(&pool, 2));
-    // Replacement: a retired deployment refuses new leases, its live lease
-    // keeps serving, and the VM is reaped once that lease settles.
+    // Replacement: work that reached a retired deployment still leases its
+    // live VM, and the VM is reaped once every lease settles.
     let mut snapshot = store.read(first).await.unwrap();
     let current = store
         .deployment(first, &name("pool-c"))
@@ -847,17 +1237,16 @@ export default {
     store.activate(&mut snapshot, current).await.unwrap();
     store.commit(snapshot).await.unwrap();
     pool.retire_deployment(first, &name("pool-c")).await;
-    assert!(format!(
-        "{:#}",
-        pool.acquire(app, first, &name("pool-c"), &handler)
-            .await
-            .err()
-            .unwrap()
-    )
-    .contains("retiring"));
+    let reached = pool
+        .acquire(app, first, &name("pool-c"), &handler)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&reached.pin, &c.pin));
     assert_eq!(text(call(&c, "/").await), "pool-c");
     let replaced = c.client.clone();
     drop(c);
+    assert!(!replaced.stop.is_cancelled(), "a leased VM was retired");
+    drop(reached);
     until(
         || replaced.stop.is_cancelled(),
         "retired deployment kept its VM",
@@ -866,12 +1255,12 @@ export default {
     until(|| settled(&pool, 1), "retired VMM was not reaped").await;
     // A caller cancelled during startup cannot abandon the VMM: the pool owns
     // startup, keeps the VM within capacity and still reaps it. A restore takes
-    // about 250 ms, so the cancel comes well before it.
+    // about 50 ms, so the cancel comes well before it.
     let cancelled = {
         let pool = &pool;
         let a = name("pool-a");
         let handler = handler.clone();
-        timeout(Duration::from_millis(80), async move {
+        timeout(Duration::from_millis(15), async move {
             pool.acquire_inner(app, first, &a, &handler, true).await
         })
         .await
@@ -1872,7 +2261,8 @@ export default {
         .await
         .err()
         .unwrap()
-        .is::<DeploymentRetiring>());
+        .to_string()
+        .contains("deployment is not active"));
     assert_eq!(fetch("/after").await.unwrap(), "load-b /after");
     dispatcher.shutdown().await.unwrap();
     assert!(vms(0));
@@ -2377,7 +2767,8 @@ async fn check_startup_classes(
         key,
         publish,
         Default::default(),
-        false,
+        // The revision says Lite, the reservation Basic: refused at launch.
+        Arc::new(store.read(&application).await.unwrap()),
         ApplicationSizeClass::Basic,
     )
     .await;
@@ -2579,7 +2970,9 @@ export default {
         gid: options.gid,
         max_vms: 5,
         max_memory_mib: 12_288,
-        idle_ttl_secs: 1,
+        // With the idle lifecycle a held lease does not keep a quiet VM:
+        // a, b and c must outlive the capacity checks below.
+        idle_ttl_secs: 10,
         platform_domain: TEST_DOMAIN.into(),
         container_fence_image: None,
         artifact_cache_ttl_secs: None,
@@ -2634,7 +3027,8 @@ export default {
         .await
         .err()
         .unwrap()
-        .is::<DeploymentRetiring>());
+        .to_string()
+        .contains("deployment is not active"));
     assert_eq!(pool.snapshot().vms, 0);
     let acquire = |application: &ApplicationId, deployment: &str| {
         let (application, deployment) = (application.clone(), name(deployment));
@@ -6824,4 +7218,80 @@ export default { get fetch() {
     .contains("secret is not registered"));
     assert_eq!(owned_vm_pids(), before, "missing secret started a VM");
     eprintln!("owned JavaScript bootstrap: application secret rotation, immutable manifests, private environment and missing-secret cold-launch refusal checked");
+}
+
+/// A served route and a VM-pinned cell scope read nothing from the bucket
+/// until reconcile sees their application change.
+#[cfg(test)]
+pub(crate) async fn served_routes_and_pinned_scopes_read_nothing_until_reconcile() {
+    let directory = tempfile::tempdir().unwrap();
+    let bucket = crate::bucket::Bucket::open_dev(&directory.path().join("served.sqlite")).unwrap();
+    let store = Arc::new(ApplicationStore::new(bucket.clone()));
+    let id: ApplicationId = serde_json::from_value(serde_json::json!({"app":"served"})).unwrap();
+    let kv = ResourceRef {
+        kind: ResourceKind::Kv,
+        id: "cache".to_owned().try_into().unwrap(),
+    };
+    let mut snapshot = store.read(&id).await.unwrap();
+    snapshot.create(id.clone()).unwrap();
+    snapshot
+        .register_resource(
+            &id,
+            crate::applications::Resource {
+                resource: kv.clone(),
+                configuration: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+    store.commit(snapshot).await.unwrap();
+    let deployment: Deployment = serde_json::from_value(serde_json::json!({
+        "manifest_version":1, "application":id, "id":"v1",
+        "handlers":[{"id":"main", "language":"javascript", "entrypoint":"index.js",
+            "artifact_sha256":"a".repeat(64), "runtime_image_sha256":"b".repeat(64), "http":true,
+            "bindings":{"CACHE":{"kind":"resource", "resource":kv}}}]
+    }))
+    .unwrap();
+    store.stage(&deployment).await.unwrap();
+    let mut snapshot = store.read(&id).await.unwrap();
+    store.activate(&mut snapshot, deployment).await.unwrap();
+    let route = snapshot.application(&id).unwrap().route_ids[&Name::try_from("main".to_owned()).unwrap()].clone();
+    store.commit(snapshot).await.unwrap();
+    let dispatcher = RouteDispatcher {
+        routes: Arc::new(Routes::new(store, None, "apps.test".into(), 16, 1 << 20)),
+        alarm_host: Default::default(),
+        _reconciler: None,
+        _catalog_sweep: None,
+        _follower: None,
+    };
+    let url = format!("https://{}.apps.test/", route.as_str());
+    assert!(dispatcher.route(&url).await.unwrap().is_some());
+    let address = ResourceAddress {
+        application: id.clone(),
+        resource: kv,
+    };
+    let scope = address
+        .cell_scope(
+            celld_logic::kv::RESERVED_CLASS,
+            &celld_logic::kv::cell_name("namespace", 0),
+        )
+        .unwrap();
+    let (class, object) = scope.split_once(':').unwrap();
+    let object = celld_applications::invocation_wire::ObjectTarget {
+        class: class.into(),
+        id: object.into(),
+        name: None,
+    };
+    dispatcher.register_cell(&address, &object).await.unwrap();
+    for object in bucket.list("applications").await.unwrap() {
+        bucket.delete(object.location.as_ref()).await.unwrap();
+    }
+    assert!(dispatcher.route(&url).await.unwrap().is_some());
+    assert_eq!(
+        dispatcher.prepare_scope(&scope).await.unwrap().unwrap().address,
+        address
+    );
+    dispatcher.register_cell(&address, &object).await.unwrap();
+    // The catalog record is gone, so the application is withdrawn.
+    dispatcher.reconcile().await.unwrap();
+    assert!(dispatcher.route(&url).await.unwrap().is_none());
 }

@@ -135,11 +135,81 @@ without it the node does not host application deployments and behaves as before.
 
 Metadata caches default to 256 entries and 16 MiB of charged metadata per node.
 `metadata_cache_entries` accepts 1-4096; `metadata_cache_bytes` accepts 1-67108864.
-Cached entries expire after one second; absent indexes are not cached because
-a read can race their first publication. Resident cells and admitted events
-retain metadata pins under the existing admission limits; evicting a discovery
-cache entry does not interrupt accepted work. Fresh VM admission checks the
-application's current active deployment.
+They bound the application, route-locator, cell-locator and scope caches, and
+the entry count of the asset cache. Entries do not expire; the least recently
+used one is evicted at the bound. Every commit also appends to one small
+object, the catalog epoch (`applications/v2/epoch`): a log of the last 64
+commits, each naming the application and its new revision. Each node reads
+just that object every `CELLD_APPLICATION_POLL_S` seconds (default 5) and
+refreshes only the applications the new entries name, and only those it
+serves, without checking the others. A node that has fallen more than 64
+commits behind, or finds the log replaced (an older celld writes a plain
+epoch), checks every application it serves once and then follows the log
+again. An application unused for `CELLD_APPLICATION_IDLE_S` seconds
+(default 120) leaves the cache and is read cold on its next request; a node
+that serves nothing (no cached application, no VM, no relay child) makes no
+epoch request at all. A node that commits through its own store acts on it
+immediately. Absent indexes are not cached because a read can race
+their first publication. Resident cells and admitted events retain metadata pins
+under the existing admission limits; evicting a discovery cache entry does not
+interrupt accepted work. Fresh VM admission checks the catalog revision the
+request was routed from, not the bucket, so a replaced or deactivated
+deployment can still start VMs on a node for up to one poll period (longer if a
+reconcile read fails) until its next reconcile.
+
+Every `CELLD_SYNC_SWEEP_S` seconds (default 300) each node that reads the
+bucket directly also sweeps the catalog: one LIST per 1000 applications,
+comparing each application's metadata revision with the previous sweep. A
+change the log does not record, because a commit's append was lost or an
+older celld committed it, is appended for every node to see, so a lost append
+delays other nodes by at most one sweep.
+
+Cron schedules are armed on edges, not on a timer. Each node that reads the
+bucket directly scans the cron index once at boot, then arms the crons of each
+application the epoch log names (within about one poll period), without
+listing the index again. An idle node learns of new applications from its
+sweep, so their crons arm within one sweep period. Only a log the node cannot
+follow rescans the whole index. An arm that fails after bounded backoff is
+tried again a minute later. Arming goes through ownership routing, so the
+scheduled event still fires on whichever node owns the cron's cell; nodes
+configured with a relay (below) do not arm crons. A lost owner needs no
+rescan: the new owner's cron cell wakes from its stored alarm like any other
+alarm.
+
+### Catalog relays
+
+In a large fleet, have most nodes read the catalog epoch from a few relays
+instead of the bucket, so bucket requests stop growing with node count:
+
+```sh
+CELLD_SYNC_UPSTREAM=relay-eu-1@10.0.1.5:9001,relay-eu-2@10.0.1.6:9001
+```
+
+Each entry is a node's `CELLD_NODE` name and its internal (`--advertise`)
+address; requests are signed with the fleet's peer secret for that node. A node
+with this setting long-polls `/peer/sync` on the first relay and moves to the
+next on an error or when the relay's view of the bucket is more than 60 s old.
+If every relay fails, it reads the epoch from the bucket every
+`CELLD_SYNC_FALLBACK_S` seconds (default 300, with jitter) and keeps trying
+the relays. Any node can be a relay, including one that itself reads from
+relays, so the fleet can be a tree: a few nodes per region read the bucket,
+the rest read from them. Keep at least two upstreams per node, in the same
+region. Relayed nodes do not sweep or arm crons; the nodes that read the bucket
+do both.
+
+Bucket requests per node per hour, for C cached applications and A applications
+in the catalog:
+
+| | Reads the bucket | Reads a relay |
+|---|---|---|
+| Idle, nothing served | 12·⌈A/1000⌉ LIST + 12 GET (sweep) | 0 |
+| Serving, no commits | 720 epoch GET + the sweep | 0 |
+| Per commit | 1 GET of that application (its crons are armed from it) | 1 GET of that application, if served |
+| Arming that commit's crons | one arm per cron | none |
+
+Before the change log, a serving node made 720 epoch HEADs, 60·C revision
+HEADs and 12 cron-index LISTs (plus a GET per cron) per hour, and C more HEADs
+on every commit anywhere in the fleet.
 
 All paths are absolute. `runtimes` digests must be distinct. `uid`/`gid` must be
 nonzero (the jailed process identity). Applications select one of the six named

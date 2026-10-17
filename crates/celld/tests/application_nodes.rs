@@ -66,7 +66,13 @@ async fn start(
     kv: &str,
     extra: &[(&str, &str)],
 ) -> Node {
-    let (public, internal) = (free_port(), free_port());
+    // A CELLD_INTERNAL_ADDR in `extra` pins the port, so other nodes can name
+    // this one before it starts.
+    let internal = extra
+        .iter()
+        .find(|(key, _)| *key == "CELLD_INTERNAL_ADDR")
+        .map_or_else(free_port, |(_, addr)| addr.rsplit_once(':').unwrap().1.parse().unwrap());
+    let public = free_port();
     let log = std::fs::File::create(directory.join(format!("{name}.log"))).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_celld"));
     command
@@ -77,11 +83,16 @@ async fn start(
         .env("CELLD_ADDR", format!("127.0.0.1:{public}"))
         .env("CELLD_INTERNAL_ADDR", format!("127.0.0.1:{internal}"))
         .env("CELLD_WATCH", directory.join(name))
+        // Its own, not the shared default under /tmp/celld, which a run as
+        // another user (root, for VM tests) may own.
+        .env("CELLD_ASSET_CACHE_DIR", directory.join(format!("{name}-asset-cache")))
         .env("CELLD_NODE", name)
         // Exercise wake recovery without waiting out the default three-minute
         // advisory scanner lease. Ownership and durable alarm checks stay intact.
         .env("CELLD_WAKER_TICK_MS", "1000")
         .env("CELLD_TEST_KV", kv)
+        // The catalog epoch poll defaults to 5 s; the checks wait for activations.
+        .env("CELLD_APPLICATION_POLL_S", "1")
         .envs(extra.iter().copied())
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
@@ -191,6 +202,28 @@ async fn get_eventually(port: u16, host: &str, path: &str) -> String {
     })
     .await
     .unwrap_or_else(|_| panic!("{path} never answered on port {port}"))
+}
+
+/// Reads `path` on `host` until it answers `status` (and `body`, when given): a
+/// commit made by another process reaches a node at its next catalog poll, not
+/// at once.
+async fn served(port: u16, host: &str, path: &str, status: u16, body: Option<&str>) {
+    let client = reqwest::Client::new();
+    let mut last = (0, String::new());
+    let seen = timeout(Duration::from_secs(10), async {
+        loop {
+            let reply = client.get(format!("http://127.0.0.1:{port}{path}")).header("host", host).send().await;
+            if let Ok(reply) = reply {
+                last = (reply.status().as_u16(), reply.text().await.unwrap_or_default());
+                if last.0 == status && body.is_none_or(|body| body == last.1) {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(seen.is_ok(), "{host}{path} never served {status} {body:?}; last {last:?}");
 }
 
 async fn get_json_eventually(node: &Node, path: &str) -> serde_json::Value {
@@ -374,7 +407,11 @@ async fn cron_rows(node: &Node, host: &str) -> Vec<Vec<serde_json::Value>> {
 }
 
 /// Publish the staged deployment `id` with each application's own CAS revision.
-async fn activate_all(store: &ApplicationStore, applications: [&ApplicationId; 2], id: &str) {
+async fn activate_all(
+    store: &ApplicationStore,
+    applications: impl IntoIterator<Item = &ApplicationId>,
+    id: &str,
+) {
     let id: celld_applications::Name = id.to_owned().try_into().unwrap();
     for application in applications {
         let mut snapshot = store.read(application).await.unwrap();
@@ -746,6 +783,38 @@ async fn kill_node(mut node: Node) {
     let _ = timeout(Duration::from_secs(10), node.child.wait()).await;
 }
 
+/// Writes the trusted VM configuration every VM node gets; returns its path
+/// and the runtime image digest that deployments name.
+fn vm_config(directory: &Path) -> (std::path::PathBuf, String) {
+    let image = std::env::var_os("CELLD_APPLICATION_JAVASCRIPT_TEST_VM_IMAGE")
+        .expect("CELLD_APPLICATION_JAVASCRIPT_TEST_VM_IMAGE is required");
+    let image = Path::new(&image);
+    let runtime_sha256 = std::fs::read_to_string(image.with_extension("sha256"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let vms = directory.join("vms.json");
+    std::fs::write(
+        &vms,
+        serde_json::json!({
+            "jailer": "/usr/local/bin/jailer",
+            "firecracker": "/usr/local/bin/firecracker",
+            "kernel": {
+                "path": std::env::var("CELLD_APPLICATION_JAVASCRIPT_TEST_KERNEL").unwrap(),
+                "sha256": std::env::var("CELLD_APPLICATION_JAVASCRIPT_TEST_KERNEL_SHA256").unwrap(),
+            },
+            "runtimes": [{"path": image, "sha256": runtime_sha256}],
+            "uid": 1000, "gid": 1000,
+            "max_vms": 2, "max_memory_mib": 12288, "idle_ttl_secs": 600,
+            "startup_pool": std::env::var("CELLD_APPLICATION_STARTUP_POOL").unwrap_or_else(|_| "0".into()).parse::<u32>().unwrap(),
+            "platform_domain": PLATFORM_DOMAIN
+        })
+        .to_string(),
+    )
+    .unwrap();
+    (vms, runtime_sha256)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires root, KVM and the approved application guest image/kernel"]
 async fn nodes_host_application_vms_and_call_remote_objects() {
@@ -766,13 +835,6 @@ async fn t31_mixed_application_node_smoke() {
 
 async fn check_application_nodes(focused: bool, static_mixed: bool) {
     celld::asyncrt::set_host_handle(tokio::runtime::Handle::current());
-    let image = std::env::var_os("CELLD_APPLICATION_JAVASCRIPT_TEST_VM_IMAGE")
-        .expect("CELLD_APPLICATION_JAVASCRIPT_TEST_VM_IMAGE is required");
-    let image = Path::new(&image);
-    let runtime_sha256 = std::fs::read_to_string(image.with_extension("sha256"))
-        .unwrap()
-        .trim()
-        .to_owned();
     // A Windows-mounted dev bucket can spend the native deadline on metadata
     // scans. Let operators retain this real-disk fixture on Linux's filesystem.
     let logs = std::env::var_os("CELLD_APPLICATION_NODE_ARTIFACTS")
@@ -788,6 +850,7 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
         .keep();
     eprintln!("application node artifacts: {}", directory.display());
     let directory = directory.as_path();
+    let (vms, runtime_sha256) = vm_config(directory);
 
     // The application, published into the store the nodes share.
     let source = directory.join("source");
@@ -978,25 +1041,6 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
     std::fs::write(
         directory.join("worker.js"),
         "export default { fetch() { return new Response('worker'); } }",
-    )
-    .unwrap();
-    let vms = directory.join("vms.json");
-    std::fs::write(
-        &vms,
-        serde_json::json!({
-            "jailer": "/usr/local/bin/jailer",
-            "firecracker": "/usr/local/bin/firecracker",
-            "kernel": {
-                "path": std::env::var("CELLD_APPLICATION_JAVASCRIPT_TEST_KERNEL").unwrap(),
-                "sha256": std::env::var("CELLD_APPLICATION_JAVASCRIPT_TEST_KERNEL_SHA256").unwrap(),
-            },
-            "runtimes": [{"path": image, "sha256": runtime_sha256}],
-            "uid": 1000, "gid": 1000,
-            "max_vms": 2, "max_memory_mib": 12288, "idle_ttl_secs": 600,
-            "startup_pool": std::env::var("CELLD_APPLICATION_STARTUP_POOL").unwrap_or_else(|_| "0".into()).parse::<u32>().unwrap(),
-            "platform_domain": PLATFORM_DOMAIN
-        })
-        .to_string(),
     )
     .unwrap();
 
@@ -2939,9 +2983,11 @@ async fn t31_static_application_node_smoke() {
     cli(&api, &token, "static-one", "stage", &["--file", manifest_path]).await.unwrap();
     cli(&api, &token, "static-one", "activate", &["--deployment", "v2"]).await.unwrap();
     assert_eq!(cli(&api, &reader, "static-one", "get", &[]).await.unwrap()["asset_hostname"], host);
-    assert_eq!(request(reqwest::Method::GET, "/").send().await.unwrap().text().await.unwrap(), "<h1>two</h1>");
+    // The API is this process, not the node's: each change below reaches the
+    // node at its next catalog poll.
+    served(node.public, &host, "/", 200, Some("<h1>two</h1>")).await;
     cli(&api, &token, "static-one", "activate", &["--deployment", "v1"]).await.unwrap();
-    assert_eq!(request(reqwest::Method::GET, "/").send().await.unwrap().text().await.unwrap(), "<h1>one</h1>");
+    served(node.public, &host, "/", 200, Some("<h1>one</h1>")).await;
     // SPA configuration comes from the same CLI assets project reader.
     let config = directory.join("spa.json");
     std::fs::write(&config, r#"{"assets":{"not_found_handling":"single-page-application"}}"#).unwrap();
@@ -2949,13 +2995,157 @@ async fn t31_static_application_node_smoke() {
     std::fs::write(&manifest, serde_json::to_vec(&staged("spa", spa["assets"].clone())).unwrap()).unwrap();
     cli(&api, &token, "static-one", "stage", &["--file", manifest_path]).await.unwrap();
     cli(&api, &token, "static-one", "activate", &["--deployment", "spa"]).await.unwrap();
-    assert_eq!(request(reqwest::Method::GET, "/deep/spa").send().await.unwrap().text().await.unwrap(), "<h1>two</h1>");
+    served(node.public, &host, "/deep/spa", 200, Some("<h1>two</h1>")).await;
     cli(&api, &token, "static-one", "deactivate", &[]).await.unwrap();
-    assert_eq!(request(reqwest::Method::GET, "/a.txt").send().await.unwrap().status(), 404);
+    served(node.public, &host, "/a.txt", 404, None).await;
     let state: Value = reqwest::get(format!("http://127.0.0.1:{}/state", node.internal)).await.unwrap().json().await.unwrap();
     for field in ["vms", "memoryMib", "starting", "ready", "quarantined"] { assert_eq!(state["applicationVms"][field], 0, "{state}"); }
     assert!(vm_pids(&node).is_empty());
     drain(node).await;
     server.abort();
     eprintln!("T31 static node PASS: real API/CLI, no legacy CURRENT or VM config, cold/cached HTTP, corrupt/cross-app refusal, stable replacement/rollback/deactivation; zero VM capacity/claims");
+}
+
+/// The catalog relay tree on real nodes: a root reads the bucket, two relays
+/// follow the root (`CELLD_SYNC_UPSTREAM`) and a leaf follows both relays. No
+/// VM starts: the application serves static assets, and its cron trigger next
+/// runs on 1 January.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires root, KVM and the approved application guest image/kernel"]
+async fn catalog_relay_tree_nodes() {
+    /// Waits until `node` serves `body` at `/a.txt`.
+    async fn serves(node: &Node, host: &str, body: &str) {
+        timeout(Duration::from_secs(30), async {
+            while get(node.public, host, "/a.txt").await != body {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{body} never reached the node"));
+    }
+    /// Waits until the node's log holds `needle`.
+    async fn logged(directory: &Path, node: &str, needle: &str) {
+        let log = directory.join(format!("{node}.log"));
+        timeout(Duration::from_secs(60), async {
+            while !std::fs::read_to_string(&log).unwrap().contains(needle) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{node} never logged {needle:?}"));
+    }
+    celld::asyncrt::set_host_handle(tokio::runtime::Handle::current());
+    let artifacts = std::env::var_os("CELLD_APPLICATION_NODE_ARTIFACTS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&artifacts).unwrap();
+    let directory = tempfile::Builder::new().prefix("relay-tree-").tempdir_in(artifacts).unwrap().keep();
+    eprintln!("relay tree node artifacts: {}", directory.display());
+    let directory = directory.as_path();
+    let (vms, runtime_sha256) = vm_config(directory);
+    let store = ApplicationStore::new(
+        celld::dev::open_local_bucket(&directory.join("bucket.sqlite")).unwrap(),
+    );
+    let application = ApplicationId {
+        app: "relay".to_owned().try_into().unwrap(),
+    };
+    // Revision `vN` serves "revision vN" at /a.txt on the asset hostname.
+    for label in ["v1", "v2", "v3"] {
+        let body = format!("revision {label}");
+        let sha256 = content_digest(body.as_bytes());
+        store.upload_artifact(&application, &sha256, body.clone().into_bytes().into()).await.unwrap();
+        let index = serde_json::json!({"schema_version": 1, "config": {}, "entries": {
+            "/a.txt": {"sha256": sha256, "bytes": body.len(), "content_type": "text/plain"}}})
+        .to_string()
+        .into_bytes();
+        let index_sha256 = content_digest(&index);
+        store.upload_artifact(&application, &index_sha256, index.into()).await.unwrap();
+        let deployment: Deployment = serde_json::from_value(serde_json::json!({
+            "manifest_version": 1, "application": application, "id": label,
+            "assets": {"index": "assets.json", "sha256": index_sha256, "file_count": 1, "total_bytes": body.len()},
+            "handlers": [{"id": "javascript", "language": "javascript", "entrypoint": "main.mjs",
+                "artifact_sha256": content_digest(b"never run"), "runtime_image_sha256": runtime_sha256}],
+            "triggers": [{"kind": "cron", "id": "tick", "expression": "0 0 1 1 *", "handler": "javascript"}]
+        }))
+        .unwrap();
+        store.stage(&deployment).await.unwrap();
+    }
+    let mut snapshot = store.read(&application).await.unwrap();
+    snapshot.create(application.clone()).unwrap();
+    let tick = ResourceRef {
+        kind: ResourceKind::Cron,
+        id: "tick".to_owned().try_into().unwrap(),
+    };
+    snapshot
+        .register_resource(&application, Resource { resource: tick, configuration: serde_json::json!({}) })
+        .unwrap();
+    store.commit(snapshot).await.unwrap();
+    activate_all(&store, [&application], "v1").await;
+    let snapshot = store.read(&application).await.unwrap();
+    let route = snapshot.application(&application).unwrap().asset_route_id.clone().unwrap();
+    let host = format!("{}.{PLATFORM_DOMAIN}", route.as_str());
+
+    // The relays start before the root, with the cron already active: a relay
+    // that armed crons at boot would own the cron cell before the root exists.
+    // Each reads the bucket once while the root is missing, then never again.
+    let root_addr = format!("127.0.0.1:{}", free_port());
+    let to_root = format!("root@{root_addr}");
+    let relayed = [("CELLD_SYNC_UPSTREAM", to_root.as_str()), ("CELLD_SYNC_FALLBACK_S", "3600")];
+    let relay_a = start(directory, "relay-a", Some(&vms), true, "", &relayed).await;
+    let relay_b = start(directory, "relay-b", Some(&vms), true, "", &relayed).await;
+    let root = start(directory, "root", Some(&vms), true, "", &[("CELLD_INTERNAL_ADDR", root_addr.as_str())]).await;
+    for relay in ["relay-a", "relay-b"] {
+        logged(directory, relay, "catalog sync upstream answers again").await;
+    }
+    // 3. Only the root arms: it takes the cron cell nobody else claimed.
+    timeout(Duration::from_secs(60), async {
+        while !holds_cell(&root, ".cron:").await {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the root did not arm the cron");
+    // The leaf starts once both relays follow the root, so it settles on the first.
+    let to_relays = format!(
+        "relay-a@127.0.0.1:{},relay-b@127.0.0.1:{}",
+        relay_a.internal, relay_b.internal
+    );
+    // Never idle: an evicted application is read cold, which would serve a
+    // new revision without the tree.
+    let leaf = start(directory, "leaf", Some(&vms), true, "",
+        &[("CELLD_SYNC_UPSTREAM", to_relays.as_str()), ("CELLD_SYNC_FALLBACK_S", "3600"), ("CELLD_APPLICATION_IDLE_S", "3600")]).await;
+    for node in [&relay_a, &relay_b, &leaf] {
+        assert!(!holds_cell(node, ".cron:").await, "a relayed node holds the cron cell");
+    }
+
+    // 1. A commit reaches the leaf through the root and the first relay.
+    assert_eq!(get(leaf.public, &host, "/a.txt").await, "revision v1");
+    activate_all(&store, [&application], "v2").await;
+    serves(&leaf, &host, "revision v2").await;
+
+    // 2. Losing the first relay moves the leaf to the second, and the next
+    // commit arrives through it.
+    let leaf_log = directory.join("leaf.log");
+    let before = std::fs::read_to_string(&leaf_log).unwrap().len();
+    drain(relay_a).await;
+    activate_all(&store, [&application], "v3").await;
+    serves(&leaf, &host, "revision v3").await;
+    let log = std::fs::read_to_string(&leaf_log).unwrap();
+    let failover = &log[before..];
+    assert!(
+        failover.lines().any(|line| line.contains("trying the next") && line.contains("relay-a")),
+        "{failover}"
+    );
+    assert!(
+        failover.lines().any(|line| line.contains("answers again") && line.contains("relay-b")),
+        "{failover}"
+    );
+    // 4. The leaf never read the epoch from the bucket: every view came down
+    // the tree.
+    assert!(!log.contains("reading the bucket"), "{log}");
+
+    for node in [leaf, relay_b, root] {
+        drain(node).await;
+    }
+    eprintln!("catalog relay tree PASS: commits reached a leaf through root and relay, the leaf failed over to the second relay when the first drained and still got the next commit, it never read the epoch from the bucket, and only the bucket-reading root armed the cron");
 }

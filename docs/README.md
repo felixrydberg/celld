@@ -651,6 +651,11 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_ESBUILD` | The path of the esbuild executable |
 | `CELLD_ACTIVATIONS` | Concurrent cold-cell activations (default: 8 per CPU, at least 16, at most 128) |
 | `CELLD_DEPLOY_POLL_S` | The deployment pointer poll interval in seconds (default: 30) |
+| `CELLD_APPLICATION_POLL_S` | How often a node reads the application catalog epoch log to notice activations and other changes, in seconds (default: 5) |
+| `CELLD_APPLICATION_IDLE_S` | Seconds an unused application stays in a node's metadata cache before it is dropped and read cold on its next request (default: 120) |
+| `CELLD_SYNC_SWEEP_S` | How often a node that reads the bucket sweeps the application catalog listing, repairing commits the epoch log lost and arming new applications' crons, in seconds (default: 300) |
+| `CELLD_SYNC_UPSTREAM` | Comma-separated `node@host:port` relays to read the application catalog epoch from instead of the bucket (default: read the bucket). See "Catalog relays" in the application setup guide |
+| `CELLD_SYNC_FALLBACK_S` | How often a relayed node reads the epoch from the bucket while every relay is failing, in seconds (default: 300) |
 | `CELLD_DEPLOY_MAX_AGE_S` | Seconds before celld forces a resident Durable Object onto a new deployment (default: 60; 0 forces at once) |
 | `CELLD_OPERATION_DEADLINE_MS` | The deadline for a non-restore operation (default: 15000) |
 | `CELLD_MAX_CELL_REQUESTS` | Concurrent fetch events for one Durable Object (default: 64) |

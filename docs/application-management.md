@@ -129,6 +129,16 @@ fleet listing. `list --limit 1 --cursor TOKEN` returns one page; pass its
    staged deployments are kept; persistent data is never deleted by code changes
    or deactivation.
 
+A node keeps the metadata of the applications it serves in memory and watches
+one small catalog epoch object in the bucket (every 5 seconds by default,
+`CELLD_APPLICATION_POLL_S`), a log of recent commits that names each changed
+application, so an activation, rollback, limit change or deactivation reaches
+every node within about one poll period and costs it one read of that
+application. Like a Workers
+version, a deployment is immutable: a request that already reached the previous
+deployment finishes there, and its VMs retire once idle. A Durable Object still
+has one live instance at a time across the change.
+
 `deployment.json`:
 
 ```json
@@ -233,7 +243,10 @@ configured SPA/404 behavior are unchanged. Missing paths return a terminal
 Activation verifies the index and every body's checksum before publishing.
 Missing, corrupt or foreign assets leave the active deployment unchanged.
 Static routes refuse `run_worker_first`; deployments without handlers also
-refuse cron/queue triggers. A mixed deployment can carry top-level `assets`
+refuse cron/queue triggers. Activating or replacing a cron trigger arms it on
+the nodes that read the bucket when they see the new revision (within a poll
+period), or at the latest after their next catalog sweep (`CELLD_SYNC_SWEEP_S`,
+default 300 s). A mixed deployment can carry top-level `assets`
 and executable handlers: its static URL always resolves on the host, while
 each handler URL retains assets-first and explicit worker-first dispatch into
 Firecracker. Dynamic execution requires `--application-vms`; those nodes use
@@ -278,8 +291,9 @@ Application credentials return zero or one entry and reject cursors without
 listing the fleet. Invalid cursors or unknown query fields return 400.
 
 Cell data, leases and replication retain the original Celld mechanisms. Old
-application IDs containing `tenant`, tenant grants, tenant CLI flags and the
-legacy fleet catalog are unsupported; there is no migration reader.
+application IDs containing `tenant`, tenant grants and tenant CLI flags are
+unsupported; there is no migration reader, and a node no longer refuses to start
+over version 1 state: it ignores it.
 
 ## Status
 
