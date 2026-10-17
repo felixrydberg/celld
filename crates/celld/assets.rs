@@ -82,6 +82,7 @@ const FALLBACK_CHECK_MS: u64 = 5_000;
 struct AssetResolverInner {
     bucket: Bucket,
     index: AssetIndex,
+    index_bytes: usize,
     asset_only: bool,
     fallback: Option<FallbackSource>,
     /// Application assets keep their bodies under the application's own
@@ -193,6 +194,7 @@ impl AssetResolver {
             inner: Arc::new(AssetResolverInner {
                 bucket: bucket.clone(),
                 index,
+                index_bytes: bytes.len(),
                 asset_only,
                 fallback,
                 blob_prefix,
@@ -205,6 +207,11 @@ impl AssetResolver {
                 redirect_rules,
             }),
         })
+    }
+
+    /// The size of the index as stored, a measure of what it holds in memory.
+    pub fn index_bytes(&self) -> usize {
+        self.inner.index_bytes
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &AssetEntry> {

@@ -100,7 +100,8 @@ pub(crate) fn build(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
 }
 
 /// Refuses incompatible or truncated images before a VM boots. The cache
-/// checks the whole digest; the guest kernel validates the filesystem on mount.
+/// hashes an artifact once, at download, so this is a structural check only;
+/// the guest kernel validates the filesystem on mount.
 pub(crate) fn check(path: &Path) -> Result<()> {
     let mut file = std::fs::File::open(path)?;
     let length = file.metadata()?.len();
