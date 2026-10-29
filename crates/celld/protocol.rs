@@ -453,7 +453,7 @@ pub fn asset_blob_key(sha256: &str) -> Option<String> {
 
 /// `deploy/current.json` — the fleet-wide pointer a node reads on startup.
 /// Changing this is a deploy; nodes converge to it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployPointer {
     /// Present on fleet-wide pointers. Older named pointers omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -463,7 +463,7 @@ pub struct DeployPointer {
     pub rollout: Rollout,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rollout {
     pub percent: u8,
 }

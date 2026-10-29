@@ -598,6 +598,148 @@ async fn arm_pending_alarm(node: &Node, name: &str) {
     );
 }
 
+/// The node holding the advisory waker role and when its lease ends, as the
+/// bucket records it.
+async fn waker_lease(bucket: &celld::bucket::Bucket) -> Option<(String, i64)> {
+    let (bytes, _) = bucket.get("wake/waker.json").await.unwrap()?;
+    let lease: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    Some((lease["node"].as_str()?.to_owned(), lease["expires_ms"].as_i64()?))
+}
+
+/// The cell of the fixture's `Counter` object `name`, once a wake entry for its
+/// alarm is published. Cell names are hashed, so the scope is computed, not
+/// searched for.
+async fn wake_entry_cell(bucket: &celld::bucket::Bucket, name: &str) -> Option<String> {
+    let cell = celld_applications::ResourceAddress {
+        application: ApplicationId {
+            app: "nodes".to_owned().try_into().unwrap(),
+        },
+        resource: ResourceRef {
+            kind: ResourceKind::DurableObject,
+            id: "counter".to_owned().try_into().unwrap(),
+        },
+    }
+    .cell_scope("Counter", name)
+    .unwrap();
+    bucket
+        .list("wake/entries/")
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|object| celld_logic::wake::parse_entry_key(object.location.as_ref()))
+        .any(|entry| entry.cell == cell)
+        .then_some(cell)
+}
+
+/// Arms an alarm on `owner`, evicts its cell so that it sleeps behind the wake
+/// entry, and returns once the alarm has fired exactly once. Nothing reads the
+/// cell in between, because a request would wake it too: the owner does not
+/// scan the wake index, so only the elected waker's push can.
+async fn alarm_fires_from_dormancy(bucket: &celld::bucket::Bucket, owner: &Node, name: &str) {
+    // Far enough out that the eviction always lands first, and past the one
+    // second residency window the nodes run with, so the cell may be evicted.
+    let arm = format!("/alarm-arm?name={name}&delay=25000");
+    assert_eq!(get(owner.public, "route.test", &arm).await, "armed");
+    assert_alarm_unfired(owner, name, true).await;
+    let cell = wake_entry_cell(bucket, name)
+        .await
+        .expect("the installation did not publish a wake entry");
+    let evict = format!("http://127.0.0.1:{}/evict/{cell}", owner.internal);
+    timeout(Duration::from_secs(20), async {
+        // Refused until the alarm is covered by its entry and the cell is idle.
+        while reqwest::Client::new().post(&evict).send().await.unwrap().status() != 200 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the owner did not evict the cell behind its alarm");
+    // The entry is retired only after the alarm has run.
+    timeout(Duration::from_secs(120), async {
+        while wake_entry_cell(bucket, name).await.is_some() {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("the dormant owner's alarm was never woken");
+    alarm_fired_once(owner, name).await;
+}
+
+/// Alarm wakes list the bucket from one node, the elected waker, which pushes
+/// each entry to its live owner. Three nodes: an alarm on a dormant cell of a
+/// node that is not the waker fires through a push; then the waker is killed
+/// right after it renews its lease, another node takes the role within the
+/// lease TTL (three one-second ticks), and an alarm armed after the death on
+/// each survivor, the new waker included, still fires once.
+async fn wake_push_survives_waker_death(
+    directory: &Path,
+    vms: &Path,
+    bucket: &celld::bucket::Bucket,
+) {
+    // Sticky ownership keeps an evicted cell with its owner. The default
+    // releases it, and the waker would hint it as an orphan without a push.
+    let extra = [
+        ("CELLD_HANDLER_BUDGET_S", "60"),
+        ("CELLD_PRESSURE_OWNERSHIP", "sticky"),
+        ("CELLD_ALARM_RESIDENT_MS", "1000"),
+    ];
+    let mut nodes = Vec::new();
+    for name in ["wake-push-a", "wake-push-b", "wake-push-c"] {
+        let node = start(directory, name, Some(vms), true, "", &extra).await;
+        assert_eq!(get_eventually(node.public, "route.test", "/hello").await, "hello one");
+        nodes.push((name, node));
+    }
+    let waker = timeout(Duration::from_secs(30), async {
+        loop {
+            match waker_lease(bucket).await {
+                Some((holder, _)) if nodes.iter().any(|(name, _)| *name == holder) => break holder,
+                _ => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("none of the nodes took the waker role");
+    let waker = nodes.iter().position(|(name, _)| *name == waker).unwrap();
+    alarm_fires_from_dormancy(bucket, &nodes[(waker + 1) % 3].1, "wake-push-before").await;
+
+    // Kill whoever holds the role the moment its lease is renewed, so a full
+    // TTL still stands on a waker that is gone.
+    let before = waker_lease(bucket).await.unwrap();
+    let renewed = timeout(Duration::from_secs(10), async {
+        loop {
+            let now = waker_lease(bucket).await.unwrap();
+            if now != before {
+                break now;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the waker did not renew its lease");
+    let dead = nodes.iter().position(|(name, _)| *name == renewed.0).unwrap();
+    kill_node(nodes.swap_remove(dead).1).await;
+    let killed = std::time::Instant::now();
+    timeout(Duration::from_secs(15), async {
+        while waker_lease(bucket).await.is_some_and(|(holder, _)| holder == renewed.0) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("no other node took the waker role within its lease TTL");
+    assert!(killed.elapsed() < Duration::from_secs(10), "takeover took {:?}", killed.elapsed());
+
+    // Armed after the death, so only the new waker can wake them: it hints its
+    // own cell itself and pushes the other survivor's.
+    let [(_, first), (_, second)] = &nodes[..] else { unreachable!() };
+    tokio::join!(
+        alarm_fires_from_dormancy(bucket, first, "wake-push-after-a"),
+        alarm_fires_from_dormancy(bucket, second, "wake-push-after-b"),
+    );
+    for (_, node) in nodes {
+        drain(node).await;
+    }
+    eprintln!("wake push: an alarm on a dormant cell of a non-waker node fired through the elected waker's push; after the waker was killed mid-tick another node took the role in {:?} and an alarm on each survivor still fired once", killed.elapsed());
+}
+
 /// A request that may fail: the body of a 200, otherwise `None`. A frozen,
 /// fenced or recovering node answers late, wrongly or not at all.
 async fn try_get_opt(port: u16, host: &str, path: &str) -> Option<String> {
@@ -2602,6 +2744,7 @@ async fn check_application_nodes(focused: bool, static_mixed: bool) {
         "lost owner's guest served the successor"
     );
     drain(successor).await;
+    wake_push_survives_waker_death(directory, &vms, &bucket).await;
     // T23: recovery and one-writer fencing on replicated production-bootstrap
     // nodes, for every durable service. Two nodes hold acknowledged state: an
     // object's storage, D1 rows, KV values (inline and blob), a delayed queue

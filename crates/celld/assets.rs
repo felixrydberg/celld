@@ -89,9 +89,12 @@ struct AssetResolverInner {
     /// artifact prefix instead of the fleet-wide content-addressed prefix.
     blob_prefix: Option<String>,
     fallback_state: std::sync::Mutex<FallbackState>,
+    /// The node's disk tier for the index and the bodies, when it has one.
+    objects: Option<Arc<crate::object_cache::ObjectCache>>,
     cache_root: PathBuf,
     cache_max_bytes: u64,
-    download_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Downloads in flight, by digest: concurrent misses share one.
+    downloads: crate::single_flight::SingleFlight<String, ()>,
     cleanup_lock: Mutex<()>,
     header_rules: Vec<HeaderRule>,
     redirect_rules: Vec<RedirectRule>,
@@ -150,13 +153,19 @@ impl AssetResolver {
             return Err(anyhow!("unsupported asset index name: {}", reference.index));
         }
         let key = format!("{prefix}/{}", reference.index);
-        Self::load_scoped(bucket, &key, None, None, reference, asset_only, fallback).await
+        Self::load_scoped(
+            bucket, &key, None, None, reference, asset_only, fallback, None,
+        )
+        .await
     }
 
     /// `load` for an index stored at `key`. `blob_prefix` names where the
     /// bodies live (`None`: the fleet-wide prefix) and `cache_scope` keeps
-    /// the local body cache private to one application.
-    pub async fn load_scoped(
+    /// the local body cache private to one application. `objects` is the
+    /// node's disk tier for the index and the bodies.
+    // Each parameter names one independent input of a load.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn load_scoped(
         bucket: &Bucket,
         key: &str,
         blob_prefix: Option<String>,
@@ -164,8 +173,18 @@ impl AssetResolver {
         reference: &AssetManifestRef,
         asset_only: bool,
         fallback: Option<FallbackSource>,
+        objects: Option<Arc<crate::object_cache::ObjectCache>>,
     ) -> anyhow::Result<Self> {
-        let (bytes, _) = bucket.get(key).await?.with_context(|| {
+        // ponytail: no size bound, as before; cap it if indexes can reach many MiB.
+        let bytes = crate::object_cache::immutable_object(
+            objects.as_deref(),
+            bucket,
+            key,
+            u64::MAX,
+            "object exceeds limit",
+        )
+        .await?
+        .with_context(|| {
             format!(
                 "read {}://{}/{key}: no such key",
                 bucket.scheme(),
@@ -199,9 +218,10 @@ impl AssetResolver {
                 fallback,
                 blob_prefix,
                 fallback_state: std::sync::Mutex::new(FallbackState::default()),
+                objects,
                 cache_root,
                 cache_max_bytes,
-                download_locks: Mutex::new(HashMap::new()),
+                downloads: Default::default(),
                 cleanup_lock: Mutex::new(()),
                 header_rules,
                 redirect_rules,
@@ -695,20 +715,34 @@ impl AssetResolver {
             touch_cache_file(cache_path.clone());
             return Ok(file);
         }
+        // Concurrent misses share one download and its outcome, a failure
+        // included: under a stampede every waiter then fails at once, instead
+        // of retrying in turn behind a lock. Each opens the file afterwards,
+        // so the body is not held in memory once per waiter.
+        self.inner
+            .downloads
+            .run(entry.sha256.clone(), || {
+                self.download(resolved_path, entry, &cache_path)
+            })
+            .await?;
+        let file = tokio::fs::File::open(&cache_path)
+            .await
+            .with_context(|| format!("open asset cache file {}", cache_path.display()))?;
+        touch_cache_file(cache_path);
+        Ok(file)
+    }
 
-        let lock = {
-            let mut locks = self.inner.download_locks.lock().await;
-            locks
-                .entry(entry.sha256.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        let _guard = lock.lock().await;
-        if let Some(file) = valid_cached_file(&cache_path, entry.bytes).await? {
-            touch_cache_file(cache_path.clone());
-            return Ok(file);
+    /// Fetches `entry` into its cache file at `cache_path`.
+    async fn download(
+        &self,
+        resolved_path: &str,
+        entry: &AssetEntry,
+        cache_path: &Path,
+    ) -> anyhow::Result<()> {
+        // Another flight may have finished between the caller's look and this one.
+        if valid_cached_file(cache_path, entry.bytes).await?.is_some() {
+            return Ok(());
         }
-
         let parent = cache_path
             .parent()
             .context("asset cache path has no parent")?;
@@ -723,19 +757,22 @@ impl AssetResolver {
                 None => fleet,
             })
             .ok_or_else(|| anyhow!("invalid asset digest for {resolved_path}"))?;
-        let (body, _) = self
-            .inner
-            .bucket
-            .get(&key)
-            .await
-            .with_context(|| format!("read asset {resolved_path}"))?
-            .with_context(|| {
-                format!(
-                    "asset {resolved_path} missing from {}://{}/{key}",
-                    self.inner.bucket.scheme(),
-                    self.inner.bucket.name
-                )
-            })?;
+        let body = crate::object_cache::immutable_object(
+            self.inner.objects.as_deref(),
+            &self.inner.bucket,
+            &key,
+            entry.bytes,
+            "asset body exceeds its indexed size",
+        )
+        .await
+        .with_context(|| format!("read asset {resolved_path}"))?
+        .with_context(|| {
+            format!(
+                "asset {resolved_path} missing from {}://{}/{key}",
+                self.inner.bucket.scheme(),
+                self.inner.bucket.name
+            )
+        })?;
         if body.len() as u64 != entry.bytes {
             return Err(anyhow!("asset {resolved_path} has the wrong bucket size"));
         }
@@ -765,10 +802,10 @@ impl AssetResolver {
                 entry.sha256
             ));
         }
-        if valid_cached_file(&cache_path, entry.bytes).await?.is_some() {
+        if valid_cached_file(cache_path, entry.bytes).await?.is_some() {
             let _ = tokio::fs::remove_file(&temporary).await;
         } else {
-            tokio::fs::rename(&temporary, &cache_path)
+            tokio::fs::rename(&temporary, cache_path)
                 .await
                 .with_context(|| {
                     format!(
@@ -778,10 +815,6 @@ impl AssetResolver {
                     )
                 })?;
         }
-        let file = tokio::fs::File::open(&cache_path)
-            .await
-            .with_context(|| format!("open asset cache file {}", cache_path.display()))?;
-        touch_cache_file(cache_path);
         let resolver = self.clone();
         tokio::spawn(async move {
             if let Err(error) = resolver.cleanup_cache().await {
@@ -792,7 +825,7 @@ impl AssetResolver {
                 );
             }
         });
-        Ok(file)
+        Ok(())
     }
 
     async fn cleanup_cache(&self) -> anyhow::Result<()> {

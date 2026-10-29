@@ -14,10 +14,12 @@ use crate::application_template::{
 };
 use crate::application_template_agent::{claim, prewarm, AGENT_PORT, HELLO};
 use crate::applications::{
-    content_digest, Application, ApplicationLimits, ApplicationSizeClass, ApplicationStore,
-    CellLocator, EpochChange, RouteLocator, Snapshot,
+    content_digest, object_kind, Application, ApplicationLimits, ApplicationSizeClass,
+    ApplicationStore, CellLocator, EpochChange, RouteLocator, Snapshot,
 };
 use crate::catalog_sync::CatalogSync;
+use crate::object_cache::Object;
+use crate::single_flight::SingleFlight;
 use anyhow::{ensure, Context, Result};
 use bytes::Bytes;
 use celld_applications::{
@@ -39,6 +41,7 @@ use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
+use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -2301,6 +2304,8 @@ pub(crate) struct Routes {
     pool: Option<VmPool>,
     domain: String,
     apps: Mutex<BoundedCache<ApplicationId, Arc<Snapshot>>>,
+    /// Cold reads in flight: concurrent misses of one application share one.
+    cold: SingleFlight<ApplicationId, Arc<Snapshot>>,
     route_locators: Mutex<BoundedCache<RouteId, RouteLocator>>,
     cell_locators: Mutex<BoundedCache<String, CellLocator>>,
     scopes: Mutex<BoundedCache<String, Arc<ScopeMetadata>>>,
@@ -2312,7 +2317,8 @@ pub(crate) struct Routes {
     /// What changed since the cron arm last took it.
     catalog_pending: Mutex<Option<Changed>>,
     /// Where this node learns the catalog epoch (the bucket, or upstream
-    /// nodes), and what it tells the nodes reading from it.
+    /// nodes), and what it tells the nodes reading from it. The node's one, which
+    /// `main` also feeds the deploy pointer.
     sync: Arc<CatalogSync>,
 }
 
@@ -2323,19 +2329,21 @@ impl Routes {
         domain: String,
         entries: usize,
         bytes: usize,
+        sync: Arc<CatalogSync>,
     ) -> Self {
         Self {
             store,
             pool,
             domain,
             apps: Mutex::new(BoundedCache::new(entries, bytes)),
+            cold: SingleFlight::default(),
             route_locators: Mutex::new(BoundedCache::new(entries, bytes)),
             cell_locators: Mutex::new(BoundedCache::new(entries, bytes)),
             scopes: Mutex::new(BoundedCache::new(entries, bytes)),
             assets: Mutex::new(BoundedCache::new(entries, ASSET_INDEX_CACHE_BYTES)),
             catalog_changed: tokio::sync::Notify::new(),
             catalog_pending: Mutex::new(None),
-            sync: Arc::new(CatalogSync::from_env()),
+            sync,
         }
     }
 
@@ -2358,19 +2366,21 @@ impl Routes {
         self.catalog_changed.notify_one();
     }
 
-    /// The revision of `id` this node serves, read through on a miss.
-    // ponytail: concurrent misses each read once; single-flight if cold bursts matter.
+    /// The revision of `id` this node serves, read through on a miss. Concurrent
+    /// misses of one application share one read.
     async fn app(&self, id: &ApplicationId) -> Result<Arc<Snapshot>> {
         if let Some(found) = lock(&self.apps).get(id) {
             return Ok(found);
         }
-        self.refresh(id).await
+        self.cold.run(id.clone(), || self.refresh(id, true)).await
     }
 
     /// Reads `id` again and serves that revision from now on, telling the cron
-    /// arm when it changed.
-    async fn refresh(&self, id: &ApplicationId) -> Result<Arc<Snapshot>> {
-        let (snapshot, changed) = self.reread(id).await?;
+    /// arm when it changed. `cold`: a first read for a request, which this
+    /// node's disk copy may answer; otherwise the node knows its view is behind
+    /// and only the bucket will do.
+    async fn refresh(&self, id: &ApplicationId, cold: bool) -> Result<Arc<Snapshot>> {
+        let (snapshot, changed) = self.reread(id, cold).await?;
         if changed {
             self.signal_catalog_changed(Changed::Apps(BTreeSet::from([id.clone()])));
         }
@@ -2379,27 +2389,51 @@ impl Routes {
 
     /// `refresh` without the signal, and whether the revision changed, so a
     /// pass tells the cron arm everything it found at once.
-    async fn reread(&self, id: &ApplicationId) -> Result<(Arc<Snapshot>, bool)> {
+    async fn reread(&self, id: &ApplicationId, cold: bool) -> Result<(Arc<Snapshot>, bool)> {
         let (previous, used) = {
             let apps = lock(&self.apps);
             (apps.peek(id), apps.used(id))
         };
-        let snapshot = Arc::new(self.store.read(id).await?);
+        let mut disk = cold;
+        let snapshot = loop {
+            // A commit the log named by now is in what this read returns.
+            let before = self.sync.position();
+            let from_disk = disk;
+            let read = if disk {
+                self.store.read(id).await
+            } else {
+                self.store.read_fresh(id).await
+            };
+            // A repeat follows a commit the disk copy may predate.
+            disk = false;
+            let snapshot = Arc::new(read?);
+            let size = snapshot
+                .application(id)
+                .map(|app| serde_json::to_vec(app).map(|body| body.len()))
+                .transpose()?
+                .unwrap_or(0)
+                + 1024;
+            // A re-read by reconcile is not a use, so it keeps the entry's age.
+            lock(&self.apps).insert_at(
+                id.clone(),
+                size,
+                snapshot.clone(),
+                used.unwrap_or_else(Instant::now),
+            );
+            // A poll that followed the log while this read was in flight
+            // skipped `id`, not cached yet, and the log never names that
+            // commit again: read once more if it named one this may predate.
+            // From now on `id` is cached, so later polls see it themselves. A
+            // disk copy is also checked against the log as a whole: the poll
+            // drops the copies the log names, and this read can beat it.
+            let stale = self.sync.changed_since(&before, id, snapshot.revision())
+                || (from_disk && self.sync.names_other(id, snapshot.revision()));
+            if !stale {
+                break snapshot;
+            }
+        };
         // A first read is not a change: the boot scan covers what exists.
         let changed = previous.is_some_and(|previous| previous.revision() != snapshot.revision());
-        let size = snapshot
-            .application(id)
-            .map(|app| serde_json::to_vec(app).map(|body| body.len()))
-            .transpose()?
-            .unwrap_or(0)
-            + 1024;
-        // A re-read by reconcile is not a use, so it keeps the entry's age.
-        lock(&self.apps).insert_at(
-            id.clone(),
-            size,
-            snapshot.clone(),
-            used.unwrap_or_else(Instant::now),
-        );
         // Before any signal, so the cron arm woken by it reads this revision.
         lock(&self.scopes).retain(|_, metadata| &metadata.address.application != id);
         Ok((snapshot, changed))
@@ -2530,7 +2564,9 @@ impl Routes {
     /// the log lost is not seen here until the catalog sweep appends it. A node
     /// serving nothing makes no request, unless a node reads from it. A
     /// relayed node takes the epoch from its upstreams' view instead of the
-    /// bucket, and does nothing until the first one arrives.
+    /// bucket, and does nothing until the first one arrives. The disk tier's
+    /// metadata is dropped for each application the log names, and wiped
+    /// whenever the node cannot follow the log, idle included.
     async fn poll_epoch(&self, watch: &mut EpochWatch, idle: Duration) -> Result<()> {
         let forced = std::mem::take(&mut watch.forced);
         let evicted = lock(&self.apps).evict_idle(idle);
@@ -2542,7 +2578,12 @@ impl Routes {
             .as_ref()
             .is_some_and(|pool| !pool.state.lock().expect("VM pool poisoned").slots.is_empty());
         if lock(&self.apps).entries.is_empty() && !resident && !self.sync.listening() {
+            // Not following the log from here on, so a disk copy could go stale unseen.
+            if let Some(objects) = self.store.objects() {
+                objects.distrust().await;
+            }
             *watch = EpochWatch::default();
+            self.sync.mark_processed(None);
             if forced {
                 self.signal_catalog_changed(Changed::All);
             }
@@ -2571,13 +2612,33 @@ impl Routes {
             .iter()
             .map(|change| (change.application.clone(), change.revision.clone()))
             .collect();
-        let mut changed = if since.is_none() || forced {
+        let full = since.is_none() || forced;
+        // The disk metadata of an application the log names is outdated, served
+        // by this node or not. A pass that checks everything starts from an
+        // empty tier: a log this node cannot follow may hide any change.
+        // ponytail: a discontinuity wipes the tier; validating it against one
+        // `metadata_tokens` LIST instead would keep it warm across restarts.
+        let objects = self.store.objects();
+        if let Some(objects) = objects {
+            if full {
+                objects.distrust().await;
+            } else {
+                for application in newest.keys() {
+                    objects.forget(application).await;
+                }
+            }
+        }
+        let mut changed = if full {
             self.reconcile_with(None).await?
         } else if newest.is_empty() {
             BTreeSet::new()
         } else {
             self.reconcile_with(Some(&newest)).await?
         };
+        if let Some(objects) = objects.filter(|_| full) {
+            // Everything it stored since was read after the epoch above.
+            objects.trust();
+        }
         // The log also names applications this node does not serve: the cron
         // arm arms theirs. One it cannot follow, after a first look, may hide
         // any change at all.
@@ -2587,8 +2648,70 @@ impl Routes {
         } else if !changed.is_empty() {
             self.signal_catalog_changed(Changed::Apps(changed));
         }
+        // Children asking for objects are checked against this: the disk copies
+        // are current as of the log position the poll has acted on.
+        self.sync.mark_processed(position.clone());
         watch.seen = Some(position);
         Ok(())
+    }
+
+    /// A child's read of one catalog object on `/peer/object`: `key`, and `log`
+    /// and `seq` for where its view of the epoch stands. Metadata comes from
+    /// this node's disk copy only if the poll has acted on the log at least that
+    /// far, so the copy cannot predate what the child already knows; otherwise
+    /// it is read through, from this node's upstream or the bucket. The rest is
+    /// streamed from the tier, so hundreds of children asking for one artifact
+    /// at once do not each hold it in memory.
+    async fn answer_object(&self, query: Option<&str>, draining: bool) -> axum::response::Response {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        if draining {
+            return (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response();
+        }
+        let (mut key, mut log, mut seq) = (None, None, None);
+        for (name, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+            match &*name {
+                "key" => key = Some(value.into_owned()),
+                "log" => log = Some(value.into_owned()),
+                "seq" => seq = value.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        let kind = key.as_deref().and_then(object_kind);
+        let (Some(key), Some(kind)) = (key, kind) else {
+            return (StatusCode::FORBIDDEN, "not a served object").into_response();
+        };
+        let disk = matches!(
+            (&log, seq),
+            (Some(log), Some(seq)) if self.sync.has_processed(log, seq)
+        );
+        match self.store.serve_object(&key, kind, disk).await {
+            Ok(Some((object, token))) => {
+                let (body, length) = match object {
+                    Object::File(file, length) => (
+                        axum::body::Body::from_stream(ReaderStream::new(file)),
+                        length,
+                    ),
+                    Object::Bytes(bytes) => {
+                        let length = bytes.len() as u64;
+                        (axum::body::Body::from(bytes), length)
+                    }
+                };
+                let mut response =
+                    axum::response::Response::builder().header("content-length", length);
+                if let Some(token) = token {
+                    response = response.header(crate::object_cache::TOKEN_HEADER, token);
+                }
+                response
+                    .body(body)
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            }
+            Ok(None) => (StatusCode::NOT_FOUND, "no such object").into_response(),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "object not read for a child");
+                (StatusCode::BAD_GATEWAY, "object not read").into_response()
+            }
+        }
     }
 
     /// One catalog sweep. The first takes the baseline, silently: the boot scan
@@ -2656,7 +2779,7 @@ impl Routes {
                 };
                 let (snapshot, changed) = match cached {
                     Some(cached) if cached.revision() == revision.as_deref() => (cached, false),
-                    _ => self.reread(&application).await?,
+                    _ => self.reread(&application, false).await?,
                 };
                 anyhow::Ok((application, snapshot, changed))
             })
@@ -2717,7 +2840,7 @@ impl Routes {
         let (snapshot, owner) = match snapshot.cell_owner(locator.clone()) {
             // The resource may be newer than the served revision.
             Err(error) if error.is::<crate::applications::UncommittedCellIndex>() => {
-                let fresh = self.refresh(&application).await?;
+                let fresh = self.refresh(&application, false).await?;
                 let owner = fresh.cell_owner(locator)?;
                 (fresh, owner)
             }
@@ -2777,8 +2900,6 @@ pub struct RouteDispatcher {
     alarm_host: std::sync::OnceLock<crate::actor::AppHandle>,
     _reconciler: Option<AbortOnDropHandle<()>>,
     _catalog_sweep: Option<AbortOnDropHandle<()>>,
-    /// Reads the epoch from upstream nodes; set by `host` for a relayed node.
-    _follower: Option<AbortOnDropHandle<()>>,
 }
 
 impl RouteDispatcher {
@@ -2822,22 +2943,18 @@ impl RouteDispatcher {
         self.routes.sync.relayed()
     }
 
-    /// A child's long-poll on `/peer/sync`; `log` and `seq` in `query` say
-    /// where its view of the epoch stands.
-    pub async fn answer_sync(
+    /// The catalog store, for the bucket read of a relayed node's follower.
+    pub fn store(&self) -> Arc<ApplicationStore> {
+        self.routes.store.clone()
+    }
+
+    /// A child's read on `/peer/object`; see `Routes::answer_object`.
+    pub async fn answer_object(
         &self,
         query: Option<&str>,
         draining: bool,
-    ) -> (axum::http::StatusCode, Vec<u8>) {
-        let (mut log, mut seq) = (None, None);
-        for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            match &*key {
-                "log" => log = Some(value.into_owned()),
-                "seq" => seq = value.parse::<u64>().ok(),
-                _ => {}
-            }
-        }
-        self.routes.sync.answer(log.as_deref(), seq, draining).await
+    ) -> axum::response::Response {
+        self.routes.answer_object(query, draining).await
     }
 
     /// The application cron the cell scope names, in the committed catalog.
@@ -2990,7 +3107,11 @@ impl RouteDispatcher {
     }
 
     /// Serves the committed catalog from its first request.
-    pub(crate) async fn new(config: VmHostConfig, store: Arc<ApplicationStore>) -> Result<Self> {
+    pub(crate) async fn new(
+        config: VmHostConfig,
+        store: Arc<ApplicationStore>,
+        sync: Arc<CatalogSync>,
+    ) -> Result<Self> {
         let fence = config.container_fence_image.clone();
         let domain = config.platform_domain.clone();
         let (entries, bytes) = (
@@ -3000,7 +3121,7 @@ impl RouteDispatcher {
             config.metadata_cache_bytes.unwrap_or(METADATA_CACHE_BYTES),
         );
         let pool = VmPool::new(config, store.clone())?;
-        let routes = Arc::new(Routes::new(store, Some(pool), domain, entries, bytes));
+        let routes = Arc::new(Routes::new(store, Some(pool), domain, entries, bytes, sync));
         routes
             .pool()?
             .service_routes
@@ -3010,7 +3131,11 @@ impl RouteDispatcher {
         Ok(Self::serve(routes))
     }
 
-    pub(crate) async fn static_host(domain: String, store: Arc<ApplicationStore>) -> Result<Self> {
+    pub(crate) async fn static_host(
+        domain: String,
+        store: Arc<ApplicationStore>,
+        sync: Arc<CatalogSync>,
+    ) -> Result<Self> {
         validate_platform_domain(&domain)?;
         Ok(Self::serve(Arc::new(Routes::new(
             store,
@@ -3018,6 +3143,7 @@ impl RouteDispatcher {
             domain,
             METADATA_CACHE_ENTRIES,
             METADATA_CACHE_BYTES,
+            sync,
         ))))
     }
 
@@ -3078,7 +3204,6 @@ impl RouteDispatcher {
             alarm_host: Default::default(),
             _reconciler: Some(reconciler),
             _catalog_sweep: catalog_sweep,
-            _follower: None,
         }
     }
 
@@ -3542,29 +3667,37 @@ pub fn validate_platform_domain(domain: &str) -> Result<()> {
 
 static HOSTED: std::sync::OnceLock<RouteDispatcher> = std::sync::OnceLock::new();
 
+/// A node's store: its catalog reads go through the disk tier.
+fn node_store(bucket: crate::bucket::Bucket) -> Result<Arc<ApplicationStore>> {
+    let store = ApplicationStore::new(bucket.clone());
+    store.enable_object_cache(crate::object_cache::ObjectCache::new(bucket)?);
+    Ok(Arc::new(store))
+}
+
 /// Node startup with a trusted configuration file: serve the committed
 /// application catalog's routes from this node's VMs.
 pub async fn host(
     config: &Path,
     bucket: crate::bucket::Bucket,
     app: &crate::actor::AppHandle,
+    sync: Arc<CatalogSync>,
 ) -> Result<()> {
     ensure!(HOSTED.get().is_none(), "application VMs are already hosted");
     let config = tokio::fs::read(config)
         .await
         .context("read application VM configuration")?;
     let config = serde_json::from_slice(&config).context("invalid application VM configuration")?;
-    let mut dispatcher =
-        RouteDispatcher::new(config, Arc::new(ApplicationStore::new(bucket))).await?;
+    let dispatcher = RouteDispatcher::new(config, node_store(bucket)?, sync).await?;
     if dispatcher.routes.sync.relayed() {
-        dispatcher._follower = Some(AbortOnDropHandle::new(tokio::spawn(
-            crate::catalog_sync::follow(
+        // Objects come from the relay it follows too, and from the bucket if it fails.
+        // `main` spawns the follower, once the node's store is known.
+        if let Some(objects) = dispatcher.routes.store.objects() {
+            objects.set_relay(
                 dispatcher.routes.sync.clone(),
-                dispatcher.routes.store.clone(),
                 app.peer_http.clone(),
                 app.peer_auth.clone(),
-            ),
-        )));
+            );
+        }
     }
     if let Err(error) = dispatcher.routes.pool()?.prepare(app).await {
         let cleanup = dispatcher.shutdown().await;
@@ -3577,13 +3710,16 @@ pub async fn host(
     Ok(())
 }
 
-pub async fn host_static(domain: String, bucket: crate::bucket::Bucket) -> Result<()> {
+pub async fn host_static(
+    domain: String,
+    bucket: crate::bucket::Bucket,
+    sync: Arc<CatalogSync>,
+) -> Result<()> {
     ensure!(
-        crate::env_vars::sync_upstreams()?.is_empty(),
+        !sync.relayed(),
         "CELLD_SYNC_UPSTREAM needs --application-vms: a static application host has no peer client"
     );
-    let dispatcher =
-        RouteDispatcher::static_host(domain, Arc::new(ApplicationStore::new(bucket))).await?;
+    let dispatcher = RouteDispatcher::static_host(domain, node_store(bucket)?, sync).await?;
     ensure!(
         HOSTED.set(dispatcher).is_ok(),
         "applications are already hosted"

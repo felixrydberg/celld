@@ -8,14 +8,16 @@
 //! Paginated, repeated LIST passes reclaim older objects, including mutations
 //! whose caller stopped waiting before their remote effect.
 use crate::bucket::Bucket;
+use crate::dead_node_gc::LiveNodes;
 use crate::ownership_store::BucketOwnership;
+use crate::peer_auth::PeerAuth;
 use celld_logic::wake::elected_hint_needed;
 use celld_logic::wake::parse_entry_key;
 use celld_logic::wake::WakeCore;
 use celld_logic::wake::{AlarmSnapshot, PublicationId, Retirement, ENTRY_PREFIX};
 use futures_util::stream::{self, StreamExt as _};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::warn;
 
@@ -95,36 +97,83 @@ pub async fn due_scan(bucket: &Bucket, now_ms: i64) -> Vec<(String, i64)> {
 /// entries in about a second of store latency.
 const ELECTED_PROBE_CONCURRENCY: usize = 32;
 
-/// The elected waker's pass over the due entries: the ones this node must
-/// hint with `WakeHintScope::Fleet`.
+/// Owners the waker pushes to at once. A push is one small request, so this
+/// bounds sockets, not work.
+const PUSH_CONCURRENCY: usize = 16;
+
+/// Entries in one `POST /peer/wake`. An owner with more gets several requests
+/// in a row; with cell names of at most 255 bytes, a body stays under the
+/// receiver's limit however deep the backlog is.
+pub const PUSH_ENTRIES_MAX: usize = 512;
+
+/// One entry of a push: a cell whose wake entry is due and whose owner record
+/// names the receiver.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct PushedEntry {
+    pub cell: String,
+    pub entry_ms: i64,
+    /// A cleanup refresh also has the owner re-check its retirement
+    /// (`MaintainWake`) before the hint; a due-scan entry does not.
+    pub maintain: bool,
+}
+
+/// The body of `POST /peer/wake`.
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct WakePush {
+    pub entries: Vec<PushedEntry>,
+}
+
+/// The due entries of one live owner, and where its lease says to reach it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OwnerGroup {
+    pub(crate) addr: String,
+    pub(crate) entries: Vec<(String, i64)>,
+}
+
+/// The due entries the elected waker found an owner for, sorted by what to do
+/// with them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Probed {
+    /// Hinted by this node: no owner, a dead owner, this node, or a failed read.
+    pub(crate) local: Vec<(String, i64)>,
+    /// Owned by another live node: pushed to it, by owner.
+    pub(crate) pushed: BTreeMap<String, OwnerGroup>,
+}
+
+/// The entries the boot-time scan hints for itself. A live foreign owner's
+/// entries are left to its own boot scan and to the elected waker, which
+/// pushes them to that owner.
+pub async fn elected_due(
+    ownership: &BucketOwnership,
+    node: &str,
+    live: &LiveNodes,
+    due: Vec<(String, i64)>,
+) -> Vec<(String, i64)> {
+    probe_entries(ownership, node, live, due).await.local
+}
+
+/// The elected waker's pass over a set of due entries.
 ///
 /// One owner read per entry, without an activation permit, decides through
 /// `elected_hint_needed` against the node leases the same tick's dead-node
 /// scan read. Before this pass existed, every due entry in the fleet went
 /// through the core's route on every node: an owner read under a permit,
 /// then `Remote`, for cells whose live owners were about to fire the alarm
-/// themselves. A read that fails keeps its entry, because the core's own
+/// themselves. A live foreign owner is not dropped, though: no other node
+/// scans, so a dormant cell of its own would never wake. Its entries come back
+/// grouped for a push. A read that fails stays local, because the core's own
 /// resolution is the authority and an entry dropped here on a transient
 /// error would wait a whole tick.
-pub async fn elected_due(
-    ownership: &BucketOwnership,
-    node: &str,
-    live: &BTreeSet<String>,
-    due: Vec<(String, i64)>,
-) -> Vec<(String, i64)> {
-    probe_entries(ownership, node, live, true, due).await
-}
-
-/// Keep a persisted local owner even when this process has lost its in-memory
-/// cell. Only the elected scanner resolves dead or unknown foreign owners.
-/// An Owned hint alone cannot recover an unknown cell after a same-name restart.
+///
+/// A persisted local owner stays local even when this process has lost its
+/// in-memory cell: an `Owned` hint alone cannot recover an unknown cell after
+/// a same-name restart.
 pub(crate) async fn probe_entries(
     ownership: &BucketOwnership,
     node: &str,
-    live: &BTreeSet<String>,
-    elected: bool,
+    live: &LiveNodes,
     entries: Vec<(String, i64)>,
-) -> Vec<(String, i64)> {
+) -> Probed {
     let probed: Vec<(
         String,
         i64,
@@ -138,29 +187,175 @@ pub(crate) async fn probe_entries(
         .collect()
         .await;
     let mut failed = 0usize;
-    let mut hinted: Vec<(String, i64)> = probed
-        .into_iter()
-        .filter_map(|(cell, entry_ms, owner)| match owner {
+    let mut sorted = Probed::default();
+    for (cell, entry_ms, owner) in probed {
+        let owner = match owner {
+            Ok(record) => record.and_then(|record| record.node),
             Err(_) => {
                 failed += 1;
-                elected.then_some((cell, entry_ms))
+                None
             }
-            Ok(record) => {
-                let owner = record.as_ref().and_then(|record| record.node.as_deref());
-                let owner_live = owner.is_some_and(|owner| live.contains(owner));
-                (owner == Some(node) || (elected && elected_hint_needed(owner, node, owner_live)))
-                    .then_some((cell, entry_ms))
-            }
-        })
-        .collect();
+        };
+        let live_owner = owner
+            .as_deref()
+            .and_then(|name| Some((name, live.get(name)?)));
+        match (
+            elected_hint_needed(owner.as_deref(), node, live_owner.is_some()),
+            live_owner,
+        ) {
+            (false, Some((owner, addr))) => sorted
+                .pushed
+                .entry(owner.to_string())
+                .or_insert_with(|| OwnerGroup {
+                    addr: addr.clone(),
+                    entries: Vec::new(),
+                })
+                .entries
+                .push((cell, entry_ms)),
+            _ => sorted.local.push((cell, entry_ms)),
+        }
+    }
     if failed > 0 {
         warn!(
             failed,
-            elected, "wake probe owner reads failed; only the elected scanner hints those entries"
+            "wake probe owner reads failed; this node hints those entries"
         );
     }
-    hinted.sort();
-    hinted
+    sorted.local.sort();
+    for group in sorted.pushed.values_mut() {
+        group.entries.sort();
+    }
+    sorted
+}
+
+/// How the waker reaches a live owner: this node's peer client and signer.
+#[derive(Clone)]
+struct PeerLink {
+    http: reqwest::Client,
+    auth: Arc<PeerAuth>,
+}
+
+/// The requests that carry one owner's entries, at most `PUSH_ENTRIES_MAX` each.
+fn push_bodies(entries: &[(String, i64)], maintain: bool) -> impl Iterator<Item = WakePush> + '_ {
+    entries.chunks(PUSH_ENTRIES_MAX).map(move |chunk| WakePush {
+        entries: chunk
+            .iter()
+            .map(|(cell, entry_ms)| PushedEntry {
+                cell: cell.clone(),
+                entry_ms: *entry_ms,
+                maintain,
+            })
+            .collect(),
+    })
+}
+
+/// Push each live owner its entries: one signed request per owner per pass
+/// (more only past `PUSH_ENTRIES_MAX`), `PUSH_CONCURRENCY` owners at once.
+///
+/// A failed push only warns, once for the owner. Nothing is lost: the entry is
+/// still due or unretired, so the next tick pushes it again, and if the owner
+/// has died its lease expires and the waker hints the entry itself as an
+/// orphan. The timeout is one tick, so a frozen owner cannot hold the waker
+/// past the next election.
+///
+/// ponytail: one attempt per owner per tick, no backoff and no state between
+/// ticks. An owner that stays unreachable warns every tick until its lease
+/// expires (a node lease is ten seconds by default). Add per-owner backoff if
+/// that noise ever matters.
+async fn push_to_owners(
+    link: &PeerLink,
+    pushed: BTreeMap<String, OwnerGroup>,
+    maintain: bool,
+    tick_ms: u64,
+) {
+    let timeout = Duration::from_millis(tick_ms);
+    stream::iter(pushed)
+        .for_each_concurrent(PUSH_CONCURRENCY, |(owner, group)| async move {
+            if let Err(error) = push_one(link, &owner, &group, maintain, timeout).await {
+                warn!(
+                    %owner, %error, entries = group.entries.len(),
+                    "wake push failed; the next tick pushes it again"
+                );
+            }
+        })
+        .await;
+}
+
+async fn push_one(
+    link: &PeerLink,
+    owner: &str,
+    group: &OwnerGroup,
+    maintain: bool,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    const PATH: &str = "/peer/wake";
+    for push in push_bodies(&group.entries, maintain) {
+        let body = serde_json::to_vec(&push)?;
+        let request = link.http.post(format!("http://{}{PATH}", group.addr));
+        let response = link
+            .auth
+            .sign(request.timeout(timeout), "POST", PATH, &body, owner)?
+            .body(body)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "{owner} answered HTTP {}",
+            response.status()
+        );
+        crate::peer_auth::validate_response(response.headers())?;
+    }
+    Ok(())
+}
+
+/// One due entry as the Actor takes it: a refresh entry first re-checks its
+/// retirement, then the hint. `false` once the Actor has stopped.
+///
+/// The scope is `Fleet`, not `Owned`. A probe read the owner record and found
+/// this node in it (or no live owner), and `Fleet` also admits a persisted
+/// local owner absent from RAM, such as a cell from an ownership-only handoff
+/// or a same-name restart. An `Owned` hint ignores a cell the map does not
+/// already hold dormant. A `Fleet` hint for a cell that is no longer ours
+/// resolves to its owner and takes nothing.
+fn send_hint(
+    actor: &tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
+    cell: String,
+    entry_ms: i64,
+    maintain: bool,
+) -> bool {
+    if maintain
+        && actor
+            .send(crate::actor::Message::MaintainWake { cell: cell.clone() })
+            .is_err()
+    {
+        return false;
+    }
+    actor
+        .send(crate::actor::Message::WakeHint {
+            cell,
+            entry_ms,
+            scope: celld_logic::WakeHintScope::Fleet,
+        })
+        .is_ok()
+}
+
+/// Take a push from the elected waker exactly as this node's own scan used to
+/// take its entries. `false` once the Actor has stopped.
+///
+/// A name the wake index would never list is skipped: this route is a second
+/// door to the same hint, and the name becomes a storage key.
+pub fn deliver_push(
+    actor: &tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
+    push: WakePush,
+) -> bool {
+    for entry in push.entries {
+        if celld_logic::cell::valid_cell_scope(&entry.cell)
+            && !send_hint(actor, entry.cell, entry.entry_ms, entry.maintain)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Run the periodic wake scan after node authority and the boot scan complete.
@@ -168,36 +363,53 @@ pub(crate) async fn probe_entries(
 /// caller cannot run a scan without delivering the entries it discovers.
 pub async fn run_periodic(
     bucket: Bucket,
-    ownership: std::sync::Arc<BucketOwnership>,
+    ownership: Arc<BucketOwnership>,
     node: String,
     actor: tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
     tick_ms: u64,
+    http: reqwest::Client,
+    auth: Arc<PeerAuth>,
 ) {
+    let link = PeerLink { http, auth };
+    // One election per tick. The due loop takes it and publishes the live
+    // nodes it saw; cleanup runs once per publication. Each loop used to read
+    // the waker lease itself, and cleanup listed a page before it knew whether
+    // it was elected. Now a node that is not elected reads the lease once a
+    // tick and lists nothing. A watch rather than a timestamp: cleanup acts on
+    // an election in the tick that took it, never on a stale one, and a
+    // cleanup pass that overruns a tick picks up the latest and skips the rest.
+    let (elected, election) = tokio::sync::watch::channel(LiveNodes::new());
     tokio::join!(
         run_due_scans(
             bucket.clone(),
             ownership.clone(),
             node.clone(),
             actor.clone(),
-            tick_ms
+            tick_ms,
+            link.clone(),
+            elected,
         ),
-        run_cleanup(bucket, ownership, node, actor, tick_ms),
+        run_cleanup(bucket, ownership, node, actor, tick_ms, link, election),
     );
 }
 
 async fn run_cleanup(
     bucket: Bucket,
-    ownership: std::sync::Arc<BucketOwnership>,
+    ownership: Arc<BucketOwnership>,
     node: String,
     actor: tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
     tick_ms: u64,
+    link: PeerLink,
+    mut election: tokio::sync::watch::Receiver<LiveNodes>,
 ) {
-    let mut tick = crate::asyncrt::interval(Duration::from_millis(tick_ms));
-    tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
+    // ponytail: one cursor, held only by the waker, so a failover restarts the
+    // sweep at the head of the index. A sweep takes index size / 128 ticks,
+    // as it did on each node before. Raise the page size if that is too slow.
     let mut collector = Collector::default();
-    tick.tick().await;
-    loop {
-        tick.tick().await;
+    // Woken by an election, so this node lists nothing unless it holds the
+    // waker role. The sender is gone once the due loop has returned.
+    while election.changed().await.is_ok() {
+        let live = election.borrow_and_update().clone();
         let refresh = match collector.pass(&bucket).await {
             Ok(refresh) => refresh,
             Err(error) => {
@@ -205,40 +417,13 @@ async fn run_cleanup(
                 continue;
             }
         };
-        let now_ms = crate::asyncrt::wall_ms();
-        let elected = try_hold_waker(
-            &bucket,
-            &node,
-            now_ms,
-            tick_ms.saturating_mul(3).min(i64::MAX as u64) as i64,
-        )
-        .await;
-        let live = if elected {
-            crate::dead_node_gc::live_nodes(&bucket, now_ms.max(0) as u64).await
-        } else {
-            BTreeSet::new()
-        };
-        let refresh = probe_entries(&ownership, &node, &live, elected, refresh).await;
-        for (cell, entry_ms) in refresh {
-            if actor
-                .send(crate::actor::Message::MaintainWake { cell: cell.clone() })
-                .is_err()
-            {
-                return;
-            }
-            if actor
-                .send(crate::actor::Message::WakeHint {
-                    cell,
-                    entry_ms,
-                    // The probe excludes live foreign owners before admission.
-                    // Fleet also admits a persisted local owner absent from RAM.
-                    scope: celld_logic::WakeHintScope::Fleet,
-                })
-                .is_err()
-            {
+        let probed = probe_entries(&ownership, &node, &live, refresh).await;
+        for (cell, entry_ms) in probed.local {
+            if !send_hint(&actor, cell, entry_ms, true) {
                 return;
             }
         }
+        push_to_owners(&link, probed.pushed, true, tick_ms).await;
         if actor.is_closed() {
             return;
         }
@@ -247,10 +432,12 @@ async fn run_cleanup(
 
 async fn run_due_scans(
     bucket: Bucket,
-    ownership: std::sync::Arc<BucketOwnership>,
+    ownership: Arc<BucketOwnership>,
     node: String,
     actor: tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
     tick_ms: u64,
+    link: PeerLink,
+    elected: tokio::sync::watch::Sender<LiveNodes>,
 ) {
     let mut tick = crate::asyncrt::interval(Duration::from_millis(tick_ms));
     tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
@@ -258,27 +445,29 @@ async fn run_due_scans(
     let mut dead_node_gc = crate::dead_node_gc::DeadNodeGc::default();
     loop {
         tick.tick().await;
-        let elected = dead_node_gc.run_elected_pass(&bucket, &node, tick_ms).await;
-        let due = due_scan(&bucket, crate::asyncrt::wall_ms()).await;
-        let (scope, due) = match elected {
-            Some(live) => (
-                celld_logic::WakeHintScope::Fleet,
-                elected_due(&ownership, &node, &live, due).await,
-            ),
-            None => (celld_logic::WakeHintScope::Owned, due),
+        if actor.is_closed() {
+            return;
+        }
+        // Only the node that holds the waker role lists. A tick without the
+        // role is one read of the lease, so the bucket cost of alarm wakes no
+        // longer grows with the node count.
+        //
+        // ponytail: the role is renewed at the start of the tick and inside
+        // the GC pass only. A tick whose scan, probes and pushes outrun the
+        // three-tick lease lets the role lapse, and another node takes it;
+        // concurrent wakers are harmless. Renew between phases if that happens.
+        let Some(live) = dead_node_gc.run_elected_pass(&bucket, &node, tick_ms).await else {
+            continue;
         };
-        for (cell, entry_ms) in due {
-            if actor
-                .send(crate::actor::Message::WakeHint {
-                    cell,
-                    entry_ms,
-                    scope,
-                })
-                .is_err()
-            {
+        elected.send_replace(live.clone());
+        let due = due_scan(&bucket, crate::asyncrt::wall_ms()).await;
+        let probed = probe_entries(&ownership, &node, &live, due).await;
+        for (cell, entry_ms) in probed.local {
+            if !send_hint(&actor, cell, entry_ms, false) {
                 return;
             }
         }
+        push_to_owners(&link, probed.pushed, false, tick_ms).await;
     }
 }
 
@@ -323,9 +512,9 @@ pub async fn try_hold_waker(bucket: &Bucket, node: &str, now_ms: i64, ttl_ms: i6
         .await
     {
         Ok(Some(_)) => true,
-        // The cleanup loop and the due-scan loop renew the same node's role.
-        // A clean CAS conflict can be their overlap, so check the winner
-        // before cancelling a GC pass and repeating its fleet-wide LIST.
+        // The cleanup loop used to renew beside the due-scan loop, and a clean
+        // CAS conflict could be their overlap. Keep checking the winner before
+        // cancelling a GC pass and repeating its fleet-wide LIST.
         Ok(None) => same_node_still_holds_waker(bucket, node).await,
         Err(_) => false,
     }
@@ -671,3 +860,10 @@ impl Collector {
         Ok(refresh)
     }
 }
+
+// Tests drive a real socket and wall-clock ticks on their own runtime, outside
+// the Actor execution domain.
+#[allow(clippy::disallowed_methods)]
+#[cfg(test)]
+#[path = "unit_tests/wake/tests.rs"]
+mod tests;

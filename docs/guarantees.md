@@ -278,12 +278,22 @@ identities or a proven consumed one, so an old DELETE cannot remove a later
 installation and the bucket needs no conditional DELETE. Deletes of obsolete
 publications do not block an alarm response.
 
-Each cleanup pass lists at most 128 objects and processes at most eight cells
-concurrently, continuing the listing on the next pass and restarting after the
-last page. A failed DELETE or a late PUT can need another full scan. The
-interval defaults to 60 seconds; `CELLD_WAKER_TICK_MS` sets it and the due-scan
-interval. A large inventory can take many intervals, and each extra node can
-repeat the same reads and deletes.
+Only the node that holds the waker role scans and cleans. Each cleanup pass
+lists at most 128 objects and processes at most eight cells concurrently,
+continuing the listing on the next pass and restarting after the last page. A
+failed DELETE or a late PUT can need another full scan. The interval defaults
+to 60 seconds; `CELLD_WAKER_TICK_MS` sets it and the due-scan interval. A large
+inventory can take many intervals, and a new waker starts the listing again.
+
+The waker reads each due cell's owner record. It wakes cells with no live owner
+itself, and sends every live owner one signed request per interval with the
+due entries of its own cells, which the owner wakes as if it had found them.
+A request that fails is repeated on the next interval; if the owner has died,
+its lease expires and the waker wakes the cells itself. Every other node reads
+the waker lease once per interval and lists nothing. When the waker dies, its
+lease expires after three intervals and another node takes the role. During a
+rolling upgrade, keep a node of the new version as the waker: an older waker
+does not send owners their entries, and newer owners no longer scan.
 
 `wake/format.json` selects format 2; `wake/waker.json` holds the advisory lease
 for the waker role. A new node initializes an empty fleet or upgrades a stopped

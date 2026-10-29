@@ -1038,27 +1038,65 @@ async fn adopt_deployment(
 /// "adopts one interval later". A version that failed to build is remembered
 /// and not retried until the pointer names something else or a reload is
 /// forced: a broken bundle must not recompile every interval on every node.
+///
+/// A node that reads the bucket (no `CELLD_SYNC_UPSTREAM`) hands each pointer
+/// it reads to `sync`, so its children get it on their long-poll. A relayed
+/// node never polls: it adopts the pointer in its view when the view changes,
+/// so only the roots of the relay tree read the bucket. Adoption still needs
+/// the deploy bucket, to load the bundle the pointer names.
+// ponytail: a forced reload (`POST /reload`) on a relayed node reads the bucket
+// itself: it is rare, and the operator asked for the pointer now. A managed
+// nudge is not forced, so it only looks at the view.
 fn start_pointer_watcher(
     app: AppHandle,
     bucket: Bucket,
     node: String,
     region: String,
+    sync: Arc<celld::catalog_sync::CatalogSync>,
     mut requests: celld::generation::ReloadReceiver,
 ) {
     tokio::spawn(async move {
+        let relayed = sync.relayed();
         let period = celld::generation::poll_interval();
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Only a relayed node waits on this. It starts marked, so that a
+        // pointer the view got before this task started is looked at too.
+        let mut views = sync.subscribe();
+        views.mark_changed();
+        let mut handled: Option<DeployPointer> = None;
         let mut failed: Option<ReloadOutcome> = None;
         loop {
             let request = celld::asyncrt::select! {
-                _ = tick.tick() => ReloadRequest { force: false, reply: None },
+                _ = async {
+                    if relayed {
+                        // `sync` is held here, so the sender outlives this.
+                        let _ = views.changed().await;
+                    } else {
+                        tick.tick().await;
+                    }
+                } => ReloadRequest { force: false, reply: None },
                 request = requests.recv() => match request {
                     Some(request) => request,
                     None => return,
                 },
             };
-            let outcome = match fleet::read_current_pointer(&bucket).await {
+            let pointer = if relayed && !request.force {
+                // Only a forced request has a reply, so nobody waits on this one.
+                match celld::catalog_sync::unhandled_pointer(&mut views, &mut handled) {
+                    Some(pointer) => Ok(pointer),
+                    None => continue,
+                }
+            } else {
+                fleet::read_current_pointer(&bucket).await
+            };
+            // A relayed node's view is its upstream's, even after a forced read.
+            if let Ok(pointer) = &pointer {
+                if !relayed {
+                    sync.publish_pointer(pointer.clone());
+                }
+            }
+            let outcome = match pointer {
                 Err(error) => {
                     tracing::warn!(event = "deployment_pointer_unreadable", %error);
                     ReloadOutcome::Failed {
@@ -1746,6 +1784,9 @@ const MAX_PEER_FORWARD_BODY_BYTES: usize = DEFAULT_MAX_REQUEST_BODY_BYTES + (1 <
 const MAX_PEER_PROTOCOL_BODY_BYTES: usize = 64 << 20;
 /// Control messages contain identifiers and counters, not application data.
 const MAX_PEER_CONTROL_BODY_BYTES: usize = 64 << 10;
+/// A wake push is a full request's worth of entries. Each is a cell name of at
+/// most 255 bytes plus its JSON, which fits in 512.
+const MAX_PEER_WAKE_BODY_BYTES: usize = celld::wake::PUSH_ENTRIES_MAX * 512;
 const INTERNAL_LOG_APPEND_PATH: &str = "/peer/log/append";
 /// A streamed body crosses the isolate boundary through a string-only error
 /// channel. Keep one private marker in that string so the HTTP entry point can
@@ -2922,8 +2963,61 @@ async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply
     }
 }
 
-/// A child's long-poll for the catalog epoch (`CELLD_SYNC_UPSTREAM` on its
-/// side): held while it is up to date, so it can run for about 20 seconds.
+/// The elected waker's push of due alarm entries whose owner record names this
+/// node. Only the waker lists the wake index, so this is how a dormant cell of
+/// ours gets woken. The entries go to the Actor as this node's own scan once
+/// sent them, as `Fleet` hints: the waker's probe found us in the owner record,
+/// and `Fleet` also admits a persisted local owner absent from RAM, such as a
+/// cell from an ownership-only handoff.
+async fn internal_wake(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    if app.is_draining() {
+        return peer_response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"ok\":false,\"draining\":true}",
+        ));
+    }
+    let (parts, body) = request.into_parts();
+    let body = match collect_limited_body(body, MAX_PEER_WAKE_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("wake", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::POST {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    let push = match serde_json::from_slice::<celld::wake::WakePush>(&body) {
+        Ok(push) => push,
+        Err(error) => {
+            return peer_response(response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid wake JSON: {error}"),
+            ));
+        }
+    };
+    if !celld::wake::deliver_push(&app.tx, push) {
+        return peer_response(response(StatusCode::SERVICE_UNAVAILABLE, "{\"ok\":false}"));
+    }
+    peer_response(response(StatusCode::OK, "{\"ok\":true}"))
+}
+
+/// A child's long-poll for the catalog epoch and the deploy pointer
+/// (`CELLD_SYNC_UPSTREAM` on its side): held while it is up to date, so it can
+/// run for about 20 seconds. Any node answers, application host or not.
 async fn internal_sync(request: Request<Incoming>, app: AppHandle) -> HttpReply {
     let (parts, body) = request.into_parts();
     let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
@@ -2949,14 +3043,53 @@ async fn internal_sync(request: Request<Incoming>, app: AppHandle) -> HttpReply 
             "method not allowed",
         ));
     }
-    #[cfg(target_os = "linux")]
-    if let Some(applications) = celld::application_vm::hosted() {
-        let (status, body) = applications
-            .answer_sync(parts.uri.query(), app.is_draining())
-            .await;
+    if let Some(sync) = celld::catalog_sync::node() {
+        let (status, body) = sync.answer_peer(parts.uri.query(), app.is_draining()).await;
         return peer_response(response(status, body));
     }
     peer_response(response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"))
+}
+
+/// A child's read of one catalog object (`CELLD_SYNC_UPSTREAM` on its side),
+/// from this node's disk tier, which fills itself from this node's own upstream
+/// or the bucket.
+async fn internal_object(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let (parts, body) = request.into_parts();
+    let body = match collect_limited_body(body, MAX_PEER_CONTROL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("object", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::GET {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(applications) = celld::application_vm::hosted() {
+        let reply = applications
+            .answer_object(parts.uri.query(), app.is_draining())
+            .await;
+        return peer_response(asset_response(reply));
+    }
+    // Not a 404, which a child would read as an object that does not exist.
+    peer_response(response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{\"error\":\"applications are not hosted\"}",
+    ))
 }
 
 /// Adopt one released cell for a terminating peer. A successful response
@@ -3256,7 +3389,9 @@ async fn handle_internal(
     let evict_scope = path.strip_prefix("/evict/");
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
+        "/peer/wake" => internal_wake(request, app).await,
         "/peer/sync" => internal_sync(request, app).await,
+        "/peer/object" => internal_object(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, node_state(app.snapshot().await)),
@@ -4597,6 +4732,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .tcp_nodelay(true)
         .build()
         .unwrap();
+    // The node's one view of the catalog epoch and the deploy pointer, whatever
+    // it hosts: `/peer/sync` answers from it, the pointer watcher feeds or
+    // follows it, and a relayed node's follower (below) keeps it current.
+    let catalog_sync = Arc::new(celld::catalog_sync::CatalogSync::from_env());
+    celld::catalog_sync::install(catalog_sync.clone())?;
     let resume_generation = celld::runtime::take_clean_reload_generation(&data_dir, &node);
     let clean_reload_candidate = resume_generation.is_some();
     let drain_pins = DrainPinRegistry::default();
@@ -4686,7 +4826,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         prepare_with_unhealthy_listeners(
             &listener,
             &internal_listener,
-            celld::application_vm::host(config, bucket, &app),
+            celld::application_vm::host(config, bucket, &app, catalog_sync.clone()),
         )
         .await
         .context("prepare application startup caches")?;
@@ -4702,7 +4842,29 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     #[cfg(target_os = "linux")]
     if let Some(domain) = &settings.application_domain {
         let bucket = fleet_bucket.clone().context("--application-domain needs a fleet bucket")?;
-        celld::application_vm::host_static(domain.clone(), bucket).await?;
+        celld::application_vm::host_static(domain.clone(), bucket, catalog_sync.clone()).await?;
+    }
+
+    // After hosting, which owns the store its bucket fallback reads the epoch
+    // from; a node that hosts nothing follows for the pointer alone.
+    if catalog_sync.relayed() {
+        let store = {
+            #[cfg(target_os = "linux")]
+            {
+                celld::application_vm::hosted().map(|applications| applications.store())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        };
+        tokio::spawn(celld::catalog_sync::follow(
+            catalog_sync.clone(),
+            store,
+            deploy_bucket.clone(),
+            app.peer_http.clone(),
+            app.peer_auth.clone(),
+        ));
     }
 
     // The in-fleet log tier, v0. The takeover interlock is installed in
@@ -5103,6 +5265,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         // due while nothing was watching. It probes like the elected waker
         // does, so a rolling restart does not send every node the whole
         // fleet's due set once each.
+        //
+        // ponytail: this still runs on every node at boot, so a rolling
+        // restart of N nodes costs N due listings. It could become waker-only
+        // (the periodic scan below finds the same entries one tick later);
+        // do that if boot-time listings show up in the bucket bill.
         let boot_ms = now_ms();
         let live = celld::dead_node_gc::live_nodes(&client, boot_ms).await;
         let due = celld::wake::due_scan(&client, boot_ms as i64).await;
@@ -5123,21 +5290,26 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         // restarted -- an alarm silently not firing, which is the one thing a
         // Durable Object is not allowed to do.
         //
-        // Every node lists the due entries on its tick, because a node's own
-        // dormant cells can carry alarms it has never loaded (a cell that
-        // arrived by an ownership-only handoff), and only that node can wake
-        // them. But only the node that holds the advisory waker role acts for
-        // the fleet: it reads each due cell's owner outside the activation
-        // queue and hints the orphans, while every other node hints with
-        // `Owned` scope, which the core answers from memory. Before that
-        // split, every node pushed the whole fleet's due set through its own
-        // activation queue, one permit and one owner read per entry, and its
-        // own alarm wakes queued behind them.
+        // Only the node that holds the advisory waker role lists. Each tick it
+        // lists the due entries once and reads each cell's owner outside the
+        // activation queue. It hints the orphans, the cells of dead owners and
+        // its own cells itself. A cell owned by another live node it hands to
+        // that owner (`POST /peer/wake`, one request per owner), because only
+        // the owner can wake its own dormant cells: a cell that arrived by an
+        // ownership-only handoff can carry an alarm the node has never loaded.
+        // The owner hints the entries with `Fleet` scope, as its own scan
+        // would. Every other node reads the waker lease once per tick and
+        // lists nothing, so the bucket cost of alarm wakes no longer grows
+        // with the node count. Before this split every node listed the whole
+        // fleet's due set and hinted it with `Owned` scope, which the core
+        // answers from memory.
         //
         // Every decision about a hinted entry still stays in the core: a
         // hint for a cell this node already serves is ignored, and one for a
         // cell with a live owner elsewhere resolves to that owner rather
-        // than stealing it.
+        // than stealing it. The role is advisory: when the waker dies, its
+        // lease runs out after three ticks and another node takes over, and a
+        // failed push is simply repeated on the next tick.
         let tick_ms = celld::env_vars::positive::<u64>("CELLD_WAKER_TICK_MS")?.unwrap_or(60_000);
         celld::asyncrt::spawn(celld::wake::run_periodic(
             client,
@@ -5145,6 +5317,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             node.clone(),
             app.tx.clone(),
             tick_ms,
+            app.peer_http.clone(),
+            app.peer_auth.clone(),
         ))
         .detach();
     }
@@ -5158,6 +5332,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             bucket,
             node.clone(),
             settings.region.clone(),
+            catalog_sync.clone(),
             reload_rx,
         );
     }

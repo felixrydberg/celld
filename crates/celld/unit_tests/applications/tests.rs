@@ -358,7 +358,7 @@ pub(crate) async fn application_secret_rotation_isolation_and_limits() {
     eprintln!("application secrets/limits: application separation, opaque metadata without values, foreign-version refusal, immutable old snapshot, rotation CAS winner/loser, active-reference deletion refusal, missing-secret refusal and validated/reset policy over original local bucket; no independent-provider qualification");
 }
 
-mod metadata_fault_store {
+pub(crate) mod metadata_fault_store {
     use super::*;
     use futures_util::stream::BoxStream;
     use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
@@ -370,9 +370,9 @@ mod metadata_fault_store {
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Default)]
-    pub(super) struct Store {
+    pub(crate) struct Store {
         inner: object_store::memory::InMemory,
-        pub(super) calls: Mutex<Vec<(String, String)>>,
+        pub(crate) calls: Mutex<Vec<(String, String)>>,
         pub(super) fail: Mutex<Option<(String, bool)>>,
         /// Written to its key just before the next put there: a rival wins the race.
         pub(super) race: Mutex<Option<(String, Bytes)>>,
@@ -395,7 +395,7 @@ mod metadata_fault_store {
                 source: std::io::Error::other("injected lost reply").into(),
             }
         }
-        pub(super) fn bucket(self: &Arc<Self>) -> Bucket {
+        pub(crate) fn bucket(self: &Arc<Self>) -> Bucket {
             Bucket::with_paginated_store_for_test(self.clone(), self.clone(), String::new())
         }
     }
@@ -448,6 +448,9 @@ mod metadata_fault_store {
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
             self.call(if options.head { "head" } else { "get" }, key.as_ref());
+            // A real read waits on the network; without this yield concurrent
+            // readers could never overlap, and request collapsing goes untested.
+            tokio::task::yield_now().await;
             self.inner.get_opts(key, options).await
         }
         async fn put_multipart_opts(
@@ -1489,4 +1492,72 @@ pub(crate) async fn application_static_assets_isolation_and_routing() {
         .unwrap();
     let theft = get(hostile, "GET", "https://assets.local/stolen.txt").await;
     assert!(theft.is_err(), "foreign asset body was served");
+}
+
+#[test]
+fn children_are_served_catalog_objects_by_key_shape_and_nothing_else() {
+    let (digest, route) = ("a".repeat(64), "b".repeat(32));
+    assert!(matches!(
+        object_kind("applications/v2/metadata/one.json"),
+        Some(ObjectKind::Metadata(id)) if id == app("one")
+    ));
+    for (key, bound) in [
+        (
+            format!("applications/v2/routes/{route}.json"),
+            MAX_INDEX_BYTES,
+        ),
+        (
+            format!("applications/v2/cells/{digest}.json"),
+            MAX_INDEX_BYTES,
+        ),
+        (
+            "applications/v2/apps/one/deployments/v1/manifest.json".to_owned(),
+            MAX_METADATA_BYTES,
+        ),
+        (
+            format!("applications/v2/apps/one/artifacts/{digest}"),
+            MAX_ARTIFACT_BYTES as u64,
+        ),
+    ] {
+        assert!(
+            matches!(object_kind(&key), Some(ObjectKind::Immutable { max, .. }) if max == bound),
+            "{key}"
+        );
+    }
+    let refused = [
+        // Secret values never leave the bucket path.
+        format!("applications/v2/apps/one/secrets/token/{digest}"),
+        format!("applications/v2/apps/one/artifacts/../secrets/token/{digest}"),
+        format!("applications/v2/apps/../apps/one/artifacts/{digest}"),
+        "applications/v2/metadata/../epoch".to_owned(),
+        "applications/v2/metadata/a/b.json".to_owned(),
+        "applications/v2/metadata/one.json.json".to_owned(),
+        "applications/v2/metadata/.json".to_owned(),
+        // Other prefixes, and a leading or missing one.
+        "applications/v2/epoch".to_owned(),
+        format!("applications/v2/cron-candidates/{digest}.json"),
+        "applications/v2/apps/one/resources/kv/x/data".to_owned(),
+        "fleet/peer-auth.json".to_owned(),
+        "/applications/v2/metadata/one.json".to_owned(),
+        String::new(),
+        // Bad hex: uppercase, short, long, not hex, or something after it.
+        format!(
+            "applications/v2/apps/one/artifacts/{}",
+            digest.to_uppercase()
+        ),
+        format!("applications/v2/apps/one/artifacts/{}", &digest[1..]),
+        format!("applications/v2/apps/one/artifacts/{digest}0"),
+        format!("applications/v2/apps/one/artifacts/g{}", &digest[1..]),
+        format!("applications/v2/apps/one/artifacts/{digest}/x"),
+        format!("applications/v2/cells/{}.json", &digest[1..]),
+        format!("applications/v2/routes/{}.json", &route[1..]),
+        format!("applications/v2/routes/{}.json", route.to_uppercase()),
+        // The manifest and nothing else beside it.
+        "applications/v2/apps/one/deployments/v1/other.json".to_owned(),
+        "applications/v2/apps/one/deployments//manifest.json".to_owned(),
+        "applications/v2/apps/one/deployments/v1/manifest.json/x".to_owned(),
+    ];
+    for key in refused {
+        assert!(object_kind(&key).is_none(), "{key}");
+    }
 }

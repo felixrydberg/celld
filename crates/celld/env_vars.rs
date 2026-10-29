@@ -291,6 +291,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_LOG_WINDOW_BYTES",
         "CELLD_MAX_RESIDENT_CELLS",
         "CELLD_MAX_RSS_MB",
+        "CELLD_OBJECT_CACHE_BYTES",
         "CELLD_READY_FLEET_GATE_MS",
         "CELLD_REBALANCE_INTERVAL_MS",
     ] {

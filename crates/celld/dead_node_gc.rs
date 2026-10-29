@@ -25,6 +25,10 @@ struct NodeWire {
     generation: String,
     #[serde(default)]
     probe_public_key: String,
+    /// Where peers reach the node. The elected waker pushes it wake entries
+    /// here. Skipped when empty, so a tombstone adds nothing a record lacked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    addr: String,
     /// The folded node log: this record IS
     /// the fleet log's root of truth, so retirement must respect its
     /// state and the tombstone must carry it through unchanged.
@@ -84,19 +88,19 @@ impl DeadNodeGc {
     /// spawned: the caller's existing wake-loop future polls both work and
     /// renewal, and dropping a lost-role pass cancels remaining I/O.
     ///
-    /// Returns the node sessions whose leases were live when the pass began,
-    /// and only when this node held the role for the whole pass. The caller
-    /// uses that as its election result: the fleet-wide wake probe that
-    /// follows runs on the same tick, against the same leases, and only on
-    /// the node that holds the role. `None` means either that another node
-    /// holds the role or that this node lost it mid-pass; both mean "do not
-    /// probe this tick".
+    /// Returns the node sessions whose leases were live when the pass began
+    /// (with their addresses), and only when this node held the role for the
+    /// whole pass. The caller uses that as its election result: the
+    /// fleet-wide wake probe and the pushes to live owners that follow run on
+    /// the same tick, against the same leases, and only on the node that holds
+    /// the role. `None` means either that another node holds the role or that
+    /// this node lost it mid-pass; both mean "do not list this tick".
     pub async fn run_elected_pass(
         &mut self,
         bucket: &Bucket,
         node: &str,
         tick_ms: u64,
-    ) -> Option<BTreeSet<String>> {
+    ) -> Option<LiveNodes> {
         let lease_ttl_ms = tick_ms.saturating_mul(3).min(i64::MAX as u64);
         if !crate::wake::try_hold_waker(
             bucket,
@@ -135,7 +139,7 @@ impl DeadNodeGc {
     }
 
     /// One GC pass. Returns the live node sessions the pass observed.
-    async fn run_pass(&mut self, bucket: &Bucket, tick_ms: u64) -> BTreeSet<String> {
+    async fn run_pass(&mut self, bucket: &Bucket, tick_ms: u64) -> LiveNodes {
         let observed_ms = crate::ownership_store::now_ms();
         let NodeScan { dead, live } = scan_nodes(bucket, observed_ms).await;
         let dead_names: BTreeSet<&str> = dead.iter().map(|record| record.node.as_str()).collect();
@@ -238,9 +242,14 @@ impl DeadNodeGc {
 
 /// The node sessions with a live lease, for a caller that has no GC pass to
 /// take them from (the boot-time wake scan).
-pub async fn live_nodes(bucket: &Bucket, now_ms: u64) -> BTreeSet<String> {
+pub async fn live_nodes(bucket: &Bucket, now_ms: u64) -> LiveNodes {
     scan_nodes(bucket, now_ms).await.live
 }
+
+/// Node sessions with a live lease, each with the address its lease
+/// advertises. The same record read gives the elected waker both the liveness
+/// of an entry's owner and where to push the entry, with no second LIST.
+pub type LiveNodes = BTreeMap<String, String>;
 
 /// The fleet's node records, split by lease state at one instant.
 struct NodeScan {
@@ -249,12 +258,12 @@ struct NodeScan {
     /// expired. A record that fails to read is in neither set, so an owner
     /// named by such a record counts as not live and the wake probe hints
     /// its cells; the core's own lease read then decides.
-    live: BTreeSet<String>,
+    live: LiveNodes,
 }
 
 async fn scan_nodes(bucket: &Bucket, now_ms: u64) -> NodeScan {
     let mut dead = Vec::new();
-    let mut live = BTreeSet::new();
+    let mut live = LiveNodes::new();
     let objects = match bucket.list("nodes/").await {
         Ok(objects) => objects,
         Err(error) => {
@@ -285,7 +294,7 @@ async fn scan_nodes(bucket: &Bucket, now_ms: u64) -> NodeScan {
                 });
             }
             Ok(Some((record, _))) if record.node == node => {
-                live.insert(node.to_string());
+                live.insert(node.to_string(), record.addr);
             }
             Ok(_) => {}
             Err(error) => warn!(%node, %error, "dead-node scan read failed"),

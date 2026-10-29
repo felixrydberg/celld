@@ -197,6 +197,27 @@ the rest read from them. Keep at least two upstreams per node, in the same
 region. Relayed nodes do not sweep or arm crons; the nodes that read the bucket
 do both.
 
+Relays also serve the catalog objects themselves: application metadata, route
+and cell indexes, deployment manifests, handler artifacts and asset files.
+A relayed node reads a missing object from the relay it currently follows and
+the bucket only if that fails; artifacts and assets are checked against their
+digests. Each node keeps what it reads in its disk cache
+(`CELLD_OBJECT_CACHE_DIR`, `CELLD_OBJECT_CACHE_BYTES`), and concurrent reads of
+one object share a single fetch on every node, so a rollout to the whole tree
+reads each artifact from the bucket about once per root. A relay serves
+application metadata from its cache only when it has followed the epoch at
+least as far as the asking node; secrets never pass through relays.
+
+The Worker deployment pointer (`deploy/current.json`) travels the same tree.
+Nodes that read the bucket read it every `CELLD_DEPLOY_POLL_S` seconds as
+before and pass it on; a relayed node adopts a new deployment as soon as its
+relay passes the change on, instead of polling. A relayed node still reads the
+pointer from the bucket when every relay fails, at the fallback interval, and
+on `POST /reload`. Give relays the same deploy bucket as the nodes below them,
+and upgrade the nodes that read the bucket first: an older one does not pass
+the pointer on. A relay that serves nodes hosting applications must host
+applications too, or it has no epoch to pass on.
+
 Bucket requests per node per hour, for C cached applications and A applications
 in the catalog:
 
@@ -204,7 +225,8 @@ in the catalog:
 |---|---|---|
 | Idle, nothing served | 12·⌈A/1000⌉ LIST + 12 GET (sweep) | 0 |
 | Serving, no commits | 720 epoch GET + the sweep | 0 |
-| Per commit | 1 GET of that application (its crons are armed from it) | 1 GET of that application, if served |
+| Per commit | 1 GET of that application (its crons are armed from it) | 0 (read from the relay, if served) |
+| New deployment | 1 GET per artifact and asset file it serves | 0 (read from the relay) |
 | Arming that commit's crons | one arm per cron | none |
 
 Before the change log, a serving node made 720 epoch HEADs, 60·C revision

@@ -138,7 +138,9 @@ pub(crate) async fn check_inactive_cron_candidates_keep_ownership_without_arming
         "idle_ttl_secs":1,"platform_domain":"apps.test"
     }))
     .unwrap();
-    let dispatcher = RouteDispatcher::new(config, store).await.unwrap();
+    let dispatcher = RouteDispatcher::new(config, store, standalone())
+        .await
+        .unwrap();
     assert!(dispatcher.owns_storage_cell(&scope).await.unwrap());
     assert!(dispatcher
         .cron_entry(&scope)
@@ -206,7 +208,9 @@ pub(crate) async fn check_cron_scans_are_edge_triggered() {
         "idle_ttl_secs":1,"platform_domain":"apps.test"
     }))
     .unwrap();
-    let dispatcher = RouteDispatcher::new(config, store.clone()).await.unwrap();
+    let dispatcher = RouteDispatcher::new(config, store.clone(), standalone())
+        .await
+        .unwrap();
     // Serve the application, so reconcile watches its revision.
     assert!(dispatcher.owns_storage_cell(&scope).await.unwrap());
     let scans = Mutex::new(Vec::new());
@@ -326,6 +330,7 @@ pub(crate) async fn check_catalog_epoch_polling() {
         "apps.test".to_owned(),
         METADATA_CACHE_ENTRIES,
         METADATA_CACHE_BYTES,
+        standalone(),
     );
     let ops = |reset: bool| {
         let counter: &AtomicUsize = &node.catalog_ops;
@@ -427,9 +432,10 @@ pub(crate) async fn check_catalog_epoch_polling() {
     routes.poll_epoch(&mut watch, idle).await.unwrap();
     assert_eq!(ops(true), 1 + 1);
     // This node's own commit wakes its loop's pass at once.
-    let dispatcher = RouteDispatcher::static_host("apps.test".to_owned(), node.clone())
-        .await
-        .unwrap();
+    let dispatcher =
+        RouteDispatcher::static_host("apps.test".to_owned(), node.clone(), standalone())
+            .await
+            .unwrap();
     let routes = &dispatcher.routes;
     routes.app(&ids[1]).await.unwrap();
     let mut snapshot = node.read(&ids[1]).await.unwrap();
@@ -443,6 +449,266 @@ pub(crate) async fn check_catalog_epoch_polling() {
     .await
     .expect("a local commit is served without waiting for a poll period");
     dispatcher.shutdown().await.unwrap();
+}
+
+/// The disk tier answers a cold metadata read without the bucket for as long
+/// as the node follows the epoch log. The log drops what it names, served here
+/// or not; a pass that cannot follow it, and idleness, empty the tier.
+#[cfg(test)]
+#[tokio::test]
+async fn disk_metadata_follows_the_epoch_log() {
+    use crate::applications::tests::metadata_fault_store::Store;
+    let backend = Arc::new(Store::default());
+    let directory = tempfile::tempdir().unwrap();
+    let node = Arc::new(ApplicationStore::new(backend.bucket()));
+    node.enable_object_cache(
+        crate::object_cache::ObjectCache::at(
+            backend.bucket(),
+            directory.path().join("cache"),
+            1 << 20,
+        )
+        .unwrap(),
+    );
+    let objects = node.objects().unwrap().clone();
+    let other = ApplicationStore::new(backend.bucket());
+    let app = |name: &str| ApplicationId {
+        app: name.to_owned().try_into().unwrap(),
+    };
+    let (a, b) = (app("disk-a"), app("disk-b"));
+    let mut created = Vec::new();
+    for id in [&a, &b] {
+        let mut snapshot = other.read(id).await.unwrap();
+        snapshot.create(id.clone()).unwrap();
+        created.push(other.commit(snapshot).await.unwrap());
+    }
+    // Bucket reads of application metadata since the last call.
+    let reads = || {
+        std::mem::take(&mut *backend.calls.lock().unwrap())
+            .into_iter()
+            .filter(|(operation, key)| {
+                operation == "get" && key.starts_with("applications/v2/metadata/")
+            })
+            .count()
+    };
+    let routes = Routes::new(
+        node.clone(),
+        None,
+        "apps.test".to_owned(),
+        METADATA_CACHE_ENTRIES,
+        METADATA_CACHE_BYTES,
+        standalone(),
+    );
+    let evict = || {
+        lock(&routes.apps).evict_idle(Duration::ZERO);
+    };
+    let (idle, mut watch) = (Duration::from_secs(60), EpochWatch::default());
+
+    // A node serving nothing is not following the log: it keeps no disk metadata.
+    reads();
+    assert_eq!(routes.app(&a).await.unwrap().revision(), Some(&*created[0]));
+    assert_eq!(
+        reads(),
+        1,
+        "a node that has not looked at the log asks the bucket"
+    );
+    evict();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    objects.trust();
+    assert!(
+        objects.metadata(&a).await.is_none(),
+        "idleness emptied the tier"
+    );
+    objects.distrust().await;
+
+    // A child that listens keeps the node following with nothing in memory.
+    routes.sync.answer(None, None, true).await;
+    routes.app(&a).await.unwrap();
+    routes.app(&b).await.unwrap();
+    reads();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(reads(), 0);
+    // The first look emptied the tier and trusts it: cold reads fill the disk.
+    assert!(objects.metadata(&a).await.is_none());
+    for _ in 0..2 {
+        evict();
+        routes.app(&a).await.unwrap();
+        routes.app(&b).await.unwrap();
+    }
+    assert_eq!(reads(), 2, "the second cold read of each came from disk");
+    assert_eq!(routes.app(&a).await.unwrap().revision(), Some(&*created[0]));
+
+    // Another store commits to `a`, which this node holds only on disk.
+    evict();
+    let mut snapshot = other.read(&a).await.unwrap();
+    snapshot
+        .register_resource(
+            &a,
+            crate::applications::Resource {
+                resource: ResourceRef {
+                    kind: ResourceKind::Kv,
+                    id: "kv".to_owned().try_into().unwrap(),
+                },
+                configuration: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+    let revision = other.commit(snapshot).await.unwrap();
+    reads();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert_eq!(reads(), 0, "an application not in memory is not read");
+    assert!(objects.metadata(&a).await.is_none(), "the log dropped it");
+    assert!(objects.metadata(&b).await.is_some(), "and only it");
+    assert_eq!(routes.app(&a).await.unwrap().revision(), Some(&*revision));
+    assert_eq!(reads(), 1, "the next cold read goes to the bucket");
+    evict();
+    routes.app(&b).await.unwrap();
+    assert_eq!(reads(), 0);
+
+    // A body that is not a log cannot be followed: the pass empties the tier.
+    routes.app(&a).await.unwrap();
+    assert!(objects.metadata(&a).await.is_some());
+    backend
+        .bucket()
+        .put("applications/v2/epoch", "tok\n1")
+        .await
+        .unwrap();
+    routes.poll_epoch(&mut watch, idle).await.unwrap();
+    assert!(objects.metadata(&a).await.is_none());
+    assert!(objects.metadata(&b).await.is_none());
+    evict();
+    reads();
+    routes.app(&a).await.unwrap();
+    assert_eq!(reads(), 1);
+}
+
+/// `Routes::answer_object` as a child asks it, with its position in the log.
+#[cfg(test)]
+async fn ask_object(
+    routes: &Routes,
+    key: &str,
+    position: Option<(&str, u64)>,
+) -> axum::response::Response {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("key", key);
+    if let Some((log, seq)) = position {
+        query
+            .append_pair("log", log)
+            .append_pair("seq", &seq.to_string());
+    }
+    routes.answer_object(Some(&query.finish()), false).await
+}
+
+/// A child gets an immutable object streamed from this node's tier, filled
+/// from the bucket once, and nothing outside the allow-list. Metadata comes
+/// from the disk only for a child no further along the epoch log than this
+/// node's poll has got; any other is read through to the source.
+#[cfg(test)]
+#[tokio::test]
+async fn objects_are_served_to_children_from_the_tier_by_epoch_position() {
+    use crate::applications::tests::metadata_fault_store::Store;
+    use crate::object_cache::TOKEN_HEADER;
+    use axum::body::HttpBody as _;
+    let backend = Arc::new(Store::default());
+    let directory = tempfile::tempdir().unwrap();
+    let node = Arc::new(ApplicationStore::new(backend.bucket()));
+    node.enable_object_cache(
+        crate::object_cache::ObjectCache::at(
+            backend.bucket(),
+            directory.path().join("cache"),
+            1 << 20,
+        )
+        .unwrap(),
+    );
+    let id = ApplicationId {
+        app: "served".to_owned().try_into().unwrap(),
+    };
+    let mut snapshot = node.read(&id).await.unwrap();
+    snapshot.create(id.clone()).unwrap();
+    let revision = node.commit(snapshot).await.unwrap();
+    let artifact = Bytes::from(vec![7u8; 100_000]);
+    let digest = content_digest(&artifact);
+    node.upload_artifact(&id, &digest, artifact.clone())
+        .await
+        .unwrap();
+    let routes = Routes::new(
+        node.clone(),
+        None,
+        "apps.test".to_owned(),
+        METADATA_CACHE_ENTRIES,
+        METADATA_CACHE_BYTES,
+        standalone(),
+    );
+    let gets = |key: &str| {
+        let calls = backend.calls.lock().unwrap();
+        calls
+            .iter()
+            .filter(|(operation, called)| operation == "get" && called == key)
+            .count()
+    };
+
+    // The artifact is read from the bucket once, whoever asks and however
+    // often, and each reply is the file, framed by its length.
+    let key = format!("applications/v2/apps/served/artifacts/{digest}");
+    for _ in 0..2 {
+        let response = ask_object(&routes, &key, None).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-length"], "100000");
+        assert!(
+            response.body().size_hint().exact().is_none(),
+            "streamed from the file, not buffered"
+        );
+        let served = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(served, artifact);
+    }
+    assert_eq!(gets(&key), 1);
+    let absent = format!("applications/v2/apps/served/artifacts/{}", "0".repeat(64));
+    assert_eq!(ask_object(&routes, &absent, None).await.status(), 404);
+    let secret = format!("applications/v2/apps/served/secrets/token/{digest}");
+    assert_eq!(ask_object(&routes, &secret, None).await.status(), 403);
+    assert_eq!(
+        routes.answer_object(Some("log=aa"), false).await.status(),
+        403
+    );
+    let draining = routes.answer_object(Some("key=whatever"), true).await;
+    assert_eq!(draining.status(), 503);
+
+    // The poll has acted on the log up to its newest change, and trusts its disk.
+    let key = "applications/v2/metadata/served.json";
+    routes.app(&id).await.unwrap();
+    routes
+        .poll_epoch(&mut EpochWatch::default(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let (log, seq) = routes.sync.position().unwrap().unwrap();
+    let mut last = gets(key);
+    let mut reads = || {
+        let total = gets(key);
+        total - std::mem::replace(&mut last, total)
+    };
+    for position in [
+        Some((log.as_str(), seq)),
+        Some((log.as_str(), seq)),
+        Some((log.as_str(), seq - 1)),
+    ] {
+        let response = ask_object(&routes, key, position).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()[TOKEN_HEADER], revision.as_str());
+    }
+    assert_eq!(
+        reads(),
+        1,
+        "the first ask filled the disk; a child behind it is no later"
+    );
+    for position in [Some((log.as_str(), seq + 1)), Some(("another", seq)), None] {
+        let response = ask_object(&routes, key, position).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()[TOKEN_HEADER], revision.as_str());
+        assert_eq!(reads(), 1, "{position:?} is read through");
+    }
+    let nobody = ask_object(&routes, "applications/v2/metadata/nobody.json", None).await;
+    assert_eq!(nobody.status(), 404);
 }
 
 /// A node reads the bucket only for itself or for a child that asked: a
@@ -472,6 +738,7 @@ async fn relayed_node_follows_its_view_and_a_listened_to_node_keeps_reading() {
         epoch,
         age: Duration::ZERO,
         received: std::time::Instant::now(),
+        pointer: None,
     };
     let mut routes = Routes::new(
         node.clone(),
@@ -479,6 +746,7 @@ async fn relayed_node_follows_its_view_and_a_listened_to_node_keeps_reading() {
         "apps.test".to_owned(),
         METADATA_CACHE_ENTRIES,
         METADATA_CACHE_BYTES,
+        standalone(),
     );
     let (idle, mut watch) = (Duration::from_secs(60), EpochWatch::default());
 
@@ -886,6 +1154,12 @@ fn catalog_authenticates_objects_for_guest_peer_and_storage_paths() {
 
 #[cfg(test)]
 pub(super) const TEST_DOMAIN: &str = "apps.test";
+
+/// The sync of a node that reads the bucket itself.
+#[cfg(test)]
+pub(super) fn standalone() -> Arc<CatalogSync> {
+    Arc::new(CatalogSync::new(Vec::new()))
+}
 
 #[cfg(test)]
 pub(super) async fn assigned_host(
@@ -1715,7 +1989,7 @@ export default {
         store.commit(snapshot).await.unwrap();
     }
     // Staged is not published: no route, and no VM launches for it.
-    let dispatcher = RouteDispatcher::new(config.clone(), store.clone())
+    let dispatcher = RouteDispatcher::new(config.clone(), store.clone(), standalone())
         .await
         .unwrap();
     let shared_templates = dispatcher.routes.pool.as_ref().unwrap().templates.status();
@@ -1847,7 +2121,9 @@ export default {
     // A restarted dispatcher serves the committed catalog from a cold pool.
     dispatcher.shutdown().await.unwrap();
     assert!(vms(&dispatcher, 0));
-    let dispatcher = RouteDispatcher::new(config, store.clone()).await.unwrap();
+    let dispatcher = RouteDispatcher::new(config, store.clone(), standalone())
+        .await
+        .unwrap();
     assert_eq!(
         get(app, &dispatcher, &host, "/").await.as_deref(),
         Some("route-a /")
@@ -2137,7 +2413,11 @@ export default {
             store.commit(snapshot).await.unwrap();
         }
     };
-    let dispatcher = Arc::new(RouteDispatcher::new(config, store.clone()).await.unwrap());
+    let dispatcher = Arc::new(
+        RouteDispatcher::new(config, store.clone(), standalone())
+            .await
+            .unwrap(),
+    );
     let vms = |count: u32| {
         let pool = dispatcher.routes.pool.as_ref().unwrap().snapshot();
         assert_eq!(pool.quarantined, 0);
@@ -5599,6 +5879,7 @@ export default class Main extends WorkerEntrypoint {
                 memory_guard: None,
             },
             store.clone(),
+            standalone(),
         )
         .await
         .unwrap(),
@@ -6155,6 +6436,7 @@ export default { fetch(request, env) { return env.BOX.getByName('same').fetch(re
                 memory_guard: None,
             },
             store.clone(),
+            standalone(),
         )
         .await
         .unwrap(),
@@ -7257,11 +7539,17 @@ pub(crate) async fn served_routes_and_pinned_scopes_read_nothing_until_reconcile
     let route = snapshot.application(&id).unwrap().route_ids[&Name::try_from("main".to_owned()).unwrap()].clone();
     store.commit(snapshot).await.unwrap();
     let dispatcher = RouteDispatcher {
-        routes: Arc::new(Routes::new(store, None, "apps.test".into(), 16, 1 << 20)),
+        routes: Arc::new(Routes::new(
+            store,
+            None,
+            "apps.test".into(),
+            16,
+            1 << 20,
+            standalone(),
+        )),
         alarm_host: Default::default(),
         _reconciler: None,
         _catalog_sweep: None,
-        _follower: None,
     };
     let url = format!("https://{}.apps.test/", route.as_str());
     assert!(dispatcher.route(&url).await.unwrap().is_some());
