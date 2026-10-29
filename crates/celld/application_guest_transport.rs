@@ -806,8 +806,9 @@ impl Client {
             crate::asyncrt::mono_ms() < deadline_ms,
             "guest execution deadline exceeded"
         );
+        ensure!(!self.0.stop.is_cancelled(), "guest transport retired");
         ensure!(
-            !self.0.stop.is_cancelled() && !cancellation.is_cancelled(),
+            !cancellation.is_cancelled(),
             "guest execution admission cancelled"
         );
         match self.0.execution_gate.get() {

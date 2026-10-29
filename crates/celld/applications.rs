@@ -6,6 +6,7 @@
 //! adapter. Executing an application remains the runtime/Actor's responsibility.
 
 use crate::bucket::Bucket;
+use crate::object_cache::Object;
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use bytes::Bytes;
@@ -17,11 +18,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const LEGACY_CATALOG_KEY: &str = "applications/v1/catalog.json";
 const METADATA_PREFIX: &str = "applications/v2/metadata";
 const CRON_PREFIX: &str = "applications/v2/cron-candidates";
+/// One small object every successful `commit` appends to (an `EpochLog`). A
+/// node learns which applications changed from one GET of it instead of one
+/// HEAD per application. A commit whose append was lost is appended by `sweep`.
+const EPOCH_KEY: &str = "applications/v2/epoch";
+const EPOCH_VERSION: u16 = 1;
+/// Newest changes the log keeps; a node further behind re-checks everything.
+const EPOCH_CHANGES: usize = 64;
+/// Keys per LIST page of `metadata_tokens`: the providers' common maximum.
+const TOKEN_PAGE: usize = 1000;
+const MAX_EPOCH_BYTES: u64 = 64 * 1024;
 const METADATA_VERSION: u16 = 2;
 const MAX_METADATA_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_INDEX_BYTES: u64 = 4096;
@@ -139,18 +150,20 @@ pub fn content_digest(body: &[u8]) -> String {
         .collect()
 }
 
+/// 64 lowercase hex digits, the name of a content-addressed object.
+fn is_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn artifact_key(application: &ApplicationId, digest: &str) -> Result<String> {
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "invalid artifact digest"
-    );
+    ensure!(is_digest(digest), "invalid artifact digest");
     Ok(format!("{}artifacts/{digest}", application.storage_root()))
 }
 
-async fn write_cache_file(path: &Path, body: &[u8]) -> Result<()> {
+pub(crate) async fn write_cache_file(path: &Path, body: &[u8]) -> Result<()> {
     let parent = path.parent().context("artifact cache path has no parent")?;
     tokio::fs::create_dir_all(parent).await?;
     let temporary = parent.join(format!(
@@ -295,11 +308,22 @@ fn metadata_key(id: &ApplicationId) -> String {
     format!("{METADATA_PREFIX}/{}.json", id.app.as_str())
 }
 
+/// The application a `METADATA_PREFIX` listing key names.
+fn metadata_application(key: &str) -> Result<ApplicationId> {
+    let name = key
+        .strip_prefix(&format!("{METADATA_PREFIX}/"))
+        .and_then(|name| name.strip_suffix(".json"))
+        .context("invalid application metadata listing key")?;
+    Ok(ApplicationId {
+        app: name.to_owned().try_into()?,
+    })
+}
+
 /// An application's own provider revision; an absent record uses create-CAS.
 pub struct Snapshot {
-    id: ApplicationId,
-    application: Option<Application>,
-    token: Option<String>,
+    pub(crate) id: ApplicationId,
+    pub(crate) application: Option<Application>,
+    pub(crate) token: Option<String>,
 }
 
 impl Snapshot {
@@ -409,6 +433,52 @@ impl Snapshot {
     pub fn routes(&self) -> Result<RouteTable> {
         applications_routes(self.application.iter())
     }
+
+    /// The target `locator` names in this revision, if it is still active.
+    pub(crate) fn route(&self, locator: &RouteLocator, id: &RouteId) -> Option<RouteTarget> {
+        let app = self.application(&locator.application)?;
+        let deployment = app.active.as_ref()?;
+        let destination = match &locator.handler {
+            Some(handler) => {
+                if app.route_ids.get(handler) != Some(id)
+                    || !deployment.handlers.iter().any(|item| &item.id == handler && item.http) {
+                    return None;
+                }
+                RouteDestination::Handler(handler.clone())
+            }
+            None => {
+                if app.asset_route_id.as_ref() != Some(id) || deployment.assets.is_none() {
+                    return None;
+                }
+                RouteDestination::Assets
+            }
+        };
+        Some(RouteTarget {
+            application: app.id.clone(),
+            deployment: deployment.id.clone(),
+            destination,
+        })
+    }
+
+    /// The owner of an indexed cell in this revision; the locator alone is
+    /// not active-state authority.
+    pub(crate) fn cell_owner(&self, locator: CellLocator) -> Result<CellOwner> {
+        let application = self
+            .application(&locator.address.application)
+            .ok_or(UncommittedCellIndex)?;
+        ensure!(
+            application
+                .resources
+                .iter()
+                .any(|resource| resource.resource == locator.address.resource),
+            UncommittedCellIndex
+        );
+        Ok(CellOwner {
+            locator,
+            application: application.clone(),
+            revision: self.token.clone(),
+        })
+    }
 }
 
 pub struct ApplicationListEntry {
@@ -499,9 +569,9 @@ fn page_cursor(prefix: &str, limit: usize, token: Option<String>) -> Result<Opti
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RouteLocator {
+pub(crate) struct RouteLocator {
     index_version: u16,
-    application: ApplicationId,
+    pub(crate) application: ApplicationId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handler: Option<Name>,
 }
@@ -516,6 +586,25 @@ pub struct CellLocator {
 }
 
 impl CellLocator {
+    /// The locator of an object in a bound resource's namespace.
+    pub(crate) fn for_object(
+        address: &ResourceAddress,
+        object: &celld_applications::invocation_wire::ObjectTarget,
+    ) -> Result<Self> {
+        object.validate()?;
+        ensure!(
+            address.owns(object),
+            "object is outside the resource namespace"
+        );
+        let locator = CellLocator {
+            index_version: METADATA_VERSION,
+            scope: format!("{}:{}", object.class, object.id),
+            address: address.clone(),
+        };
+        locator.validate()?;
+        Ok(locator)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             self.index_version == METADATA_VERSION,
@@ -593,6 +682,104 @@ fn route_index_key(id: &RouteId) -> String {
     format!("applications/v2/routes/{}.json", id.as_str())
 }
 
+/// What a node serves its children on `/peer/object`, by key shape: the
+/// objects its own reads go through the disk tier for. The validators the keys
+/// are built with decide the names, so no `..`, no other prefix and nothing
+/// under `secrets/` gets through: secret values never leave the bucket path.
+pub(crate) enum ObjectKind {
+    /// Mutable, so its CAS token goes with it.
+    Metadata(ApplicationId),
+    /// Content-addressed or never rewritten, at most `max` bytes.
+    Immutable { max: u64, too_large: &'static str },
+}
+
+pub(crate) fn object_kind(key: &str) -> Option<ObjectKind> {
+    let index = || ObjectKind::Immutable {
+        max: MAX_INDEX_BYTES,
+        too_large: "application index exceeds limit",
+    };
+    let (group, rest) = key.strip_prefix("applications/v2/")?.split_once('/')?;
+    Some(match group {
+        "metadata" => ObjectKind::Metadata(metadata_application(key).ok()?),
+        "routes" => {
+            RouteId::try_from(rest.strip_suffix(".json")?.to_owned()).ok()?;
+            index()
+        }
+        "cells" => is_digest(rest.strip_suffix(".json")?).then(index)?,
+        "apps" => {
+            let (app, rest) = rest.split_once('/')?;
+            Name::try_from(app.to_owned()).ok()?;
+            match rest.split_once('/')? {
+                ("artifacts", digest) if is_digest(digest) => ObjectKind::Immutable {
+                    max: MAX_ARTIFACT_BYTES as u64,
+                    too_large: "stored artifact exceeds upload limit",
+                },
+                ("deployments", rest) => {
+                    let (id, file) = rest.split_once('/')?;
+                    Name::try_from(id.to_owned()).ok()?;
+                    if file != "manifest.json" {
+                        return None;
+                    }
+                    ObjectKind::Immutable {
+                        max: MAX_METADATA_BYTES,
+                        too_large: "application manifest exceeds metadata limit",
+                    }
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The body of `EPOCH_KEY`: the last few commits in order, so a node that saw
+/// up to `seq` re-checks only the applications committed since.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EpochLog {
+    version: u16,
+    /// Random id of this log. A new one starts whenever the object is absent
+    /// or unreadable, so a `seq` from another log never reads as progress.
+    pub(crate) log: String,
+    /// The newest change's sequence number.
+    pub(crate) seq: u64,
+    /// Oldest first, consecutive, ending at `seq`.
+    pub(crate) changes: Vec<EpochChange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EpochChange {
+    pub(crate) seq: u64,
+    pub(crate) application: ApplicationId,
+    /// The metadata CAS token the commit produced.
+    pub(crate) revision: String,
+}
+
+impl EpochLog {
+    /// `None` for anything but a version-1 log, e.g. the `"<token>\n<nanos>"`
+    /// body older binaries write.
+    fn parse(body: &[u8]) -> Option<Self> {
+        serde_json::from_slice::<Self>(body)
+            .ok()
+            .filter(|log| log.version == EPOCH_VERSION)
+    }
+
+    /// The changes after `seq` in log `log`, or `None` when this log cannot
+    /// say: another log, or changes between `seq` and the oldest one kept were
+    /// trimmed. The caller then re-checks everything.
+    pub(crate) fn since(&self, log: &str, seq: u64) -> Option<&[EpochChange]> {
+        if self.log != log {
+            return None;
+        }
+        if seq >= self.seq {
+            return Some(&[]);
+        }
+        if self.changes.first()?.seq > seq + 1 {
+            return None;
+        }
+        Some(&self.changes[self.changes.partition_point(|change| change.seq <= seq)..])
+    }
+}
+
 #[derive(Debug)]
 pub struct Conflict;
 
@@ -618,7 +805,7 @@ impl std::error::Error for ImmutableConflict {}
 /// Node-local, content-addressed copies of handler artifacts so a cold VM start
 /// does not re-download them. Entries are `<root>/<hash of the application's
 /// storage root>/<sha256>`, so applications never share one; they are verified
-/// on read, written by temp file plus rename, bounded in total bytes and evicted
+/// at download, written by temp file plus rename, bounded in total bytes and evicted
 /// `ttl` after last use (the mtime, touched on each hit).
 pub struct ArtifactCache {
     root: PathBuf,
@@ -672,6 +859,17 @@ impl ArtifactCache {
 pub struct ApplicationStore {
     bucket: Bucket,
     cache: std::sync::OnceLock<ArtifactCache>,
+    /// The node-local disk tier for catalog objects; the management API never
+    /// enables it.
+    objects: std::sync::OnceLock<Arc<crate::object_cache::ObjectCache>>,
+    /// Woken by every successful `commit` through this instance, so a node
+    /// that commits acts on it at once instead of at its next epoch poll.
+    committed: Arc<tokio::sync::Notify>,
+    /// Catalog reads this instance issued, for tests that prove idleness.
+    // ponytail: counts only revision/epoch/read, the catalog poll path; a
+    // counting ObjectStore would see every call but needs a Bucket constructor.
+    #[cfg(test)]
+    pub(crate) catalog_ops: std::sync::atomic::AtomicUsize,
 }
 
 impl ApplicationStore {
@@ -679,7 +877,15 @@ impl ApplicationStore {
         Self {
             bucket,
             cache: Default::default(),
+            objects: Default::default(),
+            committed: Default::default(),
+            #[cfg(test)]
+            catalog_ops: Default::default(),
         }
+    }
+
+    pub(crate) fn committed(&self) -> Arc<tokio::sync::Notify> {
+        self.committed.clone()
     }
 
     pub fn validate_resource(&self, resource: &ResourceRef) -> Result<()> {
@@ -694,6 +900,16 @@ impl ApplicationStore {
         let _ = self.cache.set(cache);
     }
 
+    /// Turns on the node-local disk tier for catalog reads (first call wins).
+    /// Secret values never go through it.
+    pub(crate) fn enable_object_cache(&self, cache: crate::object_cache::ObjectCache) {
+        let _ = self.objects.set(Arc::new(cache));
+    }
+
+    pub(crate) fn objects(&self) -> Option<&Arc<crate::object_cache::ObjectCache>> {
+        self.objects.get()
+    }
+
     pub async fn sweep_artifact_cache(&self) {
         if let Some(cache) = self.cache.get() {
             cache.sweep().await;
@@ -702,8 +918,7 @@ impl ApplicationStore {
 
     /// The path of `artifact` in the verified local cache, fetched once and
     /// cached if absent: a handler's read-only image, which a VM's drive links
-    /// to. A tampered, partial or oversized cache file is removed and
-    /// refetched.
+    /// to. An oversized cache file is removed and refetched.
     pub async fn cached_artifact(
         &self,
         application: &ApplicationId,
@@ -713,12 +928,12 @@ impl ApplicationStore {
         let cache = self.cache.get().context("artifact cache is not enabled")?;
         let scope = content_digest(application.storage_root().as_bytes());
         let path = cache.root.join(scope).join(digest);
-        let hit = match tokio::fs::metadata(&path).await {
-            Ok(meta) if meta.len() <= MAX_ARTIFACT_BYTES as u64 => tokio::fs::read(&path)
-                .await
-                .is_ok_and(|body| content_digest(&body) == digest),
-            _ => false,
-        };
+        // ponytail: hashed once at download, then trusted. Temp file plus rename
+        // never leaves a partial entry, and a writer of this node's cache
+        // directory owns the node anyway. Rehash here if the disk is shared.
+        let hit = tokio::fs::metadata(&path)
+            .await
+            .is_ok_and(|meta| meta.len() <= MAX_ARTIFACT_BYTES as u64);
         if hit {
             crate::assets::touch_cache_file(path.clone());
             return Ok(Some(path));
@@ -792,21 +1007,15 @@ impl ApplicationStore {
                 .get(name)
                 .context("handler application secret is not registered")?;
             let key = secret_key(&application.id, name, version)?;
-            if let Some((size, _)) = self.bucket.head(&key).await? {
-                ensure!(
-                    size <= (6 * MAX_SECRET_BYTES + 4096) as u64,
-                    "stored application secret exceeds limit"
-                );
-            }
             let (body, _) = self
                 .bucket
-                .get(&key)
+                .get_bounded(
+                    &key,
+                    (6 * MAX_SECRET_BYTES + 4096) as u64,
+                    "stored application secret exceeds limit",
+                )
                 .await?
                 .context("application secret value is missing")?;
-            ensure!(
-                body.len() <= 6 * MAX_SECRET_BYTES + 4096,
-                "stored application secret exceeds limit"
-            );
             let secret: SecretValue = serde_json::from_slice(&body)
                 .map_err(|_| anyhow::anyhow!("invalid stored application secret"))?;
             ensure!(
@@ -822,33 +1031,56 @@ impl ApplicationStore {
         Ok(environment)
     }
 
-    /// Old application-platform state has no migration or compatibility reader.
-    pub async fn validate_format(&self) -> Result<()> {
-        ensure!(
-            self.bucket.head(LEGACY_CATALOG_KEY).await?.is_none(),
-            "unsupported legacy application metadata; v2 records are required"
-        );
-        Ok(())
+    /// The application's metadata object and CAS token. With `disk`, this
+    /// node's trusted copy answers. A miss asks the relay this node follows,
+    /// which with `disk` may answer from its own, else the bucket; what comes
+    /// back is written back.
+    async fn metadata_object(
+        &self,
+        id: &ApplicationId,
+        disk: bool,
+    ) -> Result<Option<(Bytes, String)>> {
+        let objects = self.objects.get();
+        if let Some(objects) = objects.filter(|_| disk) {
+            if let Some(hit) = objects.metadata(id).await {
+                return Ok(Some(hit));
+            }
+        }
+        let generation = objects.map_or(0, |objects| objects.generation());
+        let key = metadata_key(id);
+        let relayed = match objects {
+            Some(objects) => objects.relayed(&key, MAX_METADATA_BYTES, disk).await,
+            None => None,
+        };
+        let read = match relayed {
+            Some(None) => None,
+            Some(Some((body, Some(token)))) => Some((body, token)),
+            // No relay, or it failed or sent no token: the bucket answers.
+            _ => {
+                self.bucket
+                    .get_bounded(
+                        &key,
+                        MAX_METADATA_BYTES,
+                        "application metadata exceeds individual record limit",
+                    )
+                    .await?
+            }
+        };
+        if let (Some(objects), Some((body, token))) = (objects, &read) {
+            objects.store_metadata(id, body, token, generation).await;
+        }
+        Ok(read)
     }
 
-    async fn read_record(&self, id: &ApplicationId, budget: usize) -> Result<(Snapshot, usize)> {
-        let key = metadata_key(id);
-        if let Some((size, _)) = self.bucket.head(&key).await? {
-            ensure!(
-                size <= MAX_METADATA_BYTES,
-                "application metadata exceeds individual record limit"
-            );
-            ensure!(
-                size <= budget as u64,
-                ApplicationPageError("application page exceeds 16 MiB; use a smaller limit")
-            );
-        }
-        let (application, token, size) = match self.bucket.get(&key).await? {
+    async fn read_record(
+        &self,
+        id: &ApplicationId,
+        budget: usize,
+        disk: bool,
+    ) -> Result<(Snapshot, usize)> {
+        let read = self.metadata_object(id, disk).await?;
+        let (application, token, size) = match read {
             Some((bytes, token)) => {
-                ensure!(
-                    bytes.len() as u64 <= MAX_METADATA_BYTES,
-                    "application metadata exceeds individual record limit"
-                );
                 ensure!(
                     bytes.len() <= budget,
                     ApplicationPageError("application page exceeds 16 MiB; use a smaller limit")
@@ -880,13 +1112,29 @@ impl ApplicationStore {
     }
 
     pub async fn read(&self, id: &ApplicationId) -> Result<Snapshot> {
-        self.validate_format().await?;
-        Ok(self.read_record(id, MAX_METADATA_BYTES as usize).await?.0)
+        #[cfg(test)]
+        self.catalog_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self
+            .read_record(id, MAX_METADATA_BYTES as usize, true)
+            .await?
+            .0)
+    }
+
+    /// `read` that skips this node's disk tier, for a caller that knows the
+    /// node's view is behind the bucket.
+    pub(crate) async fn read_fresh(&self, id: &ApplicationId) -> Result<Snapshot> {
+        #[cfg(test)]
+        self.catalog_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self
+            .read_record(id, MAX_METADATA_BYTES as usize, false)
+            .await?
+            .0)
     }
 
     pub async fn list(&self, limit: usize, cursor: Option<String>) -> Result<ApplicationPage> {
         let token = page_token(METADATA_PREFIX, limit, cursor)?;
-        self.validate_format().await?;
         let page = self
             .bucket
             .objects_page(METADATA_PREFIX, token, limit)
@@ -898,14 +1146,7 @@ impl ApplicationStore {
         let mut applications = Vec::with_capacity(page.objects.len());
         let mut bytes = 0usize;
         for object in page.objects {
-            let key = object.location.as_ref();
-            let name = key
-                .strip_prefix(&format!("{METADATA_PREFIX}/"))
-                .and_then(|name| name.strip_suffix(".json"))
-                .context("invalid application metadata listing key")?;
-            let id = ApplicationId {
-                app: name.to_owned().try_into()?,
-            };
+            let id = metadata_application(object.location.as_ref())?;
             let remaining = MAX_APPLICATION_PAGE_BYTES - bytes;
             ensure!(
                 object.size <= MAX_METADATA_BYTES,
@@ -915,7 +1156,7 @@ impl ApplicationStore {
                 object.size <= remaining as u64,
                 ApplicationPageError("application page exceeds 16 MiB; use a smaller limit")
             );
-            let (snapshot, size) = self.read_record(&id, remaining).await?;
+            let (snapshot, size) = self.read_record(&id, remaining, false).await?;
             bytes += size;
             if let Some(application) = snapshot.application {
                 applications.push(ApplicationListEntry {
@@ -932,6 +1173,139 @@ impl ApplicationStore {
 
     /// Locators publish before this authoritative CAS; interrupted candidates are unreachable.
     pub async fn commit(&self, snapshot: Snapshot) -> Result<String> {
+        let id = snapshot.id.clone();
+        let token = self.commit_application(snapshot).await?;
+        // The metadata CAS above is the commit. A change missing from the log
+        // stays unseen by other nodes until a sweep appends it, so it must not
+        // fail the commit.
+        if let Err(error) = self.append_change(&id, &token).await {
+            tracing::warn!(%error, "catalog epoch not updated; a later sweep repairs it");
+        }
+        self.committed.notify_one();
+        Ok(token)
+    }
+
+    /// Appends one change to the epoch log by CAS, so concurrent committers
+    /// each land their entry. An error may mean the append happened, so only a
+    /// clean CAS rejection retries.
+    async fn append_change(&self, id: &ApplicationId, revision: &str) -> Result<()> {
+        for _ in 0..5 {
+            let (log, token) = self.read_epoch().await?;
+            // Absent, or a body this version cannot read: start a new log.
+            let mut log = log.unwrap_or_else(|| EpochLog {
+                version: EPOCH_VERSION,
+                log: format!("{:032x}", rand::random::<u128>()),
+                seq: 0,
+                changes: Vec::new(),
+            });
+            log.seq += 1;
+            log.changes.push(EpochChange {
+                seq: log.seq,
+                application: id.clone(),
+                revision: revision.to_owned(),
+            });
+            let excess = log.changes.len().saturating_sub(EPOCH_CHANGES);
+            log.changes.drain(..excess);
+            let body = Bytes::from(serde_json::to_vec(&log)?);
+            if self
+                .bucket
+                .put_cas(EPOCH_KEY, body, token.as_deref())
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+        bail!("catalog epoch append lost 5 races")
+    }
+
+    /// The epoch object's log (`None` when absent or not a readable log) and
+    /// its CAS token (`None` when absent).
+    async fn read_epoch(&self) -> Result<(Option<EpochLog>, Option<String>)> {
+        let read = self
+            .bucket
+            .get_bounded(EPOCH_KEY, MAX_EPOCH_BYTES, "catalog epoch exceeds limit")
+            .await?;
+        Ok(match read {
+            Some((body, token)) => (EpochLog::parse(&body), Some(token)),
+            None => (None, None),
+        })
+    }
+
+    /// Every application's metadata CAS token, from LIST pages alone: a listing
+    /// carries each object's token, so nothing is read per application. Costs
+    /// ceil(applications / `TOKEN_PAGE`) list requests.
+    pub(crate) async fn metadata_tokens(&self) -> Result<BTreeMap<ApplicationId, String>> {
+        let mut tokens = BTreeMap::new();
+        let mut page_token = None;
+        loop {
+            let page = self
+                .bucket
+                .objects_page(METADATA_PREFIX, page_token, TOKEN_PAGE)
+                .await?;
+            for object in &page.objects {
+                tokens.insert(
+                    metadata_application(object.location.as_ref())?,
+                    self.bucket.listed_token(object)?,
+                );
+            }
+            match page.page_token {
+                Some(next) => page_token = Some(next),
+                None => return Ok(tokens),
+            }
+        }
+    }
+
+    /// Lists the metadata tokens and appends to the epoch log every changed
+    /// application it does not name at its current token. That repairs a
+    /// commit whose append was lost (a crash between the CAS and the append, a
+    /// failed append, an older binary that never appends). Returns the tokens
+    /// and the applications whose token differs from `previous`, appeared or
+    /// disappeared. A duplicate entry only makes nodes re-check an application,
+    /// but a missing one hides the change, so entries compare revisions, not
+    /// just applications.
+    // ponytail: one CAS append per missing change; batch them if a sweep ever
+    // repairs many, e.g. after more than `EPOCH_CHANGES` commits in one period.
+    pub(crate) async fn sweep(
+        &self,
+        previous: &BTreeMap<ApplicationId, String>,
+    ) -> Result<(BTreeMap<ApplicationId, String>, BTreeSet<ApplicationId>)> {
+        let mut tokens = self.metadata_tokens().await?;
+        let new = tokens
+            .iter()
+            .filter(|(id, token)| previous.get(*id) != Some(*token))
+            .map(|(id, _)| id.clone());
+        let gone = previous
+            .keys()
+            .filter(|id| !tokens.contains_key(*id))
+            .cloned();
+        let changed: BTreeSet<_> = new.chain(gone).collect();
+        // After the listing: a commit it already shows has had longer to append.
+        let (log, _) = self.read_epoch().await?;
+        for id in &changed {
+            // A disappeared application is named by an empty revision.
+            let revision = tokens.get(id).cloned().unwrap_or_default();
+            let named = log.as_ref().is_some_and(|log| {
+                log.changes
+                    .iter()
+                    .any(|change| &change.application == id && change.revision == revision)
+            });
+            if named {
+                continue;
+            }
+            if let Err(error) = self.append_change(id, &revision).await {
+                tracing::warn!(%error, application = ?id, "catalog epoch not repaired; the next sweep retries");
+                // Report its old token, so the next sweep finds it changed again.
+                match previous.get(id) {
+                    Some(old) => tokens.insert(id.clone(), old.clone()),
+                    None => tokens.remove(id),
+                };
+            }
+        }
+        Ok((tokens, changed))
+    }
+
+    async fn commit_application(&self, snapshot: Snapshot) -> Result<String> {
         let application = snapshot.application.context("application does not exist")?;
         ensure!(
             application.id == snapshot.id,
@@ -941,7 +1315,6 @@ impl ApplicationStore {
         for resource in &application.resources {
             self.validate_resource(&resource.resource)?;
         }
-        self.validate_format().await?;
         applications_routes(std::iter::once(&application))?;
         let key = metadata_key(&snapshot.id);
         let body = Bytes::from(serde_json::to_vec(&MetadataRecord {
@@ -996,18 +1369,57 @@ impl ApplicationStore {
         }
     }
 
+    /// An immutable bucket object, through the disk tier when it is on.
+    async fn immutable(
+        &self,
+        key: &str,
+        max: u64,
+        too_large: &'static str,
+    ) -> Result<Option<Bytes>> {
+        crate::object_cache::immutable_object(
+            self.objects.get().map(Arc::as_ref),
+            &self.bucket,
+            key,
+            max,
+            too_large,
+        )
+        .await
+    }
+
     async fn index_body(&self, key: &str) -> Result<Option<Bytes>> {
-        if let Some((size, _)) = self.bucket.head(key).await? {
-            ensure!(size <= MAX_INDEX_BYTES, "application index exceeds limit");
+        self.immutable(key, MAX_INDEX_BYTES, "application index exceeds limit")
+            .await
+    }
+
+    /// `key`, which `object_kind` allowed, as a child node reads it from this
+    /// one: metadata with its token, from this node's disk copy only if `disk`
+    /// (the child is no further along the epoch log than this node has
+    /// acted); everything else as the tier holds it, to be streamed.
+    // ponytail: only the immutable kinds are single-flighted (by the tier);
+    // children that ask for metadata while this node's poll is behind each cost
+    // one read of the source. Collapse them per application if that shows up.
+    pub(crate) async fn serve_object(
+        &self,
+        key: &str,
+        kind: ObjectKind,
+        disk: bool,
+    ) -> Result<Option<(Object, Option<String>)>> {
+        match kind {
+            ObjectKind::Metadata(id) => Ok(self
+                .metadata_object(&id, disk)
+                .await?
+                .map(|(body, token)| (Object::Bytes(body), Some(token)))),
+            ObjectKind::Immutable { max, too_large } => {
+                let object = match self.objects.get() {
+                    Some(objects) => objects.immutable_open(key, max, too_large).await?,
+                    None => self
+                        .immutable(key, max, too_large)
+                        .await?
+                        .map(Object::Bytes),
+                };
+                Ok(object.map(|object| (object, None)))
+            }
         }
-        let Some((body, _)) = self.bucket.get(key).await? else {
-            return Ok(None);
-        };
-        ensure!(
-            body.len() as u64 <= MAX_INDEX_BYTES,
-            "application index exceeds limit"
-        );
-        Ok(Some(body))
     }
 
     async fn publish_indexes(&self, application: &Application) -> Result<()> {
@@ -1070,17 +1482,7 @@ impl ApplicationStore {
         address: &ResourceAddress,
         object: &celld_applications::invocation_wire::ObjectTarget,
     ) -> Result<()> {
-        object.validate()?;
-        ensure!(
-            address.owns(object),
-            "object is outside the resource namespace"
-        );
-        let locator = CellLocator {
-            index_version: METADATA_VERSION,
-            scope: format!("{}:{}", object.class, object.id),
-            address: address.clone(),
-        };
-        locator.validate()?;
+        let locator = CellLocator::for_object(address, object)?;
         let snapshot = self.read(&address.application).await?;
         ensure!(
             snapshot
@@ -1091,11 +1493,37 @@ impl ApplicationStore {
                     .any(|resource| resource.resource == address.resource)),
             "application cell resource is not registered"
         );
-        self.immutable_index(&cell_index_key(&locator.scope), &locator)
+        self.publish_cell(&locator).await
+    }
+
+    /// Publishes a validated cell locator. The index is immutable, so
+    /// publishing the same locator again changes nothing.
+    pub(crate) async fn publish_cell(&self, locator: &CellLocator) -> Result<()> {
+        self.immutable_index(&cell_index_key(&locator.scope), locator)
             .await
     }
 
-    pub async fn resolve_route(&self, id: &RouteId) -> Result<Option<RouteTarget>> {
+    /// The application revision's CAS token, from one HEAD.
+    pub(crate) async fn revision_of(&self, id: &ApplicationId) -> Result<Option<String>> {
+        #[cfg(test)]
+        self.catalog_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.bucket.head(&metadata_key(id)).await?.map(|(_, token)| token))
+    }
+
+    /// The catalog epoch log, from one GET: it advances whenever any
+    /// application is committed. `None` before the first commit and for a
+    /// body that is not a readable log (an older binary's); not an error, the
+    /// caller re-checks everything.
+    pub(crate) async fn epoch(&self) -> Result<Option<EpochLog>> {
+        #[cfg(test)]
+        self.catalog_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.read_epoch().await?.0)
+    }
+
+    /// The immutable route index entry for `id`.
+    pub(crate) async fn route_locator(&self, id: &RouteId) -> Result<Option<RouteLocator>> {
         let Some(body) = self.index_body(&route_index_key(id)).await? else {
             return Ok(None);
         };
@@ -1105,34 +1533,18 @@ impl ApplicationStore {
             locator.index_version == METADATA_VERSION,
             "unsupported application route index version"
         );
-        let snapshot = self.read(&locator.application).await?;
-        let Some(app) = snapshot.application(&locator.application) else {
-            return Ok(None);
-        };
-        let Some(deployment) = &app.active else { return Ok(None); };
-        let destination = match locator.handler {
-            Some(handler) => {
-                if app.route_ids.get(&handler) != Some(id)
-                    || !deployment.handlers.iter().any(|item| item.id == handler && item.http) {
-                    return Ok(None);
-                }
-                RouteDestination::Handler(handler)
-            }
-            None => {
-                if app.asset_route_id.as_ref() != Some(id) || deployment.assets.is_none() {
-                    return Ok(None);
-                }
-                RouteDestination::Assets
-            }
-        };
-        Ok(Some(RouteTarget {
-            application: app.id.clone(),
-            deployment: deployment.id.clone(),
-            destination,
-        }))
+        Ok(Some(locator))
     }
 
-    pub async fn cell_owner(&self, scope: &str) -> Result<Option<CellOwner>> {
+    pub async fn resolve_route(&self, id: &RouteId) -> Result<Option<RouteTarget>> {
+        let Some(locator) = self.route_locator(id).await? else {
+            return Ok(None);
+        };
+        Ok(self.read(&locator.application).await?.route(&locator, id))
+    }
+
+    /// The immutable cell index entry for `scope`.
+    pub(crate) async fn cell_locator(&self, scope: &str) -> Result<Option<CellLocator>> {
         ensure!(
             celld_logic::cell::valid_cell_scope(scope),
             "invalid application cell scope"
@@ -1147,20 +1559,15 @@ impl ApplicationStore {
             "application cell index identity mismatch"
         );
         locator.validate()?;
+        Ok(Some(locator))
+    }
+
+    pub async fn cell_owner(&self, scope: &str) -> Result<Option<CellOwner>> {
+        let Some(locator) = self.cell_locator(scope).await? else {
+            return Ok(None);
+        };
         let snapshot = self.read(&locator.address.application).await?;
-        let application = snapshot.application.ok_or(UncommittedCellIndex)?;
-        ensure!(
-            application
-                .resources
-                .iter()
-                .any(|resource| resource.resource == locator.address.resource),
-            UncommittedCellIndex
-        );
-        Ok(Some(CellOwner {
-            locator,
-            application,
-            revision: snapshot.token,
-        }))
+        snapshot.cell_owner(locator).map(Some)
     }
 
     /// Candidates need cell_owner/current metadata validation before dispatch.
@@ -1170,7 +1577,6 @@ impl ApplicationStore {
         cursor: Option<String>,
     ) -> Result<CronCandidatePage> {
         let token = page_token(CRON_PREFIX, limit, cursor)?;
-        self.validate_format().await?;
         let page = self.bucket.objects_page(CRON_PREFIX, token, limit).await?;
         ensure!(
             page.objects.len() <= limit,
@@ -1244,13 +1650,16 @@ impl ApplicationStore {
             application.storage_root(),
             id.as_str()
         );
-        let Some((body, _)) = self.bucket.get(&key).await? else {
+        let Some(body) = self
+            .immutable(
+                &key,
+                MAX_METADATA_BYTES,
+                "application manifest exceeds metadata limit",
+            )
+            .await?
+        else {
             return Ok(None);
         };
-        ensure!(
-            body.len() as u64 <= MAX_METADATA_BYTES,
-            "application manifest exceeds metadata limit"
-        );
         let deployment: Deployment = serde_json::from_slice(&body)?;
         deployment.validate()?;
         ensure!(
@@ -1295,17 +1704,18 @@ impl ApplicationStore {
         digest: &str,
     ) -> Result<Option<Bytes>> {
         let key = artifact_key(application, digest)?;
-        if let Some((size, _)) = self.bucket.head(&key).await? {
-            ensure!(
-                size <= MAX_ARTIFACT_BYTES as u64,
-                "stored artifact exceeds upload limit"
-            );
-        }
-        let Some((body, _)) = self.bucket.get(&key).await? else {
+        let Some(body) = self
+            .immutable(
+                &key,
+                MAX_ARTIFACT_BYTES as u64,
+                "stored artifact exceeds upload limit",
+            )
+            .await?
+        else {
             return Ok(None);
         };
         ensure!(
-            body.len() <= MAX_ARTIFACT_BYTES && content_digest(&body) == digest,
+            content_digest(&body) == digest,
             "stored artifact content mismatch"
         );
         Ok(Some(body))
@@ -1334,6 +1744,7 @@ impl ApplicationStore {
             reference,
             alias.is_none(),
             None,
+            self.objects.get().cloned(),
         )
         .await?;
         ensure!(

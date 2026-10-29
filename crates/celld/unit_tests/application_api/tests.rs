@@ -720,6 +720,10 @@ async fn application_management_authorization_publication_and_cli() {
     crate::asyncrt::bind_test_runtime();
     #[cfg(target_os = "linux")]
     crate::application_vm::tests::check_inactive_cron_candidates_keep_ownership_without_arming().await;
+    #[cfg(target_os = "linux")]
+    crate::application_vm::tests::check_cron_scans_are_edge_triggered().await;
+    #[cfg(target_os = "linux")]
+    crate::application_vm::tests::check_catalog_epoch_polling().await;
     #[cfg(unix)]
     crate::application_guest_transport::tests::check_protocol_boundary().await;
     #[cfg(unix)]
@@ -782,10 +786,13 @@ async fn application_management_authorization_publication_and_cli() {
     // tokio::test runtimes can shut down its blocking-I/O executor.
     crate::applications::tests::application_publication_cas_route_ids_and_resource_preservation()
         .await;
-    crate::applications::tests::application_artifact_cache_hits_tamper_eviction_and_isolation()
+    crate::applications::tests::application_artifact_cache_hits_refetch_eviction_and_isolation()
         .await;
     crate::applications::tests::application_secret_rotation_isolation_and_limits().await;
     crate::applications::tests::application_static_assets_isolation_and_routing().await;
+    #[cfg(target_os = "linux")]
+    crate::application_vm::tests::served_routes_and_pinned_scopes_read_nothing_until_reconcile()
+        .await;
     check_scope_matrix().await;
     let directory = tempfile::tempdir().unwrap();
     let bucket = crate::bucket::Bucket::open_dev(&directory.path().join("bucket.sqlite")).unwrap();

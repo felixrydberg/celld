@@ -746,7 +746,6 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     authorization.validate()?;
     let listen: std::net::SocketAddr = listen.parse().context("listen requires an IP:PORT")?;
     let store = ApplicationStore::new(fleet.resolve("celld application-api")?.open().await?);
-    store.validate_format().await.context("unsupported application metadata")?;
     let app = router(store, authorization, platform_domain)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(address = %listener.local_addr()?, "application management listening");

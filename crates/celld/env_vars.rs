@@ -194,6 +194,12 @@ const REMOVED: &[Removed] = &[
         // operator must therefore delete the empty setting.
         empty_was_inert: false,
     },
+    Removed {
+        name: "CELLD_CRON_SCAN_S",
+        replacement: "remove this setting; the catalog sweep (CELLD_SYNC_SWEEP_S) re-arms crons",
+        // `positive_or` parsed an empty value as a number and failed.
+        empty_was_inert: false,
+    },
 ];
 
 /// The removed `CELLD_VAR_<NAME>` family. It is a prefix and not a name, so
@@ -242,6 +248,8 @@ pub fn validate() -> anyhow::Result<()> {
 
     for name in [
         "CELLD_ACTIVATIONS",
+        "CELLD_APPLICATION_IDLE_S",
+        "CELLD_APPLICATION_POLL_S",
         "CELLD_DEPLOY_POLL_S",
         "CELLD_FETCH_TIMEOUT_S",
         "CELLD_HANDLER_BUDGET_S",
@@ -261,6 +269,8 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_OPERATION_DEADLINE_MS",
         "CELLD_PLACEMENT_WEIGHT",
         "CELLD_RELEASES",
+        "CELLD_SYNC_FALLBACK_S",
+        "CELLD_SYNC_SWEEP_S",
         "CELLD_TOKIO_THREADS",
         "CELLD_TTL_MS",
         "CELLD_WAKER_TICK_MS",
@@ -281,6 +291,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_LOG_WINDOW_BYTES",
         "CELLD_MAX_RESIDENT_CELLS",
         "CELLD_MAX_RSS_MB",
+        "CELLD_OBJECT_CACHE_BYTES",
         "CELLD_READY_FLEET_GATE_MS",
         "CELLD_REBALANCE_INTERVAL_MS",
     ] {
@@ -317,7 +328,41 @@ pub fn validate() -> anyhow::Result<()> {
     if let Some(node) = value("CELLD_NODE")? {
         crate::machine::validate_node_name(&node).map_err(|error| anyhow!("CELLD_NODE {error}"))?;
     }
+    sync_upstreams()?;
     Ok(())
+}
+
+/// `CELLD_SYNC_UPSTREAM` as `(node, host:port)` pairs in preference order:
+/// the nodes this one reads the catalog epoch from instead of the bucket.
+/// Unset or empty is bucket mode.
+pub fn sync_upstreams() -> anyhow::Result<Vec<(String, String)>> {
+    parse_sync_upstreams(value("CELLD_SYNC_UPSTREAM")?.as_deref().unwrap_or_default())
+}
+
+/// Parses `node-a@10.0.1.5:9001,node-b@host:9001`.
+pub fn parse_sync_upstreams(list: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let mut upstreams: Vec<(String, String)> = Vec::new();
+    if list.is_empty() {
+        return Ok(upstreams);
+    }
+    for entry in list.split(',') {
+        let (node, address) = entry
+            .split_once('@')
+            .ok_or_else(|| anyhow!("CELLD_SYNC_UPSTREAM entry {entry:?} must be node@host:port"))?;
+        crate::machine::validate_node_name(node)
+            .map_err(|error| anyhow!("CELLD_SYNC_UPSTREAM node {node:?} {error}"))?;
+        let valid = address
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+        if !valid {
+            bail!("CELLD_SYNC_UPSTREAM entry {entry:?} must be node@host:port with a numeric port");
+        }
+        if upstreams.iter().any(|(known, _)| known == node) {
+            bail!("CELLD_SYNC_UPSTREAM lists node {node:?} twice");
+        }
+        upstreams.push((node.to_owned(), address.to_owned()));
+    }
+    Ok(upstreams)
 }
 
 /// Resolve all shutdown timing from the operator's complete process bound.

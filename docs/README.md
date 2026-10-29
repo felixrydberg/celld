@@ -79,7 +79,9 @@ send a successful response until a durable wake entry covers the alarm. A
 later `waitUntil` alarm does not delay the response of another event.
 
 A hibernated cell fires its alarm on the node that owns it. One node holds
-the waker role, and it wakes only the cells whose owner node has stopped.
+the waker role: it lists the due alarms, wakes the cells whose owner node has
+stopped, and sends each live owner the alarms of its own cells. Other nodes do
+not list alarms.
 
 ## What do you build with cells
 
@@ -434,6 +436,13 @@ dormant cells; a restarted node omits it until it has read its ownership
 records. `resident_cells` counts only cells in memory. The memory and CPU
 values are sampled every second.
 
+Lease renewals are bucket writes, one every `CELLD_TTL_MS`/3 per node: about
+1,080 an hour per node at the default. A large fleet should raise it, for
+example `CELLD_TTL_MS=30000` for a third of the writes. The cost is slower
+failover: a node that dies keeps its cells until its lease expires, so they
+move up to 30 seconds after the failure instead of 10. A node partitioned from
+the bucket also fences itself only when its longer lease runs out.
+
 `GET /state` on the internal listener reports the live counters. Its
 `node_load` object is the lease load block.
 
@@ -651,6 +660,13 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_ESBUILD` | The path of the esbuild executable |
 | `CELLD_ACTIVATIONS` | Concurrent cold-cell activations (default: 8 per CPU, at least 16, at most 128) |
 | `CELLD_DEPLOY_POLL_S` | The deployment pointer poll interval in seconds (default: 30) |
+| `CELLD_APPLICATION_POLL_S` | How often a node reads the application catalog epoch log to notice activations and other changes, in seconds (default: 5) |
+| `CELLD_APPLICATION_IDLE_S` | Seconds an unused application stays in a node's metadata cache before it is dropped and read cold on its next request (default: 120) |
+| `CELLD_SYNC_SWEEP_S` | How often a node that reads the bucket sweeps the application catalog listing, repairing commits the epoch log lost and arming new applications' crons, in seconds (default: 300) |
+| `CELLD_SYNC_UPSTREAM` | Comma-separated `node@host:port` relays to read the application catalog epoch from instead of the bucket (default: read the bucket). See "Catalog relays" in the application setup guide |
+| `CELLD_SYNC_FALLBACK_S` | How often a relayed node reads the epoch from the bucket while every relay is failing, in seconds (default: 300) |
+| `CELLD_OBJECT_CACHE_DIR` | The node's disk cache for application catalog objects: metadata, route and cell indexes, deployment manifests, artifacts and asset files (default: `celld/object-cache` in the temp directory). Put it on fast local disk |
+| `CELLD_OBJECT_CACHE_BYTES` | The size limit of the object cache; the least recently used objects go first (default: 2 GiB; 0 turns the disk cache off) |
 | `CELLD_DEPLOY_MAX_AGE_S` | Seconds before celld forces a resident Durable Object onto a new deployment (default: 60; 0 forces at once) |
 | `CELLD_OPERATION_DEADLINE_MS` | The deadline for a non-restore operation (default: 15000) |
 | `CELLD_MAX_CELL_REQUESTS` | Concurrent fetch events for one Durable Object (default: 64) |

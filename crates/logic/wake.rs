@@ -292,12 +292,13 @@ pub fn waker_may_claim(held_by_us: bool, expires_ms: Ms, now_ms: Ms) -> bool {
 /// cell's owner record: does this node need to send the `Fleet` hint?
 ///
 /// A live owner fires its own alarms. A resident cell fires from the owner's
-/// timer, and a dormant one wakes from the owner's own due scan, which sends
-/// it an `Owned` hint. The elected waker's hint is for everything else: a
-/// cell nobody owns, a cell whose owner's lease has run out, and a cell this
-/// node owns itself. Hinting a live owner's cell risks nothing (the core never
-/// steals), but it costs the elected node an activation permit and an owner
-/// read per entry, for the whole fleet's due set, every tick.
+/// timer, and a dormant one wakes when the elected waker pushes the owner its
+/// entry, which the owner hints itself. The elected waker's own hint is for
+/// everything else: a cell nobody owns, a cell whose owner's lease has run
+/// out, and a cell this node owns itself. Hinting a live owner's cell from
+/// here risks nothing (the core never steals), but it costs the elected node
+/// an activation permit and an owner read per entry, for the whole fleet's
+/// due set, every tick.
 pub fn elected_hint_needed(owner: Option<&str>, node: &str, owner_live: bool) -> bool {
     match owner {
         None => true,

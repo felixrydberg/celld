@@ -66,7 +66,7 @@ fn deployment(application: ApplicationId, version: &str) -> Deployment {
     .unwrap()
 }
 
-pub(crate) async fn application_artifact_cache_hits_tamper_eviction_and_isolation() {
+pub(crate) async fn application_artifact_cache_hits_refetch_eviction_and_isolation() {
     let directory = tempfile::tempdir().unwrap();
     let store = ApplicationStore::new(
         Bucket::open_dev(&directory.path().join("artifacts.sqlite")).unwrap(),
@@ -113,11 +113,11 @@ pub(crate) async fn application_artifact_cache_hits_tamper_eviction_and_isolatio
     assert!(entry(&one).exists() && !entry(&two).exists());
     assert_eq!(cached(&two).await, Some(body.clone()));
     assert!(entry(&two).exists());
-    // Tampered and partial cache files are refused: with no bucket copy the load fails...
-    std::fs::write(entry(&one), b"tampered bytes").unwrap();
+    // A missing entry is refetched: with no bucket copy the load fails...
+    std::fs::remove_file(entry(&one)).unwrap();
     assert!(cached(&one).await.is_none());
-    // ...and with one the artifact is refetched and the entry repaired.
-    std::fs::write(entry(&two), &body[..4]).unwrap();
+    // ...and with one the entry is restored.
+    std::fs::remove_file(entry(&two)).unwrap();
     assert_eq!(cached(&two).await, Some(body.clone()));
     assert_eq!(std::fs::read(entry(&two)).unwrap(), body);
     // Expiry uses filesystem wall time and sweep throttling uses std Instant;
@@ -358,7 +358,7 @@ pub(crate) async fn application_secret_rotation_isolation_and_limits() {
     eprintln!("application secrets/limits: application separation, opaque metadata without values, foreign-version refusal, immutable old snapshot, rotation CAS winner/loser, active-reference deletion refusal, missing-secret refusal and validated/reset policy over original local bucket; no independent-provider qualification");
 }
 
-mod metadata_fault_store {
+pub(crate) mod metadata_fault_store {
     use super::*;
     use futures_util::stream::BoxStream;
     use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
@@ -370,10 +370,12 @@ mod metadata_fault_store {
     use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Default)]
-    pub(super) struct Store {
+    pub(crate) struct Store {
         inner: object_store::memory::InMemory,
-        pub(super) calls: Mutex<Vec<(String, String)>>,
+        pub(crate) calls: Mutex<Vec<(String, String)>>,
         pub(super) fail: Mutex<Option<(String, bool)>>,
+        /// Written to its key just before the next put there: a rival wins the race.
+        pub(super) race: Mutex<Option<(String, Bytes)>>,
     }
     impl std::fmt::Display for Store {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -393,7 +395,7 @@ mod metadata_fault_store {
                 source: std::io::Error::other("injected lost reply").into(),
             }
         }
-        pub(super) fn bucket(self: &Arc<Self>) -> Bucket {
+        pub(crate) fn bucket(self: &Arc<Self>) -> Bucket {
             Bucket::with_paginated_store_for_test(self.clone(), self.clone(), String::new())
         }
     }
@@ -406,6 +408,20 @@ mod metadata_fault_store {
             options: PutOptions,
         ) -> object_store::Result<PutResult> {
             self.call("put", key.as_ref());
+            let rival = {
+                let mut race = self.race.lock().unwrap();
+                if race
+                    .as_ref()
+                    .is_some_and(|(wanted, _)| wanted == key.as_ref())
+                {
+                    race.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, body)) = rival {
+                self.inner.put(key, body.into()).await?;
+            }
             let failure = {
                 let mut fail = self.fail.lock().unwrap();
                 if fail
@@ -432,6 +448,9 @@ mod metadata_fault_store {
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
             self.call(if options.head { "head" } else { "get" }, key.as_ref());
+            // A real read waits on the network; without this yield concurrent
+            // readers could never overlap, and request collapsing goes untested.
+            tokio::task::yield_now().await;
             self.inner.get_opts(key, options).await
         }
         async fn put_multipart_opts(
@@ -535,9 +554,17 @@ async fn metadata_faults_and_bounded_calls() {
         calls.len() <= 6,
         "one-app management did unbounded work: {calls:?}"
     );
+    // The application's own record, plus the epoch log's read and conditional
+    // write that tell other nodes.
     assert!(calls
         .iter()
-        .all(|(_, key)| key == &metadata_key(&one) || key == LEGACY_CATALOG_KEY));
+        .all(|(_, key)| key == &metadata_key(&one) || key == EPOCH_KEY));
+    let epoch_calls: Vec<_> = calls
+        .iter()
+        .filter(|(_, key)| key == EPOCH_KEY)
+        .map(|(operation, _)| operation.as_str())
+        .collect();
+    assert_eq!(epoch_calls, ["get", "put"]);
     assert!(!calls
         .iter()
         .any(|(operation, _)| operation.contains("list") || operation == "page"));
@@ -701,6 +728,273 @@ async fn metadata_faults_and_bounded_calls() {
                 .is_empty());
         }
     }
+}
+
+/// Commits `id` (created on first use) with a new timeout, so every commit
+/// produces a revision of its own.
+async fn touch(store: &ApplicationStore, id: &ApplicationId, timeout_ms: u64) -> String {
+    let mut snapshot = store.read(id).await.unwrap();
+    if snapshot.application(id).is_none() {
+        snapshot.create(id.clone()).unwrap();
+    }
+    let limits = ApplicationLimits {
+        size_class: ApplicationSizeClass::Basic,
+        invocation_timeout_ms: timeout_ms,
+    };
+    snapshot.set_limits(id, Some(limits)).unwrap();
+    store.commit(snapshot).await.unwrap()
+}
+
+async fn epoch_log_trims_and_restarts_over_unreadable_bodies() {
+    let backend = std::sync::Arc::new(metadata_fault_store::Store::default());
+    let store = ApplicationStore::new(backend.bucket());
+    let id = app("one");
+    // An older binary's body is not a log, and not an error.
+    assert!(store.epoch().await.unwrap().is_none());
+    store.bucket.put(EPOCH_KEY, "tok\n123").await.unwrap();
+    assert!(store.epoch().await.unwrap().is_none());
+
+    let mut revisions = vec![touch(&store, &id, 1).await];
+    let first = store.epoch().await.unwrap().unwrap();
+    assert_eq!((first.seq, first.changes.len()), (1, 1));
+    for timeout in 2..=70 {
+        revisions.push(touch(&store, &id, timeout).await);
+    }
+    // The 64 newest of 70, consecutive, newest last.
+    let log = store.epoch().await.unwrap().unwrap();
+    assert_eq!(log.log, first.log);
+    assert_eq!(log.seq, 70);
+    let expected: Vec<_> = (7..=70)
+        .zip(&revisions[6..])
+        .map(|(seq, revision)| EpochChange {
+            seq,
+            application: id.clone(),
+            revision: revision.clone(),
+        })
+        .collect();
+    assert_eq!(log.changes, expected);
+
+    // An older binary overwrites the log: the next commit starts another one.
+    store.bucket.put(EPOCH_KEY, "tok\n123").await.unwrap();
+    assert!(store.epoch().await.unwrap().is_none());
+    touch(&store, &id, 71).await;
+    let restarted = store.epoch().await.unwrap().unwrap();
+    assert_eq!((restarted.seq, restarted.changes.len()), (1, 1));
+    assert_ne!(restarted.log, log.log);
+    assert!(restarted.since(&log.log, 70).is_none());
+}
+
+async fn epoch_log_keeps_every_committers_change() {
+    let backend = std::sync::Arc::new(metadata_fault_store::Store::default());
+    let (a, b) = (
+        ApplicationStore::new(backend.bucket()),
+        ApplicationStore::new(backend.bucket()),
+    );
+    let (one, two) = (app("one"), app("two"));
+    let first = touch(&a, &one, 1).await;
+    let second = touch(&b, &two, 1).await;
+    let third = touch(&a, &one, 2).await;
+    let log = b.epoch().await.unwrap().unwrap();
+    let changes: Vec<_> = log
+        .changes
+        .iter()
+        .map(|change| (change.seq, &change.application, &change.revision))
+        .collect();
+    assert_eq!(
+        changes,
+        [(1, &one, &first), (2, &two, &second), (3, &one, &third)]
+    );
+
+    // A rival append lands between this one's read and write: the conditional
+    // write loses and is redone on top of the rival's log.
+    let mut rival = log.clone();
+    rival.seq += 1;
+    rival.changes.push(EpochChange {
+        seq: rival.seq,
+        application: two.clone(),
+        revision: "rival".into(),
+    });
+    *backend.race.lock().unwrap() = Some((
+        EPOCH_KEY.into(),
+        Bytes::from(serde_json::to_vec(&rival).unwrap()),
+    ));
+    backend.calls.lock().unwrap().clear();
+    let fourth = touch(&a, &one, 3).await;
+    let epoch_calls: Vec<_> = backend
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, key)| key == EPOCH_KEY)
+        .map(|(operation, _)| operation.clone())
+        .collect();
+    assert_eq!(epoch_calls, ["get", "put", "get", "put"]);
+    let log = a.epoch().await.unwrap().unwrap();
+    assert_eq!(log.seq, 5);
+    assert_eq!(
+        log.changes[3..],
+        [
+            EpochChange {
+                seq: 4,
+                application: two,
+                revision: "rival".into()
+            },
+            EpochChange {
+                seq: 5,
+                application: one.clone(),
+                revision: fourth
+            },
+        ]
+    );
+
+    // A failed append never fails the commit; the log just misses it.
+    *backend.fail.lock().unwrap() = Some((EPOCH_KEY.into(), false));
+    let fifth = touch(&a, &one, 4).await;
+    assert_eq!(a.read(&one).await.unwrap().revision(), Some(&*fifth));
+    assert_eq!(a.epoch().await.unwrap().unwrap().seq, 5);
+}
+
+/// The sweep reads the catalog from LIST pages instead of a HEAD per
+/// application, and appends to the epoch log only the commits it lost.
+async fn catalog_sweep_repairs_lost_epoch_entries() {
+    let backend = std::sync::Arc::new(metadata_fault_store::Store::default());
+    let store = ApplicationStore::new(backend.bucket());
+    let (one, two) = (app("one"), app("two"));
+    let first = touch(&store, &one, 1).await;
+    let second = touch(&store, &two, 1).await;
+    // The listing carries the revisions a read answers.
+    let tokens = store.metadata_tokens().await.unwrap();
+    assert_eq!(
+        tokens,
+        BTreeMap::from([(one.clone(), first), (two.clone(), second)])
+    );
+    for (id, token) in &tokens {
+        assert_eq!(
+            store.read(id).await.unwrap().revision(),
+            Some(token.as_str())
+        );
+    }
+
+    // Everything is new to a node with no baseline, yet each commit's entry is
+    // in the log already.
+    let seq = store.epoch().await.unwrap().unwrap().seq;
+    let (swept, changed) = store.sweep(&BTreeMap::new()).await.unwrap();
+    assert_eq!(swept, tokens);
+    assert_eq!(changed, BTreeSet::from([one.clone(), two.clone()]));
+    assert_eq!(
+        store.epoch().await.unwrap().unwrap().seq,
+        seq,
+        "nothing to repair"
+    );
+
+    // An unchanged catalog costs one list page and one epoch GET.
+    backend.calls.lock().unwrap().clear();
+    let (unchanged, changed) = store.sweep(&swept).await.unwrap();
+    assert_eq!(unchanged, swept);
+    assert!(changed.is_empty());
+    let calls = backend.calls.lock().unwrap().clone();
+    let operations: Vec<_> = calls
+        .iter()
+        .map(|(operation, _)| operation.as_str())
+        .collect();
+    assert_eq!(operations, ["page", "get"]);
+    assert_eq!(calls[1].1, EPOCH_KEY);
+
+    // A commit whose append failed is in the listing alone: the next sweep
+    // appends it, once.
+    let newest = |log: &EpochLog| {
+        let change = log.changes.last().unwrap();
+        (change.application.clone(), change.revision.clone())
+    };
+    *backend.fail.lock().unwrap() = Some((EPOCH_KEY.into(), false));
+    let third = touch(&store, &one, 2).await;
+    assert_eq!(
+        store.epoch().await.unwrap().unwrap().seq,
+        seq,
+        "the append was lost"
+    );
+    let (swept, changed) = store.sweep(&swept).await.unwrap();
+    assert_eq!(changed, BTreeSet::from([one.clone()]));
+    let log = store.epoch().await.unwrap().unwrap();
+    assert_eq!(log.seq, seq + 1);
+    assert_eq!(newest(&log), (one.clone(), third));
+    assert!(store.sweep(&swept).await.unwrap().1.is_empty());
+    assert_eq!(store.epoch().await.unwrap().unwrap().seq, seq + 1);
+
+    // A repair that fails too is retried: the application stays changed until
+    // its entry lands.
+    *backend.fail.lock().unwrap() = Some((EPOCH_KEY.into(), false));
+    let fourth = touch(&store, &two, 2).await;
+    *backend.fail.lock().unwrap() = Some((EPOCH_KEY.into(), false));
+    let (swept, changed) = store.sweep(&swept).await.unwrap();
+    assert_eq!(changed, BTreeSet::from([two.clone()]));
+    assert_eq!(store.epoch().await.unwrap().unwrap().seq, seq + 1);
+    let (swept, changed) = store.sweep(&swept).await.unwrap();
+    assert_eq!(changed, BTreeSet::from([two.clone()]));
+    let log = store.epoch().await.unwrap().unwrap();
+    assert_eq!(log.seq, seq + 2);
+    assert_eq!(newest(&log), (two.clone(), fourth));
+    assert!(store.sweep(&swept).await.unwrap().1.is_empty());
+
+    // An application that disappeared is named by an empty revision, once.
+    let mut before = swept.clone();
+    before.insert(app("gone"), "token".into());
+    let (_, changed) = store.sweep(&before).await.unwrap();
+    assert_eq!(changed, BTreeSet::from([app("gone")]));
+    let log = store.epoch().await.unwrap().unwrap();
+    assert_eq!(
+        (log.seq, newest(&log)),
+        (seq + 3, (app("gone"), String::new()))
+    );
+    store.sweep(&before).await.unwrap();
+    assert_eq!(store.epoch().await.unwrap().unwrap().seq, seq + 3);
+
+    // A thousand and one applications take two list pages.
+    let backend = std::sync::Arc::new(metadata_fault_store::Store::default());
+    let store = ApplicationStore::new(backend.bucket());
+    for n in 0..=TOKEN_PAGE {
+        let key = metadata_key(&app(&format!("bulk-{n}")));
+        store.bucket.put(&key, "{}").await.unwrap();
+    }
+    backend.calls.lock().unwrap().clear();
+    assert_eq!(store.metadata_tokens().await.unwrap().len(), TOKEN_PAGE + 1);
+    let pages = backend
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(op, _)| op == "page")
+        .count();
+    assert_eq!(pages, 2);
+}
+
+#[test]
+fn epoch_log_since_names_only_continuous_changes() {
+    let change = |seq| EpochChange {
+        seq,
+        application: app("one"),
+        revision: format!("r{seq}"),
+    };
+    let log = EpochLog {
+        version: EPOCH_VERSION,
+        log: "a".into(),
+        seq: 10,
+        changes: (7..=10).map(change).collect(),
+    };
+    let since = |name: &str, seq| {
+        log.since(name, seq)
+            .map(|changes| changes.iter().map(|change| change.seq).collect::<Vec<_>>())
+    };
+    assert_eq!(since("a", 10), Some(vec![]), "caught up");
+    assert_eq!(since("a", 9), Some(vec![10]));
+    assert_eq!(
+        since("a", 6),
+        Some(vec![7, 8, 9, 10]),
+        "7 directly follows 6"
+    );
+    assert_eq!(since("a", 5), None, "change 6 was trimmed");
+    assert_eq!(since("b", 9), None, "another log");
+    assert_eq!(since("b", 10), None, "another log, even when caught up");
 }
 
 pub(crate) async fn application_publication_cas_route_ids_and_resource_preservation() {
@@ -1029,20 +1323,10 @@ pub(crate) async fn application_publication_cas_route_ids_and_resource_preservat
         .to_string()
         .contains("unsupported application metadata version"));
     store.bucket.put(&key, original).await.unwrap();
-    store
-        .bucket
-        .put(LEGACY_CATALOG_KEY, Bytes::from_static(b"{}"))
-        .await
-        .unwrap();
-    assert!(store
-        .read(&one)
-        .await
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("unsupported legacy"));
-    assert!(store.list(1, None).await.is_err());
     metadata_faults_and_bounded_calls().await;
+    epoch_log_trims_and_restarts_over_unreadable_bodies().await;
+    epoch_log_keeps_every_committers_change().await;
+    catalog_sweep_repairs_lost_epoch_entries().await;
 }
 
 /// Static assets are original resolver behaviour over application-scoped
@@ -1208,4 +1492,72 @@ pub(crate) async fn application_static_assets_isolation_and_routing() {
         .unwrap();
     let theft = get(hostile, "GET", "https://assets.local/stolen.txt").await;
     assert!(theft.is_err(), "foreign asset body was served");
+}
+
+#[test]
+fn children_are_served_catalog_objects_by_key_shape_and_nothing_else() {
+    let (digest, route) = ("a".repeat(64), "b".repeat(32));
+    assert!(matches!(
+        object_kind("applications/v2/metadata/one.json"),
+        Some(ObjectKind::Metadata(id)) if id == app("one")
+    ));
+    for (key, bound) in [
+        (
+            format!("applications/v2/routes/{route}.json"),
+            MAX_INDEX_BYTES,
+        ),
+        (
+            format!("applications/v2/cells/{digest}.json"),
+            MAX_INDEX_BYTES,
+        ),
+        (
+            "applications/v2/apps/one/deployments/v1/manifest.json".to_owned(),
+            MAX_METADATA_BYTES,
+        ),
+        (
+            format!("applications/v2/apps/one/artifacts/{digest}"),
+            MAX_ARTIFACT_BYTES as u64,
+        ),
+    ] {
+        assert!(
+            matches!(object_kind(&key), Some(ObjectKind::Immutable { max, .. }) if max == bound),
+            "{key}"
+        );
+    }
+    let refused = [
+        // Secret values never leave the bucket path.
+        format!("applications/v2/apps/one/secrets/token/{digest}"),
+        format!("applications/v2/apps/one/artifacts/../secrets/token/{digest}"),
+        format!("applications/v2/apps/../apps/one/artifacts/{digest}"),
+        "applications/v2/metadata/../epoch".to_owned(),
+        "applications/v2/metadata/a/b.json".to_owned(),
+        "applications/v2/metadata/one.json.json".to_owned(),
+        "applications/v2/metadata/.json".to_owned(),
+        // Other prefixes, and a leading or missing one.
+        "applications/v2/epoch".to_owned(),
+        format!("applications/v2/cron-candidates/{digest}.json"),
+        "applications/v2/apps/one/resources/kv/x/data".to_owned(),
+        "fleet/peer-auth.json".to_owned(),
+        "/applications/v2/metadata/one.json".to_owned(),
+        String::new(),
+        // Bad hex: uppercase, short, long, not hex, or something after it.
+        format!(
+            "applications/v2/apps/one/artifacts/{}",
+            digest.to_uppercase()
+        ),
+        format!("applications/v2/apps/one/artifacts/{}", &digest[1..]),
+        format!("applications/v2/apps/one/artifacts/{digest}0"),
+        format!("applications/v2/apps/one/artifacts/g{}", &digest[1..]),
+        format!("applications/v2/apps/one/artifacts/{digest}/x"),
+        format!("applications/v2/cells/{}.json", &digest[1..]),
+        format!("applications/v2/routes/{}.json", &route[1..]),
+        format!("applications/v2/routes/{}.json", route.to_uppercase()),
+        // The manifest and nothing else beside it.
+        "applications/v2/apps/one/deployments/v1/other.json".to_owned(),
+        "applications/v2/apps/one/deployments//manifest.json".to_owned(),
+        "applications/v2/apps/one/deployments/v1/manifest.json/x".to_owned(),
+    ];
+    for key in refused {
+        assert!(object_kind(&key).is_none(), "{key}");
+    }
 }

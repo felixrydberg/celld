@@ -14,13 +14,17 @@ use crate::application_template::{
 };
 use crate::application_template_agent::{claim, prewarm, AGENT_PORT, HELLO};
 use crate::applications::{
-    content_digest, Application, ApplicationLimits, ApplicationSizeClass, ApplicationStore,
+    content_digest, object_kind, Application, ApplicationLimits, ApplicationSizeClass,
+    ApplicationStore, CellLocator, EpochChange, RouteLocator, Snapshot,
 };
+use crate::catalog_sync::CatalogSync;
+use crate::object_cache::Object;
+use crate::single_flight::SingleFlight;
 use anyhow::{ensure, Context, Result};
 use bytes::Bytes;
 use celld_applications::{
     ApplicationId, BindingTarget, Deployment, Handler, Language, Name, ResourceAddress,
-    ResourceKind, ResourceRef, RouteDestination, RouteTable, RouteTarget,
+    ResourceKind, ResourceRef, RouteDestination, RouteId, RouteTable, RouteTarget,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -37,6 +41,7 @@ use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
+use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -274,15 +279,15 @@ impl Drop for Vm {
 
 impl Vm {
     /// The caller has management authority for this application. Metadata and
-    /// artifact are re-read from immutable staged storage, not supplied by guest.
+    /// artifact are read from immutable staged storage, not supplied by guest.
+    #[cfg(test)]
     pub(crate) async fn launch(
-        mut options: LaunchOptions,
+        options: LaunchOptions,
         store: &ApplicationStore,
         application: &ApplicationId,
         deployment: &Name,
         handler: &Name,
     ) -> Result<Self> {
-        let began = Instant::now();
         let manifest = store
             .deployment(application, deployment)
             .await?
@@ -291,6 +296,19 @@ impl Vm {
         let app = snapshot
             .application(application)
             .context("application does not exist")?;
+        Self::launch_with(options, store, app, manifest, handler).await
+    }
+
+    /// `launch` from the catalog revision and manifest the caller already
+    /// holds; only secret values and a missing artifact are read.
+    pub(crate) async fn launch_with(
+        mut options: LaunchOptions,
+        store: &ApplicationStore,
+        app: &Application,
+        manifest: Deployment,
+        handler: &Name,
+    ) -> Result<Self> {
+        let began = Instant::now();
         let mut pin = prepare_pin(&options, manifest, handler, &app.resources)?;
         let metadata = began.elapsed();
         pin.runtime_environment = store.resolve_environment(app, &pin.handler).await?;
@@ -309,7 +327,7 @@ impl Vm {
             (options.vcpus, options.memory_mib, options.cpu_quota) = limits.size_class.resources();
         }
         let image = store
-            .cached_artifact(application, &pin.handler.artifact_sha256)
+            .cached_artifact(&app.id, &pin.handler.artifact_sha256)
             .await?
             .context("handler artifact is missing")?;
         let ms = |elapsed: Duration| elapsed.as_secs_f64() * 1000.0;
@@ -635,18 +653,6 @@ impl std::fmt::Display for CapacityExhausted {
 }
 
 impl std::error::Error for CapacityExhausted {}
-
-/// New leases for a replaced deployment are refused; the caller resolves again.
-#[derive(Debug)]
-pub(crate) struct DeploymentRetiring;
-
-impl std::fmt::Display for DeploymentRetiring {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("deployment is retiring")
-    }
-}
-
-impl std::error::Error for DeploymentRetiring {}
 
 /// One VM serves one application, deployment and handler; warm reuse never
 /// crosses this identity.
@@ -1471,6 +1477,7 @@ impl VmPool {
 
     /// A lease on this pinned handler's VM. The caller has already resolved
     /// application, deployment and handler; the pool cannot choose another.
+    #[cfg(test)]
     pub(crate) async fn acquire(
         &self,
         app: &crate::actor::AppHandle,
@@ -1482,9 +1489,30 @@ impl VmPool {
             .await
     }
 
+    /// `acquire_with` on the committed catalog as it is now.
+    #[cfg(test)]
     async fn acquire_inner(
         &self,
         app: &crate::actor::AppHandle,
+        application: &ApplicationId,
+        deployment: &Name,
+        handler: &Name,
+        pinned_service: bool,
+    ) -> Result<VmLease> {
+        let snapshot = Arc::new(self.store.read(application).await?);
+        self.acquire_with(app, &snapshot, application, deployment, handler, pinned_service)
+            .await
+    }
+
+    /// A lease in the catalog revision the caller resolved its target from,
+    /// so the check and the launch never read the bucket. Only an active
+    /// deployment of that revision is admitted, or with `pinned_service` the
+    /// deployment the calling service chose. Work that reached a replaced
+    /// deployment finishes there; its VMs retire once idle.
+    pub(crate) async fn acquire_with(
+        &self,
+        app: &crate::actor::AppHandle,
+        snapshot: &Arc<Snapshot>,
         application: &ApplicationId,
         deployment: &Name,
         handler: &Name,
@@ -1495,35 +1523,20 @@ impl VmPool {
             self.templates.ready(),
             "application startup caches are not ready"
         );
-        let snapshot = self.store.read(application).await?;
         let current = snapshot
             .application(application)
             .context("application does not exist")?;
-        if !pinned_service && current.active.as_ref().map(|active| &active.id) != Some(deployment) {
-            return Err(DeploymentRetiring.into());
-        }
-        let limits = current.limits;
-        let size_class = limits.map_or(ApplicationSizeClass::default(), |limits| limits.size_class);
+        ensure!(
+            pinned_service || current.active.as_ref().map(|active| &active.id) == Some(deployment),
+            "deployment is not active"
+        );
+        let size_class = current
+            .limits
+            .map_or(ApplicationSizeClass::default(), |limits| limits.size_class);
         let memory = u64::from(size_class.resources().1);
         let key: VmKey = (application.clone(), deployment.clone(), handler.clone());
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if !pinned_service {
-                let latest = self.store.read(application).await?;
-                let current = latest
-                    .application(application)
-                    .context("application does not exist")?;
-                if current.active.as_ref().map(|active| &active.id) != Some(deployment) {
-                    return Err(DeploymentRetiring.into());
-                }
-                ensure!(
-                    current
-                        .limits
-                        .map_or(ApplicationSizeClass::default(), |limits| limits.size_class)
-                        == size_class,
-                    "application size changed during admission; retry"
-                );
-            }
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -1531,13 +1544,6 @@ impl VmPool {
             let waiting = {
                 let mut state = self.state.lock().expect("VM pool poisoned");
                 ensure!(!state.closed, "application VM pool is shut down");
-                if !pinned_service
-                    && state
-                        .retiring
-                        .contains(&(application.clone(), deployment.clone()))
-                {
-                    return Err(DeploymentRetiring.into());
-                }
                 match state.slots.get_mut(&key) {
                     // A condemned VM leases nothing more; the sweep retires it
                     // once idle and the key then launches a fresh one.
@@ -1583,7 +1589,7 @@ impl VmPool {
                                 key.clone(),
                                 publish,
                                 self.service_routes.get().cloned().unwrap_or_default(),
-                                pinned_service,
+                                snapshot.clone(),
                                 size_class,
                             ));
                             Some(startup)
@@ -1671,44 +1677,38 @@ impl VmPool {
         key: VmKey,
         publish: tokio::sync::watch::Sender<Option<Result<VmClient, String>>>,
         service_routes: std::sync::Weak<Routes>,
-        pinned_service: bool,
+        snapshot: Arc<Snapshot>,
         size_class: ApplicationSizeClass,
     ) {
         let memory = u64::from(size_class.resources().1);
         let began = Instant::now();
         let (mut checked, mut launched_at) = (Duration::ZERO, Duration::ZERO);
         let launched = async {
-            let manifest = store
-                .deployment(&key.0, &key.1)
-                .await?
-                .context("deployment is not staged")?;
+            let current = snapshot
+                .application(&key.0)
+                .context("application does not exist")?;
+            // The catalog record embeds the active manifest; only a pinned
+            // service call into a replaced deployment reads its own.
+            let manifest = match &current.active {
+                Some(active) if active.id == key.1 => active.clone(),
+                _ => store
+                    .deployment(&key.0, &key.1)
+                    .await?
+                    .context("deployment is not staged")?,
+            };
             let handler = manifest
                 .handlers
                 .iter()
                 .find(|handler| handler.id == key.2)
                 .context("handler is not in staged deployment")?;
             let mut options = config.options(&handler.runtime_image_sha256, templates.clone())?;
-            let catalog = store.read(&key.0).await?;
-            let current = catalog
-                .application(&key.0)
-                .context("application does not exist")?;
-            if !pinned_service && current.active.as_ref().map(|active| &active.id) != Some(&key.1) {
-                return Err(DeploymentRetiring.into());
-            }
-            let actual = current
-                .limits
-                .map_or(ApplicationSizeClass::default(), |limits| limits.size_class);
-            ensure!(
-                actual == size_class,
-                "application size changed during admission; retry"
-            );
             (options.vcpus, options.memory_mib, options.cpu_quota) = size_class.resources();
             // A Python handler uses only the startup-prepared shared drive.
             if crate::application_pyodide::needs_runtime(handler)? {
                 options.shared = Some(templates.pyodide(&options, &app).await?);
             }
             checked = began.elapsed();
-            let vm = Vm::launch(options, &store, &key.0, &key.1, &key.2).await?;
+            let vm = Vm::launch_with(options, &store, current, manifest, &key.2).await?;
             launched_at = began.elapsed();
             let leases = Arc::new(());
             let client = vm.client();
@@ -1782,21 +1782,9 @@ impl VmPool {
             let mut state = state.lock().expect("VM pool poisoned");
             state.snapshot.starting -= 1;
             state.snapshot.ready += 1;
-            // Only a trusted source-binding acquisition may publish a cold
-            // callee in an old deployment, while that source's lease/event is
-            // still alive. Public acquisition remains refused by acquire().
-            let live_source = state
-                .slots
-                .iter()
-                .any(|((application, deployment, _), slot)| {
-                    application == &key.0
-                        && deployment == &key.1
-                        && matches!(slot, Slot::Ready(ready) if !ready.idle())
-                });
-            if state.closed
-                || (state.retiring.contains(&(key.0.clone(), key.1.clone()))
-                    && !(pinned_service && live_source))
-            {
+            // A VM of a replaced deployment still serves the work that
+            // reached it; the sweep retires it once idle.
+            if state.closed {
                 retire.cancel();
             }
             state.slots.insert(
@@ -1922,7 +1910,30 @@ impl VmPool {
     }
 }
 
-const RECONCILE_PERIOD: Duration = Duration::from_secs(1);
+/// How often a node looks at the catalog epoch (`CELLD_APPLICATION_POLL_S`).
+const RECONCILE_PERIOD: Duration = Duration::from_secs(5);
+
+/// A served application unused this long leaves the cache
+/// (`CELLD_APPLICATION_IDLE_S`); its next request reads it cold.
+const APPLICATION_IDLE: Duration = Duration::from_secs(120);
+
+/// How often a node sweeps the catalog's metadata listing for commits the epoch
+/// log lost, and tells the cron arm what it found (`CELLD_SYNC_SWEEP_S`).
+const SYNC_SWEEP: Duration = Duration::from_secs(300);
+
+/// How long the cron arm waits before scanning again what it could not arm.
+const CRON_RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(60)
+};
+
+fn seconds_or(name: &str, default: Duration) -> Duration {
+    Duration::from_secs(
+        crate::env_vars::positive_or(name, default.as_secs())
+            .unwrap_or_else(|_| panic!("validated {name}")),
+    )
+}
 
 /// The guest harness's reserved entrypoint for a scheduled event. A leading `.`
 /// cannot start a JavaScript class name, so no export collides with it.
@@ -2137,6 +2148,8 @@ pub(crate) mod tests;
 pub(crate) struct ScopeMetadata {
     pub scope: String,
     pub address: ResourceAddress,
+    /// The revision this was derived from; dispatch leases in it.
+    pub snapshot: Arc<Snapshot>,
     pub compat: crate::js::Compat,
     pub queue: Option<Arc<QueueEntry>>,
     pub cron: Option<Arc<CronEntry>>,
@@ -2148,28 +2161,84 @@ pub(crate) struct ScopeMetadata {
 
 const METADATA_CACHE_ENTRIES: usize = 256;
 const METADATA_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// An asset index can list 20,000 files, so indexes get their own budget.
+const ASSET_INDEX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Default)]
-struct ScopeCache {
-    entries: HashMap<String, (Instant, usize, Arc<ScopeMetadata>)>,
+/// Bounded in entries and bytes; the least recently used entry goes first.
+struct BoundedCache<K, V> {
+    entries: HashMap<K, (Instant, usize, V)>,
     bytes: usize,
     max_entries: usize,
     max_bytes: usize,
 }
 
-impl ScopeCache {
-    fn get(&mut self, scope: &str) -> Option<Arc<ScopeMetadata>> {
-        self.entries
-            .retain(|_, (at, _, _)| at.elapsed() < RECONCILE_PERIOD);
-        self.bytes = self.entries.values().map(|(_, size, _)| size).sum();
-        self.entries.get(scope).map(|(_, _, value)| value.clone())
+impl<K: Eq + std::hash::Hash + Clone, V: Clone> BoundedCache<K, V> {
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            bytes: 0,
+            max_entries,
+            max_bytes,
+        }
     }
 
-    fn insert(&mut self, scope: String, size: usize, value: Arc<ScopeMetadata>) {
+    fn get<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        let (used, _, value) = self.entries.get_mut(key)?;
+        *used = Instant::now();
+        Some(value.clone())
+    }
+
+    /// Without marking the entry used.
+    fn peek(&self, key: &K) -> Option<V> {
+        self.entries.get(key).map(|(_, _, value)| value.clone())
+    }
+
+    fn used(&self, key: &K) -> Option<Instant> {
+        self.entries.get(key).map(|(used, _, _)| *used)
+    }
+
+    fn touch(&mut self, key: &K) {
+        if let Some((used, _, _)) = self.entries.get_mut(key) {
+            *used = Instant::now();
+        }
+    }
+
+    /// Removes every entry not used for `idle`, returning the keys.
+    fn evict_idle(&mut self, idle: Duration) -> Vec<K> {
+        let now = Instant::now();
+        let stale: Vec<K> = self
+            .entries
+            .iter()
+            .filter(|(_, (used, _, _))| now.duration_since(*used) >= idle)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &stale {
+            if let Some((_, size, _)) = self.entries.remove(key) {
+                self.bytes -= size;
+            }
+        }
+        stale
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
+        self.entries.retain(|key, (_, _, value)| keep(key, value));
+        self.bytes = self.entries.values().map(|(_, size, _)| size).sum();
+    }
+
+    // ponytail: O(n) scan per eviction; fine at the configured <= 4096 entries.
+    fn insert(&mut self, key: K, size: usize, value: V) {
+        self.insert_at(key, size, value, Instant::now());
+    }
+
+    fn insert_at(&mut self, key: K, size: usize, value: V, used: Instant) {
         if size > self.max_bytes {
             return;
         }
-        if let Some((_, size, _)) = self.entries.remove(&scope) {
+        if let Some((_, size, _)) = self.entries.remove(&key) {
             self.bytes -= size;
         }
         while self.entries.len() >= self.max_entries || self.bytes + size > self.max_bytes {
@@ -2188,22 +2257,261 @@ impl ScopeCache {
             self.bytes -= size;
         }
         self.bytes += size;
-        self.entries.insert(scope, (Instant::now(), size, value));
+        self.entries.insert(key, (used, size, value));
     }
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().expect("application route cache poisoned")
+}
+
+/// A committed route and the application revision it was resolved from: the
+/// asset check and the Worker of one request both use this one revision.
+pub struct Route {
+    pub target: RouteTarget,
+    snapshot: Arc<Snapshot>,
+}
+
+/// Application, deployment and handler (`None`: the asset-only route).
+type AssetKey = (ApplicationId, Name, Option<Name>);
+
+/// What a catalog change touched, so the cron arm re-arms only that.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Changed {
+    All,
+    Apps(BTreeSet<ApplicationId>),
+}
+
+impl Changed {
+    /// `All` absorbs; two sets of applications union.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Apps(mut mine), Self::Apps(theirs)) => {
+                mine.extend(theirs);
+                Self::Apps(mine)
+            }
+            _ => Self::All,
+        }
+    }
+}
+
+/// Holds only what this node serves. Application revisions are read through
+/// on first use and validated by `reconcile`, never re-read per request; the
+/// route and cell indexes and asset indexes are immutable, so only their
+/// bounds evict them.
 pub(crate) struct Routes {
     store: Arc<ApplicationStore>,
     pool: Option<VmPool>,
     domain: String,
-    scopes: Mutex<ScopeCache>,
+    apps: Mutex<BoundedCache<ApplicationId, Arc<Snapshot>>>,
+    /// Cold reads in flight: concurrent misses of one application share one.
+    cold: SingleFlight<ApplicationId, Arc<Snapshot>>,
+    route_locators: Mutex<BoundedCache<RouteId, RouteLocator>>,
+    cell_locators: Mutex<BoundedCache<String, CellLocator>>,
+    scopes: Mutex<BoundedCache<String, Arc<ScopeMetadata>>>,
+    /// Keyed by deployment, whose manifest never changes.
+    assets: Mutex<BoundedCache<AssetKey, Option<crate::assets::AssetResolver>>>,
+    /// Fired when this node learns the catalog changed, so the cron arm
+    /// rescans on that edge instead of on a timer.
+    catalog_changed: tokio::sync::Notify,
+    /// What changed since the cron arm last took it.
+    catalog_pending: Mutex<Option<Changed>>,
+    /// Where this node learns the catalog epoch (the bucket, or upstream
+    /// nodes), and what it tells the nodes reading from it. The node's one, which
+    /// `main` also feeds the deploy pointer.
+    sync: Arc<CatalogSync>,
 }
 
 impl Routes {
+    fn new(
+        store: Arc<ApplicationStore>,
+        pool: Option<VmPool>,
+        domain: String,
+        entries: usize,
+        bytes: usize,
+        sync: Arc<CatalogSync>,
+    ) -> Self {
+        Self {
+            store,
+            pool,
+            domain,
+            apps: Mutex::new(BoundedCache::new(entries, bytes)),
+            cold: SingleFlight::default(),
+            route_locators: Mutex::new(BoundedCache::new(entries, bytes)),
+            cell_locators: Mutex::new(BoundedCache::new(entries, bytes)),
+            scopes: Mutex::new(BoundedCache::new(entries, bytes)),
+            assets: Mutex::new(BoundedCache::new(entries, ASSET_INDEX_CACHE_BYTES)),
+            catalog_changed: tokio::sync::Notify::new(),
+            catalog_pending: Mutex::new(None),
+            sync,
+        }
+    }
+
     fn pool(&self) -> Result<&VmPool> {
         self.pool
             .as_ref()
             .context("application VM execution is not configured on this node")
+    }
+
+    fn signal_catalog_changed(&self, changed: Changed) {
+        // A relayed node arms no crons, so nothing would take what piles up.
+        if self.sync.relayed() {
+            return;
+        }
+        let mut pending = lock(&self.catalog_pending);
+        *pending = Some(match pending.take() {
+            Some(earlier) => earlier.merge(changed),
+            None => changed,
+        });
+        self.catalog_changed.notify_one();
+    }
+
+    /// The revision of `id` this node serves, read through on a miss. Concurrent
+    /// misses of one application share one read.
+    async fn app(&self, id: &ApplicationId) -> Result<Arc<Snapshot>> {
+        if let Some(found) = lock(&self.apps).get(id) {
+            return Ok(found);
+        }
+        self.cold.run(id.clone(), || self.refresh(id, true)).await
+    }
+
+    /// Reads `id` again and serves that revision from now on, telling the cron
+    /// arm when it changed. `cold`: a first read for a request, which this
+    /// node's disk copy may answer; otherwise the node knows its view is behind
+    /// and only the bucket will do.
+    async fn refresh(&self, id: &ApplicationId, cold: bool) -> Result<Arc<Snapshot>> {
+        let (snapshot, changed) = self.reread(id, cold).await?;
+        if changed {
+            self.signal_catalog_changed(Changed::Apps(BTreeSet::from([id.clone()])));
+        }
+        Ok(snapshot)
+    }
+
+    /// `refresh` without the signal, and whether the revision changed, so a
+    /// pass tells the cron arm everything it found at once.
+    async fn reread(&self, id: &ApplicationId, cold: bool) -> Result<(Arc<Snapshot>, bool)> {
+        let (previous, used) = {
+            let apps = lock(&self.apps);
+            (apps.peek(id), apps.used(id))
+        };
+        let mut disk = cold;
+        let snapshot = loop {
+            // A commit the log named by now is in what this read returns.
+            let before = self.sync.position();
+            let from_disk = disk;
+            let read = if disk {
+                self.store.read(id).await
+            } else {
+                self.store.read_fresh(id).await
+            };
+            // A repeat follows a commit the disk copy may predate.
+            disk = false;
+            let snapshot = Arc::new(read?);
+            let size = snapshot
+                .application(id)
+                .map(|app| serde_json::to_vec(app).map(|body| body.len()))
+                .transpose()?
+                .unwrap_or(0)
+                + 1024;
+            // A re-read by reconcile is not a use, so it keeps the entry's age.
+            lock(&self.apps).insert_at(
+                id.clone(),
+                size,
+                snapshot.clone(),
+                used.unwrap_or_else(Instant::now),
+            );
+            // A poll that followed the log while this read was in flight
+            // skipped `id`, not cached yet, and the log never names that
+            // commit again: read once more if it named one this may predate.
+            // From now on `id` is cached, so later polls see it themselves. A
+            // disk copy is also checked against the log as a whole: the poll
+            // drops the copies the log names, and this read can beat it.
+            let stale = self.sync.changed_since(&before, id, snapshot.revision())
+                || (from_disk && self.sync.names_other(id, snapshot.revision()));
+            if !stale {
+                break snapshot;
+            }
+        };
+        // A first read is not a change: the boot scan covers what exists.
+        let changed = previous.is_some_and(|previous| previous.revision() != snapshot.revision());
+        // Before any signal, so the cron arm woken by it reads this revision.
+        lock(&self.scopes).retain(|_, metadata| &metadata.address.application != id);
+        Ok((snapshot, changed))
+    }
+
+    async fn route(&self, id: &RouteId) -> Result<Option<Route>> {
+        let cached = lock(&self.route_locators).get(id);
+        let locator = match cached {
+            Some(locator) => locator,
+            None => {
+                let Some(locator) = self.store.route_locator(id).await? else {
+                    return Ok(None);
+                };
+                lock(&self.route_locators).insert(id.clone(), 1024, locator.clone());
+                locator
+            }
+        };
+        let snapshot = self.app(&locator.application).await?;
+        Ok(snapshot
+            .route(&locator, id)
+            .map(|target| Route { target, snapshot }))
+    }
+
+    /// The static assets of `handler` (or the asset-only route when `None`)
+    /// in `deployment`, which need not be the active one: a guest's binding
+    /// call finishes on the deployment its VM pins.
+    async fn assets(
+        &self,
+        snapshot: &Snapshot,
+        application: &ApplicationId,
+        deployment: &Name,
+        handler: Option<&Name>,
+    ) -> Result<Option<crate::assets::AssetResolver>> {
+        let key = (application.clone(), deployment.clone(), handler.cloned());
+        if let Some(found) = lock(&self.assets).get(&key) {
+            return Ok(found);
+        }
+        // The catalog record embeds the active manifest.
+        let manifest = match snapshot.application(application).and_then(|app| app.active.as_ref()) {
+            Some(active) if &active.id == deployment => active.clone(),
+            _ => self
+                .store
+                .deployment(application, deployment)
+                .await?
+                .context("deployment is not staged")?,
+        };
+        let resolver = match handler {
+            Some(handler) => {
+                let declared = manifest
+                    .handlers
+                    .iter()
+                    .find(|candidate| &candidate.id == handler)
+                    .context("deployment has no such handler")?;
+                match crate::application_javascript_guest::asset_binding(declared)? {
+                    Some((alias, reference)) => Some(
+                        self.store
+                            .asset_resolver(application, &reference, Some(&alias))
+                            .await?,
+                    ),
+                    None => None,
+                }
+            }
+            None => Some(
+                self.store
+                    .asset_resolver(
+                        application,
+                        manifest.assets.as_ref().context("asset route has no assets")?,
+                        None,
+                    )
+                    .await?,
+            ),
+        };
+        let size = resolver
+            .as_ref()
+            .map_or(0, crate::assets::AssetResolver::index_bytes)
+            + 1024;
+        lock(&self.assets).insert(key, size, resolver.clone());
+        Ok(resolver)
     }
 
     pub(crate) async fn asset_resolver(
@@ -2212,25 +2520,9 @@ impl Routes {
         deployment: &Name,
         handler: &Name,
     ) -> Result<Option<crate::assets::AssetResolver>> {
-        let manifest = self
-            .store
-            .deployment(application, deployment)
-            .await?
-            .context("deployment is not staged")?;
-        let declared = manifest
-            .handlers
-            .iter()
-            .find(|candidate| &candidate.id == handler)
-            .context("deployment has no such handler")?;
-        let resolver = match crate::application_javascript_guest::asset_binding(declared)? {
-            Some((alias, reference)) => Some(
-                self.store
-                    .asset_resolver(application, &reference, Some(&alias))
-                    .await?,
-            ),
-            None => None,
-        };
-        Ok(resolver)
+        let snapshot = self.app(application).await?;
+        self.assets(&snapshot, application, deployment, Some(handler))
+            .await
     }
 
     /// The source transport has resolved its immutable binding. Keep the
@@ -2251,104 +2543,352 @@ impl Routes {
         Box<dyn std::future::Future<Output = Result<crate::js::HttpResponse>> + Send + 'a>,
     > {
         Box::pin(async move {
-            // Only a live source event's broker can take this route. New HTTP
-            // ingress still uses acquire(), which refuses retiring deployments.
+            // Only a live source event's broker can take this route, so the
+            // deployment need not be the active one.
+            let snapshot = self.app(application).await?;
             let lease = self
                 .pool()?
-                .acquire_inner(app, application, deployment, handler, true)
+                .acquire_with(app, &snapshot, application, deployment, handler, true)
                 .await?;
             lease
                 .invoke_service(app, request, service, body, relay)
                 .await
         })
     }
-    async fn reconcile(&self) -> Result<()> {
-        if self.pool.is_none() {
+    /// One poll period: drop applications idle past `idle`, then read the
+    /// catalog epoch. While its log continues where the last look ended, only
+    /// the applications it names are re-checked, against the revisions it
+    /// records. Otherwise (the first look after this node went idle, which a
+    /// commit may have preceded; another or unreadable or trimmed log; or this
+    /// node's own commit) `reconcile` re-checks every application. A commit
+    /// the log lost is not seen here until the catalog sweep appends it. A node
+    /// serving nothing makes no request, unless a node reads from it. A
+    /// relayed node takes the epoch from its upstreams' view instead of the
+    /// bucket, and does nothing until the first one arrives. The disk tier's
+    /// metadata is dropped for each application the log names, and wiped
+    /// whenever the node cannot follow the log, idle included.
+    async fn poll_epoch(&self, watch: &mut EpochWatch, idle: Duration) -> Result<()> {
+        let forced = std::mem::take(&mut watch.forced);
+        let evicted = lock(&self.apps).evict_idle(idle);
+        if !evicted.is_empty() {
+            lock(&self.scopes).retain(|_, metadata| !evicted.contains(&metadata.address.application));
+        }
+        let resident = self
+            .pool
+            .as_ref()
+            .is_some_and(|pool| !pool.state.lock().expect("VM pool poisoned").slots.is_empty());
+        if lock(&self.apps).entries.is_empty() && !resident && !self.sync.listening() {
+            // Not following the log from here on, so a disk copy could go stale unseen.
+            if let Some(objects) = self.store.objects() {
+                objects.distrust().await;
+            }
+            *watch = EpochWatch::default();
+            self.sync.mark_processed(None);
+            if forced {
+                self.signal_catalog_changed(Changed::All);
+            }
             return Ok(());
         }
-        *self.scopes.lock().expect("scope cache poisoned") = ScopeCache {
-            max_entries: self
-                .pool()?
-                .config
-                .metadata_cache_entries
-                .unwrap_or(METADATA_CACHE_ENTRIES),
-            max_bytes: self
-                .pool()?
-                .config
-                .metadata_cache_bytes
-                .unwrap_or(METADATA_CACHE_BYTES),
-            ..Default::default()
+        // Read before the pass: a commit landing during it moves the epoch again.
+        let epoch = if self.sync.relayed() {
+            let Some(epoch) = self.sync.epoch() else {
+                watch.forced = forced;
+                return Ok(());
+            };
+            epoch
+        } else {
+            self.sync.read_bucket(&self.store).await?
         };
-        let residents: BTreeSet<_> = self
-            .pool()?
-            .state
-            .lock()
-            .expect("VM pool poisoned")
-            .slots
-            .keys()
-            .map(|(app, deployment, _)| (app.clone(), deployment.clone()))
+        let position = epoch.as_ref().map(|epoch| (epoch.log.clone(), epoch.seq));
+        // What the log recorded since the last look; `None` when it cannot say.
+        let since: Option<&[EpochChange]> = match (&watch.seen, &epoch) {
+            (Some(Some((log, seq))), Some(epoch)) => epoch.since(log, *seq),
+            (Some(None), None) => Some(&[]),
+            _ => None,
+        };
+        // Oldest first, so the newest revision of an application wins.
+        let newest: BTreeMap<_, _> = since
+            .unwrap_or_default()
+            .iter()
+            .map(|change| (change.application.clone(), change.revision.clone()))
             .collect();
-        let applications: BTreeSet<_> = residents.iter().map(|(app, _)| app.clone()).collect();
-        for application in applications {
-            let snapshot = self.store.read(&application).await?;
-            let active = snapshot
-                .application(&application)
-                .and_then(|app| app.active.as_ref())
-                .map(|deployment| &deployment.id);
-            for (_, deployment) in residents.iter().filter(|(app, _)| app == &application) {
-                if active == Some(deployment) {
-                    self.pool()?.readmit_deployment(&application, deployment);
-                } else {
-                    self.pool()?
-                        .retire_deployment(&application, deployment)
-                        .await;
+        let full = since.is_none() || forced;
+        // The disk metadata of an application the log names is outdated, served
+        // by this node or not. A pass that checks everything starts from an
+        // empty tier: a log this node cannot follow may hide any change.
+        // ponytail: a discontinuity wipes the tier; validating it against one
+        // `metadata_tokens` LIST instead would keep it warm across restarts.
+        let objects = self.store.objects();
+        if let Some(objects) = objects {
+            if full {
+                objects.distrust().await;
+            } else {
+                for application in newest.keys() {
+                    objects.forget(application).await;
+                }
+            }
+        }
+        let mut changed = if full {
+            self.reconcile_with(None).await?
+        } else if newest.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.reconcile_with(Some(&newest)).await?
+        };
+        if let Some(objects) = objects.filter(|_| full) {
+            // Everything it stored since was read after the epoch above.
+            objects.trust();
+        }
+        // The log also names applications this node does not serve: the cron
+        // arm arms theirs. One it cannot follow, after a first look, may hide
+        // any change at all.
+        changed.extend(newest.into_keys());
+        if since.is_none() && watch.seen.is_some() {
+            self.signal_catalog_changed(Changed::All);
+        } else if !changed.is_empty() {
+            self.signal_catalog_changed(Changed::Apps(changed));
+        }
+        // Children asking for objects are checked against this: the disk copies
+        // are current as of the log position the poll has acted on.
+        self.sync.mark_processed(position.clone());
+        watch.seen = Some(position);
+        Ok(())
+    }
+
+    /// A child's read of one catalog object on `/peer/object`: `key`, and `log`
+    /// and `seq` for where its view of the epoch stands. Metadata comes from
+    /// this node's disk copy only if the poll has acted on the log at least that
+    /// far, so the copy cannot predate what the child already knows; otherwise
+    /// it is read through, from this node's upstream or the bucket. The rest is
+    /// streamed from the tier, so hundreds of children asking for one artifact
+    /// at once do not each hold it in memory.
+    async fn answer_object(&self, query: Option<&str>, draining: bool) -> axum::response::Response {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        if draining {
+            return (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response();
+        }
+        let (mut key, mut log, mut seq) = (None, None, None);
+        for (name, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+            match &*name {
+                "key" => key = Some(value.into_owned()),
+                "log" => log = Some(value.into_owned()),
+                "seq" => seq = value.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        let kind = key.as_deref().and_then(object_kind);
+        let (Some(key), Some(kind)) = (key, kind) else {
+            return (StatusCode::FORBIDDEN, "not a served object").into_response();
+        };
+        let disk = matches!(
+            (&log, seq),
+            (Some(log), Some(seq)) if self.sync.has_processed(log, seq)
+        );
+        match self.store.serve_object(&key, kind, disk).await {
+            Ok(Some((object, token))) => {
+                let (body, length) = match object {
+                    Object::File(file, length) => (
+                        axum::body::Body::from_stream(ReaderStream::new(file)),
+                        length,
+                    ),
+                    Object::Bytes(bytes) => {
+                        let length = bytes.len() as u64;
+                        (axum::body::Body::from(bytes), length)
+                    }
+                };
+                let mut response =
+                    axum::response::Response::builder().header("content-length", length);
+                if let Some(token) = token {
+                    response = response.header(crate::object_cache::TOKEN_HEADER, token);
+                }
+                response
+                    .body(body)
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+            }
+            Ok(None) => (StatusCode::NOT_FOUND, "no such object").into_response(),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "object not read for a child");
+                (StatusCode::BAD_GATEWAY, "object not read").into_response()
+            }
+        }
+    }
+
+    /// One catalog sweep. The first takes the baseline, silently: the boot scan
+    /// covers what exists. Each later one has the store append to the epoch
+    /// log what it lost, and tells the cron arm which applications changed,
+    /// whether or not this node serves them.
+    async fn sweep_catalog(
+        &self,
+        previous: &mut Option<BTreeMap<ApplicationId, String>>,
+    ) -> Result<()> {
+        match previous {
+            None => *previous = Some(self.store.metadata_tokens().await?),
+            Some(known) => {
+                let (tokens, changed) = self.store.sweep(known).await?;
+                *known = tokens;
+                if !changed.is_empty() {
+                    self.signal_catalog_changed(Changed::Apps(changed));
                 }
             }
         }
         Ok(())
     }
 
+    /// One HEAD per served application: an unchanged revision downloads
+    /// nothing; a changed one is read and served from now on. Then deployments
+    /// that are no longer active retire their VMs once idle.
+    #[cfg(test)]
+    async fn reconcile(&self) -> Result<()> {
+        let changed = self.reconcile_with(None).await?;
+        if !changed.is_empty() {
+            self.signal_catalog_changed(Changed::Apps(changed));
+        }
+        Ok(())
+    }
+
+    /// `reconcile` without the signal, or with `known` only the applications
+    /// it names, compared against the revision it gives instead of a HEAD. An
+    /// application this node neither caches nor hosts VMs for is not read
+    /// either way. Returns the applications whose revision changed.
+    async fn reconcile_with(
+        &self,
+        known: Option<&BTreeMap<ApplicationId, String>>,
+    ) -> Result<BTreeSet<ApplicationId>> {
+        use futures_util::StreamExt;
+        let residents: BTreeSet<_> = self.pool.as_ref().map_or_else(BTreeSet::new, |pool| {
+            pool.state
+                .lock()
+                .expect("VM pool poisoned")
+                .slots
+                .keys()
+                .map(|(app, deployment, _)| (app.clone(), deployment.clone()))
+                .collect()
+        });
+        let mut applications: BTreeSet<_> = lock(&self.apps).entries.keys().cloned().collect();
+        applications.extend(residents.iter().map(|(app, _)| app.clone()));
+        if let Some(known) = known {
+            applications.retain(|application| known.contains_key(application));
+        }
+        let snapshots: Vec<_> = futures_util::stream::iter(applications)
+            .map(|application| async move {
+                let cached = lock(&self.apps).peek(&application);
+                let revision = match known {
+                    Some(known) => known.get(&application).cloned(),
+                    None => self.store.revision_of(&application).await?,
+                };
+                let (snapshot, changed) = match cached {
+                    Some(cached) if cached.revision() == revision.as_deref() => (cached, false),
+                    _ => self.reread(&application, false).await?,
+                };
+                anyhow::Ok((application, snapshot, changed))
+            })
+            .buffer_unordered(16)
+            .filter_map(|read| async {
+                // One unreadable application must not stall retirement node-wide.
+                read.inspect_err(|error| tracing::warn!(event = "reconcile_read_failed", %error))
+                    .ok()
+            })
+            .collect()
+            .await;
+        let changed = snapshots
+            .iter()
+            .filter(|(_, _, changed)| *changed)
+            .map(|(application, _, _)| application.clone())
+            .collect();
+        let Some(pool) = &self.pool else {
+            return Ok(changed);
+        };
+        for (application, snapshot, _) in snapshots {
+            let active = snapshot
+                .application(&application)
+                .and_then(|app| app.active.as_ref())
+                .map(|deployment| &deployment.id);
+            for (_, deployment) in residents.iter().filter(|(app, _)| app == &application) {
+                if active == Some(deployment) {
+                    pool.readmit_deployment(&application, deployment);
+                } else {
+                    pool.retire_deployment(&application, deployment).await;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
     async fn scope(&self, scope: &str) -> Result<Option<Arc<ScopeMetadata>>> {
-        if let Some(found) = self.scopes.lock().expect("scope cache poisoned").get(scope) {
+        let hit = lock(&self.scopes).get(scope);
+        if let Some(found) = hit {
+            // Serving from the scope cache is a use of its application.
+            lock(&self.apps).touch(&found.address.application);
             return Ok(Some(found));
         }
-        let owner = self.store.cell_owner(scope).await?;
-        let bytes = owner
-            .as_ref()
-            .map(|owner| serde_json::to_vec(&owner.application).map(|body| body.len()))
-            .transpose()?
-            .unwrap_or(0)
-            + 2 * scope.len()
-            + 1024;
-        let value = owner.map(|owner| {
-            let application = owner.application;
-            let deployments = application
-                .active
-                .clone()
-                .map(|deployment| HashMap::from([(application.id.clone(), deployment)]))
-                .unwrap_or_default();
-            let compat = storage_handler(&deployments, scope)
-                .map(|handler| crate::worker_compat(&handler.worker_config))
-                .unwrap_or_default();
-            Arc::new(ScopeMetadata {
-                scope: scope.to_owned(),
-                address: owner.locator.address,
-                compat,
-                queue: queue_catalog(std::iter::once(&application)).remove(scope),
-                cron: cron_catalog(std::iter::once(&application)).remove(scope),
-                object: alarm_target(&deployments, scope),
-            })
-        });
-        // An absent read can race another node's first cell-index publication.
-        if let Some(metadata) = &value {
-            self.scopes.lock().expect("scope cache poisoned").insert(
-                scope.to_owned(),
-                bytes,
-                metadata.clone(),
-            );
-        }
-        Ok(value)
+        let cached = lock(&self.cell_locators).get(scope);
+        let locator = match cached {
+            Some(locator) => locator,
+            None => {
+                // An absent read can race another node's first cell-index
+                // publication, so it is not cached.
+                let Some(locator) = self.store.cell_locator(scope).await? else {
+                    return Ok(None);
+                };
+                lock(&self.cell_locators).insert(scope.to_owned(), 1024, locator.clone());
+                locator
+            }
+        };
+        let application = locator.address.application.clone();
+        let snapshot = self.app(&application).await?;
+        let (snapshot, owner) = match snapshot.cell_owner(locator.clone()) {
+            // The resource may be newer than the served revision.
+            Err(error) if error.is::<crate::applications::UncommittedCellIndex>() => {
+                let fresh = self.refresh(&application, false).await?;
+                let owner = fresh.cell_owner(locator)?;
+                (fresh, owner)
+            }
+            owner => (snapshot, owner?),
+        };
+        Ok(Some(self.cache_scope(scope, owner.locator.address, snapshot)?))
     }
+
+    fn cache_scope(
+        &self,
+        scope: &str,
+        address: ResourceAddress,
+        snapshot: Arc<Snapshot>,
+    ) -> Result<Arc<ScopeMetadata>> {
+        let application = snapshot
+            .application(&address.application)
+            .context("application does not exist")?;
+        let bytes = serde_json::to_vec(application)?.len() + 2 * scope.len() + 1024;
+        let deployments = application
+            .active
+            .clone()
+            .map(|deployment| HashMap::from([(application.id.clone(), deployment)]))
+            .unwrap_or_default();
+        let compat = storage_handler(&deployments, scope)
+            .map(|handler| crate::worker_compat(&handler.worker_config))
+            .unwrap_or_default();
+        let metadata = Arc::new(ScopeMetadata {
+            scope: scope.to_owned(),
+            address,
+            compat,
+            queue: queue_catalog(std::iter::once(application)).remove(scope),
+            cron: cron_catalog(std::iter::once(application)).remove(scope),
+            object: alarm_target(&deployments, scope),
+            snapshot: snapshot.clone(),
+        });
+        lock(&self.scopes).insert(scope.to_owned(), bytes, metadata.clone());
+        Ok(metadata)
+    }
+}
+
+/// What the poll loop remembers between periods.
+#[derive(Default)]
+struct EpochWatch {
+    /// The log id and sequence last reconciled against (`Some(None)`: no
+    /// readable log yet); `None` until the first look after boot or idleness.
+    seen: Option<Option<(String, u64)>>,
+    /// This node's own store committed: reconcile now and signal the change.
+    forced: bool,
 }
 
 /// Routes HTTP requests to the pinned handlers of the committed catalog. The
@@ -2359,6 +2899,7 @@ pub struct RouteDispatcher {
     routes: Arc<Routes>,
     alarm_host: std::sync::OnceLock<crate::actor::AppHandle>,
     _reconciler: Option<AbortOnDropHandle<()>>,
+    _catalog_sweep: Option<AbortOnDropHandle<()>>,
 }
 
 impl RouteDispatcher {
@@ -2372,19 +2913,48 @@ impl RouteDispatcher {
         self.routes.scope(cell).await
     }
 
+    /// A VM's binding call: `address` is a resource its pin was built with,
+    /// so the pin, not the catalog, authorizes it. The immutable cell index is
+    /// published once per node, and the scope is answered from that locator
+    /// and the served revision, so the cell's own lookups read nothing.
     pub(crate) async fn register_cell(
         &self,
         address: &ResourceAddress,
         object: &celld_applications::invocation_wire::ObjectTarget,
     ) -> Result<()> {
-        self.routes.store.register_cell(address, object).await?;
-        // An absent lookup before registration must not survive the durable publication.
-        let mut cache = self.routes.scopes.lock().expect("scope cache poisoned");
-        let scope = format!("{}:{}", object.class, object.id);
-        if let Some((_, size, _)) = cache.entries.remove(&scope) {
-            cache.bytes -= size;
+        let locator = CellLocator::for_object(address, object)?;
+        let known = lock(&self.routes.cell_locators).get(&locator.scope);
+        if known.as_ref() != Some(&locator) {
+            // Another locator under this scope is an ImmutableConflict.
+            self.routes.store.publish_cell(&locator).await?;
+            lock(&self.routes.cell_locators).insert(locator.scope.clone(), 1024, locator.clone());
+        }
+        if lock(&self.routes.scopes).get(&locator.scope).is_none() {
+            let snapshot = self.routes.app(&address.application).await?;
+            self.routes
+                .cache_scope(&locator.scope, locator.address, snapshot)?;
         }
         Ok(())
+    }
+
+    /// Whether this node reads the catalog epoch from upstream nodes instead of
+    /// the bucket (`CELLD_SYNC_UPSTREAM`).
+    pub fn relayed(&self) -> bool {
+        self.routes.sync.relayed()
+    }
+
+    /// The catalog store, for the bucket read of a relayed node's follower.
+    pub fn store(&self) -> Arc<ApplicationStore> {
+        self.routes.store.clone()
+    }
+
+    /// A child's read on `/peer/object`; see `Routes::answer_object`.
+    pub async fn answer_object(
+        &self,
+        query: Option<&str>,
+        draining: bool,
+    ) -> axum::response::Response {
+        self.routes.answer_object(query, draining).await
     }
 
     /// The application cron the cell scope names, in the committed catalog.
@@ -2393,6 +2963,54 @@ impl RouteDispatcher {
             .prepare_scope(scope)
             .await?
             .and_then(|metadata| metadata.cron.clone()))
+    }
+
+    /// Resolves with what this node has seen change in the catalog since the
+    /// last resolution (a permit is kept, so an edge during a scan is not lost).
+    pub async fn catalog_changed(&self) -> Changed {
+        loop {
+            self.routes.catalog_changed.notified().await;
+            if let Some(changed) = lock(&self.routes.catalog_pending).take() {
+                return changed;
+            }
+        }
+    }
+
+    /// Edge-triggered cron arming, as upstream arms the Worker's cron: `scan`
+    /// runs once now for everything (the caller has established health), then
+    /// for what changed when this node learns the catalog did. A change nobody
+    /// told it about reaches it through the catalog sweep, so an idle node
+    /// reads nothing from the bucket for the scan. `scan` returns what it could
+    /// not arm, which is scanned again `CRON_RETRY` later unless a change comes
+    /// first.
+    pub async fn run_cron_scans<F, Fut>(&self, mut scan: F)
+    where
+        F: FnMut(Changed) -> Fut,
+        Fut: std::future::Future<Output = Option<Changed>>,
+    {
+        let mut failed = scan(Changed::All).await;
+        loop {
+            // ponytail: one fixed delay; per-cell backoff if many crons keep failing.
+            let changed = match failed.take() {
+                Some(failed) => match timeout(CRON_RETRY, self.catalog_changed()).await {
+                    Ok(changed) => changed.merge(failed),
+                    Err(_) => failed,
+                },
+                None => self.catalog_changed().await,
+            };
+            failed = scan(changed).await;
+        }
+    }
+
+    /// The cell scopes of `application`'s cron resources in the revision this
+    /// node serves, so the cron arm can arm one changed application without
+    /// listing the cron index. None once the application no longer exists.
+    pub async fn cron_scopes(&self, application: &ApplicationId) -> Result<Vec<String>> {
+        let snapshot = self.routes.app(application).await?;
+        Ok(snapshot
+            .application(application)
+            .map(|app| cron_catalog(std::iter::once(app)).into_keys().collect())
+            .unwrap_or_default())
     }
 
     /// Cron cells whose schedule is not yet armed on this node, as the first
@@ -2423,10 +3041,11 @@ impl RouteDispatcher {
         cron: &str,
         scheduled_ms: i64,
     ) -> Result<String> {
-        let entry = self
-            .cron_entry(scope)
+        let metadata = self
+            .prepare_scope(scope)
             .await?
             .context("not an application cron")?;
+        let entry = metadata.cron.as_ref().context("not an application cron")?;
         let schedule = entry
             .schedule
             .as_ref()
@@ -2439,11 +3058,13 @@ impl RouteDispatcher {
         let lease = self
             .routes
             .pool()?
-            .acquire(
+            .acquire_with(
                 app,
+                &metadata.snapshot,
                 &entry.application,
                 &schedule.deployment,
                 &schedule.handler,
+                false,
             )
             .await?;
         let response = lease
@@ -2477,14 +3098,6 @@ impl RouteDispatcher {
         String::from_utf8(response.body).context("guest scheduled result is not UTF-8")
     }
 
-    /// The application queue the cell scope names, in the active catalog.
-    pub(crate) async fn queue_entry(&self, scope: &str) -> Result<Option<Arc<QueueEntry>>> {
-        Ok(self
-            .prepare_scope(scope)
-            .await?
-            .and_then(|metadata| metadata.queue.clone()))
-    }
-
     /// Whether the scope is an application queue cell, not a legacy one.
     pub async fn owns_queue(&self, scope: &str) -> Result<bool> {
         Ok(self
@@ -2494,63 +3107,104 @@ impl RouteDispatcher {
     }
 
     /// Serves the committed catalog from its first request.
-    pub(crate) async fn new(config: VmHostConfig, store: Arc<ApplicationStore>) -> Result<Self> {
+    pub(crate) async fn new(
+        config: VmHostConfig,
+        store: Arc<ApplicationStore>,
+        sync: Arc<CatalogSync>,
+    ) -> Result<Self> {
         let fence = config.container_fence_image.clone();
         let domain = config.platform_domain.clone();
-        let scopes = ScopeCache {
-            max_entries: config
+        let (entries, bytes) = (
+            config
                 .metadata_cache_entries
                 .unwrap_or(METADATA_CACHE_ENTRIES),
-            max_bytes: config.metadata_cache_bytes.unwrap_or(METADATA_CACHE_BYTES),
-            ..Default::default()
-        };
-        let routes = Arc::new(Routes {
-            pool: Some(VmPool::new(config, store.clone())?),
-            store,
-            domain,
-            scopes: Mutex::new(scopes),
-        });
+            config.metadata_cache_bytes.unwrap_or(METADATA_CACHE_BYTES),
+        );
+        let pool = VmPool::new(config, store.clone())?;
+        let routes = Arc::new(Routes::new(store, Some(pool), domain, entries, bytes, sync));
         routes
             .pool()?
             .service_routes
             .set(Arc::downgrade(&routes))
             .expect("a fresh service router is unbound");
         crate::container::install_application_fence(fence);
-        routes.store.validate_format().await?;
+        Ok(Self::serve(routes))
+    }
+
+    pub(crate) async fn static_host(
+        domain: String,
+        store: Arc<ApplicationStore>,
+        sync: Arc<CatalogSync>,
+    ) -> Result<Self> {
+        validate_platform_domain(&domain)?;
+        Ok(Self::serve(Arc::new(Routes::new(
+            store,
+            None,
+            domain,
+            METADATA_CACHE_ENTRIES,
+            METADATA_CACHE_BYTES,
+            sync,
+        ))))
+    }
+
+    /// Activation, replacement and deactivation reach this node within one
+    /// poll period, or at once when this node's own store committed them. A
+    /// second task sweeps the catalog listing every `CELLD_SYNC_SWEEP_S`,
+    /// serving or not: it is how an idle node learns of a new application's
+    /// crons, and how a commit the epoch log lost reaches every node. A relayed
+    /// node does not sweep: the nodes it reads from repair the shared log.
+    fn serve(routes: Arc<Routes>) -> Self {
         let weak = Arc::downgrade(&routes);
+        let swept = Arc::downgrade(&routes);
+        let sweep = seconds_or("CELLD_SYNC_SWEEP_S", SYNC_SWEEP);
+        let catalog_sweep = (!routes.sync.relayed()).then(|| {
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                let mut previous = None;
+                loop {
+                    let Some(routes) = swept.upgrade() else { return };
+                    if let Err(error) = routes.sweep_catalog(&mut previous).await {
+                        tracing::error!(error = %format!("{error:#}"), "application catalog sweep failed");
+                    }
+                    drop(routes);
+                    tokio::time::sleep(sweep).await;
+                }
+            }))
+        });
+        let committed = routes.store.committed();
+        // A commit before this host existed is already in what it reads first.
+        let _ = futures_util::FutureExt::now_or_never(committed.notified());
+        let period = seconds_or("CELLD_APPLICATION_POLL_S", RECONCILE_PERIOD);
+        let idle = seconds_or("CELLD_APPLICATION_IDLE_S", APPLICATION_IDLE);
+        // A relayed node also polls when a view arrives. A bucket-mode node's
+        // own reads publish too, and would only spin its loop.
+        let mut views = routes.sync.relayed().then(|| routes.sync.subscribe());
         let reconciler = AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut watch = EpochWatch::default();
             loop {
-                tokio::time::sleep(RECONCILE_PERIOD).await;
+                let local = crate::asyncrt::select! {
+                    woken = timeout(period, committed.notified()) => woken.is_ok(),
+                    _ = async {
+                        match views.as_mut() {
+                            Some(views) => {
+                                let _ = views.changed().await;
+                            }
+                            None => std::future::pending().await,
+                        }
+                    } => false,
+                };
                 let Some(routes) = weak.upgrade() else { return };
-                if let Err(error) = routes.reconcile().await {
+                watch.forced |= local;
+                if let Err(error) = routes.poll_epoch(&mut watch, idle).await {
                     tracing::error!(error = %format!("{error:#}"), "application route reconciliation failed");
                 }
             }
         }));
-        Ok(Self {
+        Self {
             routes,
             alarm_host: Default::default(),
             _reconciler: Some(reconciler),
-        })
-    }
-
-    pub(crate) async fn static_host(domain: String, store: Arc<ApplicationStore>) -> Result<Self> {
-        validate_platform_domain(&domain)?;
-        store.validate_format().await?;
-        Ok(Self {
-            routes: Arc::new(Routes {
-                store,
-                pool: None,
-                domain,
-                scopes: Mutex::new(ScopeCache {
-                    max_entries: METADATA_CACHE_ENTRIES,
-                    max_bytes: METADATA_CACHE_BYTES,
-                    ..Default::default()
-                }),
-            }),
-            alarm_host: Default::default(),
-            _reconciler: None,
-        })
+            _catalog_sweep: catalog_sweep,
+        }
     }
 
     #[cfg(test)]
@@ -2558,7 +3212,8 @@ impl RouteDispatcher {
         self.routes.reconcile().await
     }
 
-    async fn resolve(&self, url: &str) -> Result<Option<RouteTarget>> {
+    /// The committed route the request URL names, with the revision it came from.
+    pub async fn route(&self, url: &str) -> Result<Option<Route>> {
         let url = url::Url::parse(url)?;
         let host = url.host_str().unwrap_or_default();
         // The same Host parsing the in-memory table uses: one owner for the
@@ -2569,7 +3224,7 @@ impl RouteDispatcher {
         let Ok(id) = celld_applications::RouteId::try_from(label) else {
             return Ok(None);
         };
-        self.routes.store.resolve_route(&id).await
+        self.routes.route(&id).await
     }
 
     /// The static assets of the handler a committed route claims for `url`.
@@ -2577,33 +3232,29 @@ impl RouteDispatcher {
         &self,
         url: &str,
     ) -> Result<Option<crate::assets::AssetResolver>> {
-        let Some(target) = self.resolve(url).await? else {
-            return Ok(None);
-        };
-        match target.destination {
-            RouteDestination::Handler(handler) => {
-                self.routes
-                    .asset_resolver(&target.application, &target.deployment, &handler)
-                    .await
-            }
-            RouteDestination::Assets => {
-                let manifest = self
-                    .routes
-                    .store
-                    .deployment(&target.application, &target.deployment)
-                    .await?
-                    .context("asset deployment is not staged")?;
-                let reference = manifest
-                    .assets
-                    .as_ref()
-                    .context("asset route has no assets")?;
-                self.routes
-                    .store
-                    .asset_resolver(&target.application, reference, None)
-                    .await
-                    .map(Some)
-            }
+        match self.route(url).await? {
+            Some(route) => self.route_assets(&route).await,
+            None => Ok(None),
         }
+    }
+
+    /// The static assets of the route's handler, or of an asset-only route.
+    pub async fn route_assets(
+        &self,
+        route: &Route,
+    ) -> Result<Option<crate::assets::AssetResolver>> {
+        let handler = match &route.target.destination {
+            RouteDestination::Handler(handler) => Some(handler),
+            RouteDestination::Assets => None,
+        };
+        self.routes
+            .assets(
+                &route.snapshot,
+                &route.target.application,
+                &route.target.deployment,
+                handler,
+            )
+            .await
     }
 
     /// Whether this URL is inside the platform domain, before any body is
@@ -2623,31 +3274,37 @@ impl RouteDispatcher {
         request: celld_applications::invocation_wire::HttpRequest,
         body: Option<crate::js::HttpChunkStream>,
     ) -> Result<Option<crate::js::HttpResponse>> {
-        // Replaced between resolving and leasing: routes are published before a
-        // deployment retires, so resolving again finds its successor.
-        // ponytail: loops only while replacements keep racing this request.
-        let lease = loop {
-            let Some(target) = self.resolve(&request.url).await? else {
-                return Ok(None);
-            };
-            if target.destination == RouteDestination::Assets {
-                return Ok(None);
-            }
-            match self
-                .routes
-                .pool()?
-                .acquire(
-                    app,
-                    &target.application,
-                    &target.deployment,
-                    target.handler()?,
-                )
-                .await
-            {
-                Err(error) if error.is::<DeploymentRetiring>() => {}
-                lease => break lease?,
-            }
-        };
+        match self.route(&request.url).await? {
+            Some(route) => self.dispatch_route(app, &route, deadline, request, body).await,
+            None => Ok(None),
+        }
+    }
+
+    /// The route's handler serves the request; `None` for an asset-only route.
+    pub async fn dispatch_route(
+        &self,
+        app: &crate::actor::AppHandle,
+        route: &Route,
+        deadline: Duration,
+        request: celld_applications::invocation_wire::HttpRequest,
+        body: Option<crate::js::HttpChunkStream>,
+    ) -> Result<Option<crate::js::HttpResponse>> {
+        let target = &route.target;
+        if target.destination == RouteDestination::Assets {
+            return Ok(None);
+        }
+        let lease = self
+            .routes
+            .pool()?
+            .acquire_with(
+                app,
+                &route.snapshot,
+                &target.application,
+                &target.deployment,
+                target.handler()?,
+                false,
+            )
+            .await?;
         lease
             .invoke_stateless(app, deadline, request, body)
             .await
@@ -2665,15 +3322,23 @@ impl RouteDispatcher {
         scope: &str,
         batch: &crate::js::QueueBatch,
     ) -> Result<crate::js::QueueDispatchResult> {
-        let entry = self
-            .queue_entry(scope)
+        let metadata = self
+            .prepare_scope(scope)
             .await?
             .context("not an application queue")?;
+        let entry = metadata.queue.as_ref().context("not an application queue")?;
         let (handler, _) = entry.consumer.as_ref().context("queue has no consumer")?;
         let lease = self
             .routes
             .pool()?
-            .acquire(app, &entry.application, &entry.deployment, handler)
+            .acquire_with(
+                app,
+                &metadata.snapshot,
+                &entry.application,
+                &entry.deployment,
+                handler,
+                false,
+            )
             .await?;
         // The cell's lease also covers admission and settlement.
         lease
@@ -2742,12 +3407,13 @@ impl RouteDispatcher {
         Option<(
             RouteTarget,
             celld_applications::invocation_wire::ObjectTarget,
+            Arc<Snapshot>,
         )>,
     > {
-        Ok(self
-            .prepare_scope(scope)
-            .await?
-            .and_then(|metadata| metadata.object.clone()))
+        Ok(self.prepare_scope(scope).await?.and_then(|metadata| {
+            let (target, object) = metadata.object.clone()?;
+            Some((target, object, metadata.snapshot.clone()))
+        }))
     }
 
     pub(crate) async fn dispatch_alarm(
@@ -2758,7 +3424,7 @@ impl RouteDispatcher {
         scheduled_ms: i64,
         cancelled: CancellationToken,
     ) -> Result<Option<(celld_logic::wake::AlarmSnapshot, bool, Option<u64>)>> {
-        let Some((target, object)) = self.alarm_target(scope).await? else {
+        let Some((target, object, snapshot)) = self.alarm_target(scope).await? else {
             return Ok(None);
         };
         let app = self
@@ -2768,7 +3434,7 @@ impl RouteDispatcher {
         let lease = crate::asyncrt::select_biased! {
             "a cancellation wins a tie with VM admission so a cancelled alarm never dispatches";
             _ = cancelled.cancelled() => anyhow::bail!("alarm cancelled before VM admission"),
-            lease = self.routes.pool()?.acquire(app, &target.application, &target.deployment, target.handler()?) => lease?,
+            lease = self.routes.pool()?.acquire_with(app, &snapshot, &target.application, &target.deployment, target.handler()?, false) => lease?,
         };
         let completion = lease
             .transport
@@ -2812,18 +3478,20 @@ impl RouteDispatcher {
         event: celld_applications::invocation_wire::SocketEvent,
         body: Vec<u8>,
     ) -> Result<()> {
-        let (target, object) = self
+        let (target, object, snapshot) = self
             .alarm_target(scope)
             .await?
             .context("socket scope is not an active application object")?;
         let lease = self
             .routes
             .pool()?
-            .acquire(
+            .acquire_with(
                 app,
+                &snapshot,
                 &target.application,
                 &target.deployment,
                 target.handler()?,
+                false,
             )
             .await?;
         let completion = lease
@@ -2845,11 +3513,9 @@ impl RouteDispatcher {
         rpc: Option<String>,
         request: celld_applications::invocation_wire::HttpRequest,
     ) -> Result<Option<crate::js::HttpResponse>> {
-        // As in `dispatch`: a deployment replaced between resolving and leasing
-        // is resolved again.
-        let lease = loop {
+        let snapshot = self.routes.app(application).await?;
+        let lease = {
             let (deployment, handler, resource) = {
-                let snapshot = self.routes.store.read(application).await?;
                 let deployment = snapshot
                     .application(application)
                     .and_then(|app| app.active.as_ref())
@@ -2890,15 +3556,10 @@ impl RouteDispatcher {
                     Err(error) => Err(error),
                 };
             }
-            match self
-                .routes
+            self.routes
                 .pool()?
-                .acquire(app, application, &deployment, &handler)
-                .await
-            {
-                Err(error) if error.is::<DeploymentRetiring>() => {}
-                lease => break lease?,
-            }
+                .acquire_with(app, &snapshot, application, &deployment, &handler, false)
+                .await?
         };
         let call = celld_applications::invocation_wire::ObjectCall { object, rpc };
         match lease.call_object(app.clone(), call, request).await {
@@ -3006,19 +3667,38 @@ pub fn validate_platform_domain(domain: &str) -> Result<()> {
 
 static HOSTED: std::sync::OnceLock<RouteDispatcher> = std::sync::OnceLock::new();
 
+/// A node's store: its catalog reads go through the disk tier.
+fn node_store(bucket: crate::bucket::Bucket) -> Result<Arc<ApplicationStore>> {
+    let store = ApplicationStore::new(bucket.clone());
+    store.enable_object_cache(crate::object_cache::ObjectCache::new(bucket)?);
+    Ok(Arc::new(store))
+}
+
 /// Node startup with a trusted configuration file: serve the committed
 /// application catalog's routes from this node's VMs.
 pub async fn host(
     config: &Path,
     bucket: crate::bucket::Bucket,
     app: &crate::actor::AppHandle,
+    sync: Arc<CatalogSync>,
 ) -> Result<()> {
     ensure!(HOSTED.get().is_none(), "application VMs are already hosted");
     let config = tokio::fs::read(config)
         .await
         .context("read application VM configuration")?;
     let config = serde_json::from_slice(&config).context("invalid application VM configuration")?;
-    let dispatcher = RouteDispatcher::new(config, Arc::new(ApplicationStore::new(bucket))).await?;
+    let dispatcher = RouteDispatcher::new(config, node_store(bucket)?, sync).await?;
+    if dispatcher.routes.sync.relayed() {
+        // Objects come from the relay it follows too, and from the bucket if it fails.
+        // `main` spawns the follower, once the node's store is known.
+        if let Some(objects) = dispatcher.routes.store.objects() {
+            objects.set_relay(
+                dispatcher.routes.sync.clone(),
+                app.peer_http.clone(),
+                app.peer_auth.clone(),
+            );
+        }
+    }
     if let Err(error) = dispatcher.routes.pool()?.prepare(app).await {
         let cleanup = dispatcher.shutdown().await;
         return Err(error.context(format!("application startup failed; cleanup: {cleanup:?}")));
@@ -3030,9 +3710,16 @@ pub async fn host(
     Ok(())
 }
 
-pub async fn host_static(domain: String, bucket: crate::bucket::Bucket) -> Result<()> {
-    let dispatcher =
-        RouteDispatcher::static_host(domain, Arc::new(ApplicationStore::new(bucket))).await?;
+pub async fn host_static(
+    domain: String,
+    bucket: crate::bucket::Bucket,
+    sync: Arc<CatalogSync>,
+) -> Result<()> {
+    ensure!(
+        !sync.relayed(),
+        "CELLD_SYNC_UPSTREAM needs --application-vms: a static application host has no peer client"
+    );
+    let dispatcher = RouteDispatcher::static_host(domain, node_store(bucket)?, sync).await?;
     ensure!(
         HOSTED.set(dispatcher).is_ok(),
         "applications are already hosted"
@@ -3502,9 +4189,11 @@ async fn start(
     );
     trusted_executable(&options.jailer)?;
     trusted_executable(&options.firecracker)?;
-    // The cache verified the digest; a file that is no image never boots a VM,
-    // restored or cold.
-    crate::application_image::check(&image)?;
+    // The cache hashed the artifact once, at download; a file that is no image
+    // never boots a VM, restored or cold, and is dropped so the next launch refetches.
+    crate::application_image::check(&image).inspect_err(|_| {
+        let _ = std::fs::remove_file(&image);
+    })?;
     // Only this private guest copy contains values. Catalog, staged manifest
     // and public pin metadata retain the original application-local references.
     let mut guest_handler = pin.handler.clone();

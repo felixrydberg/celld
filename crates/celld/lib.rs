@@ -61,6 +61,7 @@ mod asyncrt_contract_tests {
     include!(env!("CELLD_INTERNAL_ASYNCRT_TESTS"));
 }
 pub mod bucket;
+pub mod catalog_sync;
 pub mod cell_cli;
 pub mod cell_dispatch;
 mod cell_host;
@@ -99,6 +100,7 @@ pub mod ltx_replication;
 pub mod machine;
 pub mod memory;
 pub mod node_log;
+pub(crate) mod object_cache;
 pub(crate) mod operator_cell;
 #[doc(hidden)]
 pub mod otlp;
@@ -114,6 +116,7 @@ pub mod r2_cli;
 pub(crate) mod r2_store;
 pub mod replication;
 pub mod runtime;
+pub(crate) mod single_flight;
 pub mod startup;
 pub mod storage;
 pub mod telemetry;
